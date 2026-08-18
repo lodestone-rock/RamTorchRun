@@ -1,0 +1,332 @@
+# Worklog
+
+Append-only. Newest entry last. Keep entries short: date, what, why, gotchas.
+
+## 2026-08-13 — Repo bootstrap: standalone K2 port from x0-pred
+
+- Initialized uv project (Python 3.12). Deps: torch 2.10.0, torchvision
+  0.25.0, ramtorch>=1.6.4 (PyPI, per user decision — the local `RamTorch/`
+  symlink is reference-only), transformers, diffusers (needed by
+  `QwenAutoencoder`, was missing from x0-pred's requirements.txt), einops,
+  safetensors, pyarrow, pandas, opencv-python, pillow-jxl-plugin, etc.
+- Ported from `x0-pred` (no imports back into it):
+  - `k2/*` -> `models/k2/` (skipped `discriminator.py`, GAN-distill only).
+  - `MMDIT_CONFIGS`/`ENCODER_CONFIGS` extracted from the 43KB
+    `krea2_trainer.py` into `models/k2/configs.py` — this breaks the "fat
+    import" that dragged dataloaders into inference.
+  - LoRA checkpoint helpers (`load_lora_checkpoint`, `merge_lora_into_base_sd`,
+    `_classify_keys`, `_infer_old_rank`, `_strip_compiled_keys`) into
+    `utils/checkpoint.py` (sourced from krea2_trainer.py + expand_lora_rank.py).
+  - `krea2_pipeline_trainer.py` -> `train_pipeline.py` (vae_encode/vae_decode,
+    `_mu_from_seq_len`, `sample_timesteps` inlined; behavior unchanged).
+  - `krea2_inference.py` -> `inference.py` (all three modes kept:
+    single-GPU / --pipeline / --offload, sharding, manifest merge).
+  - `src/dataloaders/{parquet_dataloader,bucketing_logic,color_profile_handling,utils}.py`
+    -> `dataloaders/` (dropped `OTParquetTextImageDataset`, the scipy OT variant).
+- Configs: `configs/train_pipeline_{lora,full,smoke}.json` with repo-local
+  paths; dataset + `mmdit_checkpoint` are placeholders (see
+  `checkpoints/README.md`).
+- Known not-yet-done: training with offloading (roadmap), scripted
+  offload-vs-baseline benchmark.
+- Verification done: `uv sync` OK (ramtorch 1.6.4, torch 2.10.0+cu128);
+  all modules import; all three configs parse; 12.82B DiT builds on the meta
+  device; `build_dit_stages` 4-way split = [3.70, 3.04, 3.04, 3.04]B and
+  16-chunk offload dicing both work; `inference.py` CLI parses.
+- NOT verified end-to-end on GPU: at bootstrap time all 4 GPUs (RTX PRO 6000
+  Blackwell, 102 GB) were ~85 GB occupied by a live training job
+  (x0-pred, PID 3040620) — running a smoke on top risked OOMing it.
+  Next agent with idle GPUs: run
+  `uv run python train_pipeline.py configs/train_pipeline_smoke.json`
+  (needs a real parquet dataset path in the config) and
+  `uv run python inference.py --no-lora --offload --prompt "test" --seed 0`.
+- Convenience: `checkpoints/krea2/raw.safetensors` is a symlink to the K2
+  base weights in x0-pred (gitignored; other machines must bring their own).
+
+## 2026-08-13 — Full GPU verification + offload benchmark
+
+Hardware: 4x RTX PRO 6000 Blackwell (102 GB), PCIe (no NVLink).
+
+- **Offload inference next to a live training job**: `--offload` on a GPU
+  with only ~15 GB free (85 GB held by a running trainer) generated a clean
+  1024px image. 896 chunk loads, total acquire_wait 5.9 s over 28 steps.
+- **Pipeline inference next to the same job**: `--pipeline --devices cuda:3
+  cuda:2 cuda:1 cuda:0 --dit-block-split 4 8 8 8` (driver = freest GPU,
+  fewer blocks) worked in ~11-15 GB free per GPU. Output near-identical to
+  offload mode (same seed -> same noise; bf16 reorder noise only).
+- **Offload speed benchmark** (idle cuda:0, 1024px, 28 steps + CFG,
+  per-image sampling time = (T_multi - T_1)/(n-1) to cancel load overhead):
+  - batch 1: baseline 29.8 s/img vs offload 54.9 s/img (~1.8x) — PCIe-bound:
+    each of the 56 model passes streams 25.6 GB (~26 GB/s sustained), while
+    batch-1 compute per pass is only ~0.5 s.
+  - batch 4: baseline ~30.3 s/img vs offload ~31.3 s/img (**~3% regression**)
+    — enough compute per pass to fully hide the streaming.
+  - Lesson for the README/demo: use batch size >= 4 for "minimal regression";
+    batch 1 is the worst case. `--offload-pin` would also cut traffic.
+- **Training smoke**: `configs/train_pipeline_smoke.json` (now pointing at
+  the local e621 parquet dataset on this machine) ran 6 LoRA steps on
+  2 GPUs: loss 0.17-0.43, previews at steps 0/4, untrained + final LoRA
+  checkpoints saved, exit 0. ~2 min wall including 26 GB weight load.
+- The x0-pred fullft trainer (tmux session `fullft`, was at step 31915) was
+  terminated with user permission to free VRAM. NOT restarted. NOTE for
+  resuming it: its `config_krea2_fullft.json` still points
+  `mmdit_checkpoint` at `full_step_2000.safetensors` / initial_global_step
+  2000 — update to the latest checkpoint (~full_step_31800) before relaunch.
+
+## 2026-08-13 — Per-model restructure + single-GPU offload trainer
+
+Why: the repo is meant to host trainers for several models (krea2, flux, ...)
+with **no intertwined dependencies**, and offload-based single-GPU training
+was still an unimplemented roadmap item.
+
+- **Restructure to one folder per model.** `models/k2/` -> `krea2/model/`;
+  root `train_pipeline.py` / `inference.py` -> `krea2/`; `configs/` ->
+  `krea2/configs/`. `dataloaders/` and `utils/` stay shared. Imports are now
+  `krea2.model.*`; each script has a 2-line `sys.path` shim so both
+  `python krea2/x.py` and `python -m krea2.x` work. Convention recorded in
+  AGENTS.md: model folders never import from each other — add `flux/` by
+  copy-and-adapt, do not generalize `krea2/`.
+- **`krea2/train_utils.py`** (new): `vae_encode`, `vae_decode`,
+  `_mu_from_seq_len`, `sample_timesteps`, `_pin_sdpa_backends` — previously
+  inlined in the pipeline trainer, now shared by both K2 trainers.
+- **`krea2/train_offload.py`** (new): single-GPU trainer. DiT diced by
+  `build_dit_stages(dit, offload_chunks)` into a training `OffloadModel`;
+  frozen Qwen3-VL diced by `build_encoder_stages` into a forward-only
+  `OffloadModel` (grad accumulators cleared post-construction, ~8 GB saved);
+  VAE resident. Loop: `step()` under bf16 autocast x `grad_accum` ->
+  `flush_grads(scale=1/k)` -> clip -> fused CPU AdamW -> `zero_grad_acc()`.
+  Both `mode: "lora"` (bf16 masters) and `mode: "full"` (fp32 masters), same
+  resume-priority chain as the pipeline trainer. Configs
+  `train_offload_{lora,full,smoke}.json`.
+- Verification (4x RTX PRO 6000, all idle): pipeline smoke re-run after the
+  move (6 steps, previews, ckpt, exit 0); offload LoRA smoke 6 steps + preview
+  + ckpt; offload full-FT smoke 3 steps + 48 GB fp32 ckpt save.
+  **The offload and pipeline trainers produce matching losses step-for-step**
+  (0.2361/0.2572/0.1685/0.4334 vs 0.2360/0.2572/0.1685/0.4332) — good
+  cross-validation of both paths.
+- Measured (256px, effective batch 4, chunks 16, window 4): LoRA ~4.4 s/step
+  (~30 GB host RAM), full FT ~35 s/step (~256 GB host RAM, RSS 281 GB peak).
+  `acquire_wait_s` ~0.04-0.36 s total in both — streaming is fully hidden;
+  full FT is bound by CPU-side optimizer/grad-flush traffic, not PCIe.
+- Gotchas found:
+  - `grad_ckpt` is meaningless under `OffloadModel` (bare torch checkpoint
+    recomputes against CPU masters); the trainer warns and ignores it. Use
+    `offload_backward` (`checkpoint`/`recompute`/`keep`) instead.
+  - `eval_interval: 0` now disables previews — a preview streams the whole
+    DiT once per CFG branch per sampler step, which is brutal in full mode.
+  - A full-FT run looks "stalled" for minutes at two points: the first step
+    (allocating ~102 GB AdamW state + pinning ~51 GB flush buffers) and the
+    final 48 GB checkpoint save. It is not hung; check RSS/%CPU.
+  - Don't pipe long GPU runs through `tail` — nothing is visible until exit.
+    Log to a file instead.
+
+## 2026-08-13 — Perfetto profiling for offload + pipeline inference
+
+- `utils/profiling.py` (new, shared infra): `TraceCapture` drives
+  `torch.profiler` over iterations `[warmup, warmup+active)` of a sampling
+  loop, annotates `diffusion_step_{i}` / `cond` / `uncond`, and stops the run
+  once the window closes.
+- `krea2/inference.py`: `--profile PATH`, `--profile-steps` (default 3),
+  `--profile-warmup` (default 1), valid with `--offload` or `--pipeline`.
+- Why not the built-in RamTorch hooks: `OffloadModel.step(profile_path=...)`
+  is the TRAINING path (inference uses `forward()`, which has no hook), and
+  `Pipeline.infer(profile_path=...)` captures a single `infer()` call while a
+  diffusion step is two (cond + uncond). Driving the profiler from the loop
+  covers several steps in one timeline and works for both modes.
+- For offload we replicate what `step(profile_path=...)` does internally:
+  set `off._span_log = []`, emit a `record_function("offload_clock_sync")`
+  marker paired with a `time.monotonic_ns()` reading, then call the
+  `OffloadModel._inject_thread_spans` staticmethod. Without this the H2D
+  loader thread is invisible (kineto only records `record_function` on the
+  thread that entered the profiler).
+- Captured at 1024px, batch 4, 28-step schedule truncated to 8, chunks 16 /
+  window 2: offload 46 MB trace, pipeline (4 GPUs) 73 MB — both gzip ~13x.
+  Offload overlap over the 3 profiled steps: 11.69 s chunk compute vs 0.03 s
+  `wait L{k}` stalls (0.3%), i.e. streaming is fully hidden at this batch.
+- Traces land in gitignored `profiles/`.
+- Batch sweep at 1024px, 16 chunks, window 2, pin 0 (GPU busy = sum of
+  `kernel` durations over the `diffusion_step_{i}` wall span):
+
+  | batch | wall/step | GPU busy | util | H2D/step |
+  |---|---|---|---|---|
+  | 1 | 1.80 s | 0.93 s | 51% | 1.80 s @ 27.0 GB/s |
+  | 2 | 1.99 s | 1.94 s | 98% | 1.93 s @ 26.6 GB/s |
+  | 4 | 3.91 s | 3.86 s | 99% | 2.11 s @ 24.3 GB/s |
+
+  The stream is a constant ~2 s/step (51 GB for cond+uncond at ~26 GB/s) while
+  compute scales with batch, so the crossover is at **batch 2** — README
+  previously said "batch >= 4", now corrected.
+- Pin sweep at batch 1 (the starved case), 16 chunks / window 2:
+
+  | pin | GB/step | GPU busy | wall/step | speedup |
+  |---|---|---|---|---|
+  | 0 | 48.5 | 51% | 1.80 s | 1.00x |
+  | 4 | 34.3 | 71% | 1.28 s | 1.41x |
+  | 8 | 24.3 | 99% | 0.96 s | 1.88x |
+
+  Pinning removes those chunks from the per-step stream entirely (`loads`
+  drops 128 -> 96 -> 64). `pin 8` fully saturates batch 1: 0.92 s stream vs
+  0.94 s compute. Costs `(window+pin)/chunks` = 10/16 x 25.6 GB ~ 16 GB VRAM.
+  So low-batch offload is fixable without giving up the small-GPU premise.
+- **NVMe tier** (`--offload-nvme N --offload-nvme-path FILE`, added to
+  `krea2/inference.py`): masters for N chunks live on disk as mmap-backed
+  tensors instead of in pinned CPU RAM. `evenly_pinned(16,8)` = even indices
+  and `interleaved_nvme(16,8)` = odd indices are exactly complementary, so
+  `pin 8 + nvme 8` puts every non-pinned chunk on disk and leaves ZERO DiT
+  masters in host RAM. Measured at batch 1: 1.91 s/step, 51% util,
+  `nvme_loads` 64/64, `acquire_wait_s` 6.27 s (vs 0.003 s from RAM) — the
+  disk read adds ~1.6 s/step of real stall, ~2x slower than the RAM tier at
+  the same pin count. It buys host RAM, not speed.
+- Inference through `forward()` is UNGATED for NVMe; only training (`step()`)
+  requires the sudoer + `RAMTORCH_NVME_ACKNOWLEDGE=1` consent gate, because
+  optimizer steps rewrite the on-disk masters (SSD wear).
+- Hardware note for this box: `/mnt/datapool_u2` (the workspace) IS the NVMe
+  array — 3x Intel SSDPF2KX076TZ in md RAID -> LUKS -> ext4. `datapool_ssd`
+  is SATA SSD on ZFS, and `datapool_large`/`ext_0` are spinning rust. Put
+  NVMe scratch files under the workspace.
+- **Gotcha: `acquire_wait_s` and the `wait L{k}` spans are near zero even at
+  batch 1 when the GPU is ~50% idle.** A chunk is "resident" once its H2D copy
+  is ENQUEUED; the compute stream then waits on a CUDA event, which is a
+  device-side stall the CPU never sees. Judge overlap by GPU busy vs wall span,
+  not by the CPU wait counters.
+
+## 2026-08-17 — RamTorch 1.8.0 + chunk-based refactor: one trainer, three strategies
+
+Motivation: 1.7/1.8 let a `Pipeline` take a FLAT chunk list and choose GPUs and
+weight-residency independently. The model is already a stack of blocks, so
+dicing per block and making the hardware strategy a flag removes the reason
+`train_pipeline.py` and `train_offload.py` existed as separate files.
+
+- `ramtorch 1.6.4 -> 1.8.0`. New: `Pipeline(chunk_modules=..., offload=...)`,
+  `OffloadStage`, `grad_accum="stream"` (GPU-side accumulation, spill once at
+  flush), `offload_activations=True`.
+- **`krea2/model/pipeline_stages.py` -> `krea2/model/chunks.py`.** Per-block
+  chunks: `[DiTEmbedChunk, DiTBlockChunk x 28, DiTHeadChunk]` via
+  `build_dit_chunks(dit, blocks_per_chunk=1)`, plus `build_encoder_chunks` and
+  `balance_chunks_by_bytes` (exact DP; the embed chunk holds the ~1B
+  text-fusion transformer vs ~0.4B per block, so an even split BY COUNT leaves
+  stage 0 heavy).
+- Relay changed from `(combined, tvec, t_emb, pos, mask)` to
+  `(combined, tvec, t_emb, freqs, attn_mask)`: the RoPE table and the expanded
+  (Lp x Lp) mask are built once in the embed chunk and shared. Rebuilding per
+  chunk was fine at 4 stages but would run ~30x per forward now, and in
+  keep-activations mode each rebuild is a separate saved tensor (~21 MB/sample
+  at 1024px, x30 x microbatches).
+- **Two contract rules cost real time to find, so they are now in the notes:**
+  (1) RamTorch flags every FLOAT chunk input as a grad-requiring leaf, so
+  `DiTBlockChunk` must `freqs.detach()` or every block computes a pointless
+  `dL/dfreqs`; (2) resident stages are wrapped in the private
+  `_ChunkSequential`, which has no `out_no_grad`, so it must be set on the
+  stage module post-construction (`set_resident_out_no_grad`).
+- **`krea2/tools/check_chunk_parity.py`** — tiny DiT (1.4M params) on CPU,
+  chunked vs monolithic, forward AND every gradient, across 18 configurations
+  (resident/streamed x 1/2 stages x keep/checkpoint x window 1/2 x activation
+  offload x grad_accum stream/cpu x `OffloadModel` direct). All 18 are
+  **bit-exact (0.0)** at `blocks_per_chunk` 1 and 2. Run this before spending
+  GPU hours on any dicing change. Needs `set_sdpa_ctx(False)`: mmdit's
+  `sdpa_kernel(CUDNN)` has no CPU backend.
+- **`train_pipeline.py` + `train_offload.py` -> `krea2/train.py`.** One
+  `Pipeline` construction; `parallelism: "offload" | "pipeline" |
+  "pipeline-offload"` picks devices + `offload=`. NOTE `mode` (lora/full) and
+  `parallelism` are independent axes — easy to confuse. Grad flush branches on
+  stage type in `utils/ramtorch_helpers.py` (resident: alias `p.grad` to the
+  accumulator and scale in place; streamed: `st.flush_grads(scale)`).
+- `offload_backward: "recompute"` is gone: `OffloadStage` rejects
+  `keep_activations=False` (its no-grad forward leaves the pipelined loss graph
+  disconnected). `grad_ckpt` now raises under any streamed parallelism — bare
+  `torch.utils.checkpoint` inside a chunk recomputes against the CPU masters.
+- Configs: `train_{offload,pipeline,pipeline_offload}_{lora,full}.json` plus a
+  single `train_smoke.json` (strategy chosen with `--parallelism`/`--devices`,
+  so one file smokes all three).
+- `inference.py`: flat chunks; `--pipeline --offload` now combine;
+  `--offload-chunks N` -> `--blocks-per-chunk N`, `--dit-block-split` ->
+  `--chunks-per-stage`. NVMe stays offload-only (pipeline stages have no NVMe
+  tier). `TraceCapture` takes several engines and prefixes their tracks
+  `s0 `/`s1 ` — the injector allocates trace thread ids per track NAME, so
+  identical names from different stages would collapse into one track.
+
+### GPU verification of the refactor
+
+All three parallelisms train (LoRA smoke) and infer. The three inference modes
+render the same image from the same seed (`previews/verify/{offload,pipeline,
+pipeoff}`), so the dicing is correct end to end on real weights, not just in
+the tiny-model parity check. Full FT smokes on 4 GPUs under pipeline-offload.
+
+Added a `Peak VRAM: ...` line next to the offload stats at checkpoint time —
+the A/B below needed it and it is the number you actually tune against.
+
+**`offload_grad_accum` must follow `mode`, not the parallelism.** Measured on
+2-4 H100s, 256px, `pipeline-offload`, 12 steps, mean of the last 6:
+
+| run                          | s/step | peak VRAM (driver) |
+|------------------------------|--------|--------------------|
+| lora, stream, checkpoint     | 7.50   | 9.83 GB            |
+| lora, **cpu**, checkpoint    | **5.83** (-22%) | 9.81 GB   |
+| lora, stream, keep           | 7.23   | 26.34 GB           |
+| lora, stream, keep + act-off | 8.07 (+12%) | **10.94 GB** (-58%) |
+| full, **stream**, checkpoint | **30.02** | 18.07 GB        |
+| full, cpu, checkpoint        | 40.70 (+36%) | 17.62 GB     |
+
+So `stream` is a 26% win for full FT and a 22% LOSS for LoRA: with only ~119M
+trainable params the host-side adds are cheap, while the GPU accumulator slots
+thrash (659 `acc_loads` / 814 `acc_evictions` over 12 LoRA steps vs 120/192 for
+full FT). The lora configs now ship `"cpu"`, the full ones `"stream"`; losses
+match to ~1e-4 across the pair, so this is purely a throughput knob.
+
+Activation offload does what it says — `keep` backward at 26.3 GB drops to
+10.9 GB for +12% step time (439 GB streamed to pinned RAM over 12 steps). It is
+the way to buy `keep`'s speed at `checkpoint`'s memory, but at these sizes
+plain `checkpoint` is still both cheaper and faster; revisit at high res.
+
+## 2026-08-18 — Full FT: where the step actually goes
+
+Added a `Time split:` line (data / fwdbwd / flush / clip / opt) next to the
+peak-VRAM report, moved both BEFORE the final checkpoint save (a 51 GB write
+that can fail on a full disk should not take the measurements with it), and
+added `save_final` so benchmark runs stop writing 51 GB each.
+
+Same 12-step full-FT bench throughout: 12.8B DiT, 4 GPUs, 256px, batch 2 x 2
+microbatches, per-chunk gradient checkpointing, mean of the last 6 steps.
+
+| weights            | activations | s/step | peak VRAM (worst GPU) |
+|--------------------|-------------|--------|-----------------------|
+| resident pipeline  | resident    | **6.4** | 68.7 GB              |
+| resident, no ckpt  | resident    | 6.2    | 80.3 GB               |
+| all chunks pinned  | offloaded   | 6.6    | 72.7 GB               |
+| 1-2 chunks streamed| offloaded   | 10.3   | 67.6 GB               |
+| all pinned, `keep` | offloaded   | 14.4   | 75.5 GB               |
+| all streamed       | resident    | 30.0   | 18.6 GB               |
+
+**Streaming the weights costs 5x, and the reason is host-side arithmetic, not
+PCIe.** With every chunk streamed the split is flush 34%, clip 13%, opt 14% —
+61% of the step is the host touching 51 GB of fp32 masters and gradients.
+Resident stages spend ~0% there (fused CUDA AdamW, GPU-side norm) and put 65%
+into fwd+bwd. This also means partial offload is not a smooth dial: the moment
+a chunk's master is on the CPU, its flush + clip + optimizer slice run on the
+host, so streaming just 1-2 of 7-8 chunks per GPU already costs 60% (10.3 vs
+6.4 s/step) to save ~5 GB.
+
+**`offload_pin` >= a stage's chunk count = resident weights via the offload
+engine** (RamTorch clamps `pin` to the count). `loads: 0`, masters stay on the
+GPU, fused CUDA AdamW — the only reason to do it is that `offload_activations`
+lives on the OffloadStage path.
+
+**Offloading only the activations does not help full FT.** Under
+`backward="checkpoint"` the engine only ever saves chunk-boundary packets
+(~0.5 GB/step/stage), so streaming them costs +0.2 s/step and ADDS ~4 GB of
+staging. Under `keep` there is real memory to move (25 GB/step/stage) but it is
+PCIe-bound: 14.4 s/step and it still peaks higher than plain resident. The
+memory in full FT is weights + grads + Adam state (51 GB/GPU of a ~68 GB peak),
+not activations — the lever worth pulling is optimizer state (bf16 / 8-bit),
+not activations.
+
+- **Tried and rejected: `optimizer: "offload-adamw"`** (RamTorch's private
+  `OffloadAdamW`, sharded one per stage so each GPU streams over its own PCIe
+  link, `MultiOptimizer` stepping them in threads). 41.3 vs 30.5 s/step against
+  fused CPU AdamW — the optimizer was only 14% of the step to begin with, and
+  moving it to PCIe made it 44%. Kept as an off-by-default knob with the
+  measurement recorded; its own docstring predicts this (DDR beats PCIe).
+- **RamTorch bug**: all chunks pinned + `keep_activations=True` +
+  `offload_activations=False` dies with `CUDA error: unspecified launch
+  failure` inside `_grads_for` during backward — deterministically at step 5,
+  twice, after 5 clean steps at 6.3 s/step. Turning activation offload ON with
+  the same config runs 12 steps fine, as does `checkpoint`.

@@ -1,0 +1,97 @@
+{
+    "_comment": "Krea-2 (K2) MULTI-GPU pipeline parallelism WITH weight streaming, LoRA. See krea2/train.py. Each GPU runs a slice of the block stack but holds only (window+pin) chunks of weights at a time — the rest live in pinned host RAM. That frees most of each GPU for activations, so this is the config to reach for when 'pipeline' OOMs at high resolution or batch size. Pipelines barely touch PCIe (only activations cross stage boundaries), so weight streaming rides the idle bandwidth.",
+
+    "seed": 42,
+    "initial_global_step": 0,
+
+    "parallelism": "pipeline-offload",
+    "devices": ["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+    "chunks_per_stage": null,
+    "n_microbatches": 8,
+    "schedule": "staggered_1b1f",
+
+    "_comment_chunks": "With 30 chunks over 4 GPUs each stage holds ~7-8 chunks and streams through 'offload_window' of them. offload_backward='keep' pairs with offload_activations (the activation packets then carry real internals); with 'checkpoint' the packets are just the chunk boundaries the engine caches anyway, so activation offload buys almost nothing. offload_grad_accum='cpu' here: 'stream' (GPU-side accumulation, spill once at flush) wins by 26% for full FT but LOSES 22% in lora mode — the trainable slice is small enough that the host-side adds are cheap while the GPU accumulator slots thrash.",
+    "blocks_per_chunk": 1,
+    "offload_window": 2,
+    "offload_pin": 0,
+    "offload_backward": "keep",
+    "offload_grad_accum": "cpu",
+    "offload_acc_slots": null,
+    "offload_activations": true,
+    "offload_act_slots": 2,
+    "enc_layers_per_chunk": 1,
+    "enc_offload_window": 2,
+
+    "_comment_batch": "batch_size is PER MICROBATCH; effective batch = batch_size * n_microbatches.",
+    "batch_size": 2,
+    "lr": 1e-4,
+    "weight_decay": 1e-4,
+    "warmup": 200,
+    "max_grad_norm": 1.0,
+    "max_steps": 0,
+
+    "mu_y1": 0.5,
+    "mu_y2": 1.15,
+    "mu_override": null,
+    "mu_sigma": 1.0,
+    "minres": 256,
+    "maxres": 1280,
+
+    "uncond_ratio": 0.1,
+
+    "eval_interval": 200,
+    "save_every_n_steps": 1000,
+    "log_every_n_steps": 10,
+
+    "preview_samples": 4,
+    "preview_cfg_scale": 4.5,
+    "preview_steps": 28,
+    "preview_mu": null,
+    "preview_quality": 95,
+
+    "ckpt_path": "runs/k2-pipeline-offload-lora/ckpts",
+    "preview_path": "runs/k2-pipeline-offload-lora/previews",
+
+    "mmdit_config": "large_wide",
+    "encoder_config": "qwen3_vl_4b",
+
+    "ae_model_id": "Qwen/Qwen-Image",
+    "encoder_model_id": "Qwen/Qwen3-VL-4B-Instruct",
+
+    "_comment_ckpt": "Path to the K2 DiT base weights (safetensors). See checkpoints/README.md.",
+    "mmdit_checkpoint": "checkpoints/krea2/raw.safetensors",
+
+    "mode": "lora",
+    "full_checkpoint": null,
+    "lora_checkpoint": null,
+
+    "lora_rank": 32,
+    "lora_alpha": 32.0,
+    "lora_exclude_prefixes": [],
+
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "my_dataset": {
+                "path": "data/my_dataset.parquet",
+                "n_samples": null
+            }
+        },
+        "caption_columns": {
+            "tags": {"weight": 1.0, "is_tag_based": true}
+        },
+        "filename_column": "file_path",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [256, 512, 1024],
+        "base_resolution_weights": [1.0, 1.0, 1.0],
+        "ratio_cutoff": 2.0,
+        "resolution_step": 16,
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "offset": 0,
+        "num_workers": 4,
+        "prefetch_factor": 2
+    }
+}

@@ -1,0 +1,97 @@
+{
+    "_comment": "Krea-2 (K2) SINGLE-GPU offload FULL fine-tune (no LoRA). See krea2/train.py. HOST RAM BUDGET is the binding constraint, not VRAM: ~51 GB fp32 masters + ~51 GB grad accumulators (pinned under grad_accum='stream') + ~51 GB pinned .grad buffers + ~102 GB AdamW state = ~255 GB. The GPU only ever holds (window+pin) chunks.",
+
+    "seed": 42,
+    "initial_global_step": 0,
+
+    "parallelism": "offload",
+    "devices": ["cuda:0"],
+    "n_microbatches": 4,
+    "schedule": "staggered_1b1f",
+
+    "_comment_chunks": "fp32 masters mean every chunk is 2x the bf16 size, so PCIe traffic doubles: keep the window deep enough to stay ahead of compute. offload_grad_accum='stream' matters most here — it keeps the ~51 GB of per-step gradient arithmetic on the GPU and spills once at flush instead of writing back per microbatch (measured 26% faster than 'cpu' in full FT; note it is the LOSING choice for lora).",
+    "blocks_per_chunk": 1,
+    "offload_window": 4,
+    "offload_pin": 0,
+    "offload_backward": "checkpoint",
+    "offload_grad_accum": "stream",
+    "offload_acc_slots": null,
+    "offload_activations": false,
+    "offload_act_slots": 2,
+    "enc_layers_per_chunk": 1,
+    "enc_offload_window": 2,
+
+    "_comment_batch": "batch_size is PER MICROBATCH; effective batch = batch_size * n_microbatches.",
+    "batch_size": 1,
+    "lr": 1.732e-5,
+    "weight_decay": 1e-4,
+    "warmup": 200,
+    "max_grad_norm": 1.0,
+    "max_steps": 0,
+
+    "mu_y1": 0.5,
+    "mu_y2": 1.15,
+    "mu_override": null,
+    "mu_sigma": 1.0,
+    "minres": 256,
+    "maxres": 1280,
+
+    "uncond_ratio": 0.1,
+
+    "eval_interval": 200,
+    "save_every_n_steps": 200,
+    "log_every_n_steps": 10,
+
+    "preview_samples": 4,
+    "preview_cfg_scale": 4.5,
+    "preview_steps": 28,
+    "preview_mu": null,
+    "preview_quality": 95,
+
+    "ckpt_path": "runs/k2-offload-fullft/ckpts",
+    "preview_path": "runs/k2-offload-fullft/previews",
+
+    "mmdit_config": "large_wide",
+    "encoder_config": "qwen3_vl_4b",
+
+    "ae_model_id": "Qwen/Qwen-Image",
+    "encoder_model_id": "Qwen/Qwen3-VL-4B-Instruct",
+
+    "_comment_ckpt": "Path to the K2 DiT base weights (safetensors). See checkpoints/README.md.",
+    "mmdit_checkpoint": "checkpoints/krea2/raw.safetensors",
+
+    "_comment_mode": "full mode resume priority: full_checkpoint > lora_checkpoint (merged into mmdit_checkpoint) > mmdit_checkpoint.",
+    "mode": "full",
+    "full_checkpoint": null,
+    "lora_checkpoint": null,
+
+    "lora_rank": 32,
+    "lora_alpha": 32.0,
+    "lora_exclude_prefixes": [],
+
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "my_dataset": {
+                "path": "data/my_dataset.parquet",
+                "n_samples": null
+            }
+        },
+        "caption_columns": {
+            "tags": {"weight": 1.0, "is_tag_based": true}
+        },
+        "filename_column": "file_path",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [512],
+        "base_resolution_weights": [1.0],
+        "ratio_cutoff": 2.0,
+        "resolution_step": 64,
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "offset": 0,
+        "num_workers": 8,
+        "prefetch_factor": 4
+    }
+}

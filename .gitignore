@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Symlinked reference repos (not part of this project)
+/RamTorch
+/x0-pred
+
+# Weights and training artifacts
+checkpoints/*
+!checkpoints/README.md
+previews/
+runs/
+*.safetensors
+
+# HF cache if placed locally
+hf_cache/
+
+# Logs
+*.log
+loss_log.csv
+
+# Profiler traces (hundreds of MB)
+profiles/

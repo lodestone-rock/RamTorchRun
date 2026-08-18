@@ -1,0 +1,91 @@
+{
+    "_comment": "Krea-2 (K2) MULTI-GPU pipeline-parallel LoRA fine-tune, weights RESIDENT. See krea2/train.py. The 12.8B DiT is diced into one chunk per block and the chunks are split across GPUs; only activations cross PCIe, so no NVLink is needed. Stage weights stay on their GPU — if they do not fit, switch parallelism to 'pipeline-offload'.",
+
+    "seed": 42,
+    "initial_global_step": 0,
+
+    "_comment_topology": "parallelism 'pipeline' = N GPUs, resident weights. chunks_per_stage overrides the automatic split (which balances stages by WEIGHT BYTES, not chunk count — the embed chunk carries the whole text-fusion transformer). Must sum to the number of chunks: 2 + ceil(28/blocks_per_chunk).",
+    "parallelism": "pipeline",
+    "devices": ["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+    "chunks_per_stage": null,
+    "n_microbatches": 8,
+    "schedule": "staggered_1b1f",
+
+    "_comment_chunks": "blocks_per_chunk only sets the dicing granularity here; nothing streams. grad_ckpt wraps each block in torch.utils.checkpoint (valid ONLY with resident stages).",
+    "blocks_per_chunk": 1,
+    "grad_ckpt": true,
+
+    "_comment_batch": "batch_size is PER MICROBATCH; effective batch = batch_size * n_microbatches.",
+    "batch_size": 2,
+    "lr": 1e-4,
+    "weight_decay": 1e-4,
+    "warmup": 200,
+    "max_grad_norm": 1.0,
+    "max_steps": 0,
+
+    "mu_y1": 0.5,
+    "mu_y2": 1.15,
+    "mu_override": null,
+    "mu_sigma": 1.0,
+    "minres": 256,
+    "maxres": 1280,
+
+    "uncond_ratio": 0.1,
+
+    "eval_interval": 200,
+    "save_every_n_steps": 1000,
+    "log_every_n_steps": 10,
+
+    "preview_samples": 4,
+    "preview_cfg_scale": 4.5,
+    "preview_steps": 28,
+    "preview_mu": null,
+    "preview_quality": 95,
+
+    "ckpt_path": "runs/k2-pipeline-lora/ckpts",
+    "preview_path": "runs/k2-pipeline-lora/previews",
+
+    "mmdit_config": "large_wide",
+    "encoder_config": "qwen3_vl_4b",
+
+    "ae_model_id": "Qwen/Qwen-Image",
+    "encoder_model_id": "Qwen/Qwen3-VL-4B-Instruct",
+
+    "_comment_ckpt": "Path to the K2 DiT base weights (safetensors). See checkpoints/README.md.",
+    "mmdit_checkpoint": "checkpoints/krea2/raw.safetensors",
+
+    "_comment_mode": "mode='lora': LoRA adapters on all nn.Linear + unfrozen norms/mods, whole model bf16.",
+    "mode": "lora",
+    "full_checkpoint": null,
+    "lora_checkpoint": null,
+
+    "lora_rank": 32,
+    "lora_alpha": 32.0,
+    "lora_exclude_prefixes": [],
+
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "my_dataset": {
+                "path": "data/my_dataset.parquet",
+                "n_samples": null
+            }
+        },
+        "caption_columns": {
+            "tags": {"weight": 1.0, "is_tag_based": true}
+        },
+        "filename_column": "file_path",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [256, 512, 1024],
+        "base_resolution_weights": [1.0, 1.0, 1.0],
+        "ratio_cutoff": 2.0,
+        "resolution_step": 16,
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "offset": 0,
+        "num_workers": 4,
+        "prefetch_factor": 2
+    }
+}

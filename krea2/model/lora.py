@@ -15,6 +15,18 @@ Usage:
     inject_lora(mmdit, rank=32, alpha=32.0)
     trainable = [p for p in mmdit.parameters() if p.requires_grad]
     optimizer = AdamW(trainable, lr=1e-4)
+
+Role-based multi-adapter mode (TDM distillation):
+
+    inject_lora(mmdit, rank=32, alpha=32.0, extra_roles=("fake",))
+    set_lora_role(mmdit, "default")   # student adapter (lora_A / lora_B)
+    set_lora_role(mmdit, "fake")      # fake-score adapter (lora_A_fake / ...)
+    set_lora_role(mmdit, None)        # frozen base only (the teacher)
+
+One frozen weight buffer serves several networks; which low-rank delta is
+applied is a per-module flag flipped between forward passes. The primary
+adapter keeps the plain ``lora_A``/``lora_B`` names, so existing checkpoints
+and the merge helpers in ``utils/checkpoint.py`` stay compatible.
 """
 from __future__ import annotations
 
@@ -26,7 +38,16 @@ import torch.nn.functional as F
 
 
 class LoRALinear(nn.Module):
-    """Drop-in replacement for nn.Linear with a low-rank LoRA delta."""
+    """Drop-in replacement for nn.Linear with a low-rank LoRA delta.
+
+    Optionally carries EXTRA role adapters (``extra_roles``) next to the
+    primary one; ``active_role`` picks which delta the forward applies:
+    ``"default"`` (the primary ``lora_A``/``lora_B``), an extra role name
+    (``lora_A_{role}``/``lora_B_{role}``), or ``None`` for the frozen base
+    alone. The flag is a plain Python attribute — RamTorch's engines swap
+    tensors via ``functional_call`` and never touch attributes, so switching
+    between pipeline calls is safe under every execution mode.
+    """
 
     def __init__(
         self,
@@ -36,12 +57,15 @@ class LoRALinear(nn.Module):
         base_bias: torch.Tensor | None,
         rank: int,
         alpha: float,
+        extra_roles: tuple[str, ...] = (),
     ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.rank = rank
         self.scale = alpha / rank
+        self.extra_roles = tuple(extra_roles)
+        self.active_role: str | None = "default"
 
         # Frozen base weights — registered as buffers so they ride along with
         # .to() / .cuda() but are excluded from the optimizer.
@@ -51,26 +75,44 @@ class LoRALinear(nn.Module):
         else:
             self.base_bias = None
 
-        # Trainable LoRA adapters — standard Parameters.
+        # Trainable LoRA adapters — standard Parameters. Kaiming init for A
+        # (same as nn.Linear default), zeros for B so every adapter starts as
+        # an identity perturbation (ΔW=0 at step 0).
         self.lora_A = nn.Parameter(torch.empty(rank, in_features))
         self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
-
-        # Kaiming init for A (same as nn.Linear default), zeros for B so the
-        # adapter starts as an identity perturbation (ΔW=0 at step 0).
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        for role in self.extra_roles:
+            if role == "default":
+                raise ValueError("'default' is the primary adapter's name")
+            A = nn.Parameter(torch.empty(rank, in_features))
+            nn.init.kaiming_uniform_(A, a=math.sqrt(5))
+            setattr(self, f"lora_A_{role}", A)
+            setattr(self, f"lora_B_{role}", nn.Parameter(torch.zeros(out_features, rank)))
+
+    def _adapter(self) -> tuple[torch.Tensor, torch.Tensor] | None:
+        role = self.active_role
+        if role is None:
+            return None
+        if role == "default":
+            return self.lora_A, self.lora_B
+        return getattr(self, f"lora_A_{role}"), getattr(self, f"lora_B_{role}")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Low-rank path: y = x@W^T + scale*(x@A^T)@B^T — never materializes the
         # full ΔW and (crucially for training) backprop through A/B only needs
         # activations of size (…, rank) instead of (…, out_features).
         y = F.linear(x, self.base_weight, self.base_bias)
-        y = y + F.linear(F.linear(x, self.lora_A), self.lora_B) * self.scale
+        ab = self._adapter()
+        if ab is not None:
+            A, B = ab
+            y = y + F.linear(F.linear(x, A), B) * self.scale
         return y
 
     def extra_repr(self) -> str:
         return (
             f"in={self.in_features}, out={self.out_features}, "
             f"rank={self.rank}, scale={self.scale:.3f}"
+            + (f", extra_roles={self.extra_roles}" if self.extra_roles else "")
         )
 
 
@@ -79,6 +121,7 @@ def inject_lora(
     rank: int = 32,
     alpha: float | None = None,
     exclude_prefixes: tuple[str, ...] = (),
+    extra_roles: tuple[str, ...] = (),
 ) -> dict[str, LoRALinear]:
     """Walk *model* and replace every nn.Linear with a LoRALinear.
 
@@ -89,6 +132,9 @@ def inject_lora(
         exclude_prefixes: Dot-separated module name prefixes to skip.
                           e.g. ``("txtfusion",)`` to leave the text-fusion
                           transformer fully frozen.
+        extra_roles:      Additional named adapters next to the primary one
+                          (e.g. ``("fake",)`` for TDM's fake score). Switch
+                          with :func:`set_lora_role`.
 
     Returns:
         A dict mapping each replaced module's dotted name to the new
@@ -121,6 +167,7 @@ def inject_lora(
                     base_bias=child.bias,
                     rank=rank,
                     alpha=alpha,
+                    extra_roles=extra_roles,
                 )
                 setattr(parent, name, lora_layer)
                 replaced[full_name] = lora_layer
@@ -130,9 +177,43 @@ def inject_lora(
     _replace(model, "")
     print(
         f"[LoRA] Replaced {len(replaced)} nn.Linear layers with LoRALinear "
-        f"(rank={rank}, alpha={alpha})."
+        f"(rank={rank}, alpha={alpha}"
+        + (f", extra_roles={extra_roles}" if extra_roles else "")
+        + ")."
     )
     return replaced
+
+
+def set_lora_role(model: nn.Module, role: str | None):
+    """Select which adapter every LoRALinear in *model* applies.
+
+    ``role``: ``"default"`` for the primary adapter, an extra-role name
+    (must have been passed to ``inject_lora(extra_roles=...)``), or ``None``
+    for the frozen base weights alone. Cheap: flips one attribute per module.
+    """
+    n = 0
+    for m in model.modules():
+        if isinstance(m, LoRALinear):
+            if role is not None and role != "default" and role not in m.extra_roles:
+                raise ValueError(
+                    f"role {role!r} was not injected (extra_roles={m.extra_roles})"
+                )
+            m.active_role = role
+            n += 1
+    if n == 0:
+        raise ValueError("set_lora_role: no LoRALinear modules found")
+
+
+def lora_role_keys(model: nn.Module, role: str = "default") -> set[str]:
+    """State-dict keys of one role's adapter params (dotted, model-relative)."""
+    suffix_a = ".lora_A" if role == "default" else f".lora_A_{role}"
+    suffix_b = ".lora_B" if role == "default" else f".lora_B_{role}"
+    keys = set()
+    for name, m in model.named_modules():
+        if isinstance(m, LoRALinear):
+            keys.add(f"{name}{suffix_a}")
+            keys.add(f"{name}{suffix_b}")
+    return keys
 
 
 def lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:

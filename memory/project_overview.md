@@ -48,7 +48,7 @@ one chunk per transformer block — and the hardware strategy is a config key
 
 Adding an execution mode means adding a flag, never a second trainer.
 
-## Current state (2026-08-17)
+## Current state (2026-08-18)
 
 `krea2/` contains:
 
@@ -64,6 +64,21 @@ Adding an execution mode means adding a flag, never a second trainer.
   `pipe.step(...)` -> `flush_grads(1/k)` -> clip -> fused `AdamW` ->
   `zero_grads`. Frozen encoder runs as a forward-only pipeline on the same
   devices; the VAE is replicated per-GPU for chunk-parallel encode.
+- `train_tdm.py` — TDM distillation (arXiv:2503.06674): distills the 28-step
+  CFG teacher into a K-step (default 4) CFG-free student. The three networks
+  TDM needs (teacher / fake score / student) share ONE frozen bf16 base and
+  differ only by LoRA adapters switched per forward via
+  `set_lora_role(dit, None | "fake" | "default")` — no extra weight copies.
+  Data-free (captions only), same `parallelism` flag as `train.py`. The base
+  must stay `requires_grad=True` under RamTorch (frozen by exclusion from the
+  optimizers); see the 2026-08-18 worklog entry. Student checkpoints use the
+  standard LoRA key convention, so `inference.py --lora-checkpoint ... --steps
+  4 --guidance 0` runs them directly. NOTE: must run with `grad_ckpt: true` at
+  any real batch — RamTorch stage workers ignore the driver's thread-local
+  `no_grad`, so even `infer()` builds graphs (~5.3 GB vs ~0.5 GB per in-flight
+  sample at 512px; see the 2026-08-18 worklog entry). First production run:
+  tmux session `tdm`, `runs/k2-tdm-512/`, teacher = fullft step 49600,
+  batch 12 x 8 microbatches at 512px (~140 s/iter on 4 GPUs).
 - `train_utils.py` — K2 helpers: `vae_encode`, `vae_decode`,
   `_mu_from_seq_len`, `sample_timesteps`, `_pin_sdpa_backends`.
 - `inference.py` — default (all resident on one GPU, the speed baseline),
@@ -76,10 +91,16 @@ Adding an execution mode means adding a flag, never a second trainer.
 - `tools/check_chunk_parity.py` — tiny model on CPU, chunked vs monolithic,
   forward AND every gradient, across 18 execution configurations. Seconds to
   run; all 18 bit-exact. Run it after any change to the dicing or relay.
-- `model/` — mmdit, autoencoder, encoder, lora, sampling, chunks, plus
-  `configs.py` (`MMDIT_CONFIGS`, `ENCODER_CONFIGS`).
+- `tools/check_tdm_roles.py` — tiny model on CPU: each LoRA role matches a
+  separately-built single-LoRA reference through the Pipeline, adapters are
+  gradient-isolated, checkpoint keys match convention. Run it after any
+  change to `model/lora.py` or the role plumbing.
+- `model/` — mmdit, autoencoder, encoder, lora (multi-role: `extra_roles`,
+  `set_lora_role`, `lora_role_keys`), sampling, chunks, plus `configs.py`
+  (`MMDIT_CONFIGS`, `ENCODER_CONFIGS`).
 - `configs/` — `train_{offload,pipeline,pipeline_offload}_{lora,full}.json`
-  plus one `train_smoke.json` (any strategy via `--parallelism`/`--devices`).
+  plus one `train_smoke.json` (any strategy via `--parallelism`/`--devices`),
+  and `train_tdm_{lora,smoke}.json` for the TDM trainer.
   Dataset paths and `mmdit_checkpoint` are placeholders the user must point at
   real files (the smoke config points at a local e621 parquet on this machine).
 

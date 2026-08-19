@@ -330,3 +330,143 @@ not activations.
   failure` inside `_grads_for` during backward — deterministically at step 5,
   twice, after 5 clean steps at 6.3 s/step. Turning activation offload ON with
   the same config runs 12 steps fine, as does `checkpoint`.
+
+## 2026-08-18 — TDM distillation trainer with role-based LoRA
+
+TDM (arXiv:2503.06674, "trajectory distribution matching" — DMD applied per
+sampler step) needs THREE networks: frozen teacher, trainable fake-score, and
+trainable student. Three 12.8B copies don't fit, so all three share ONE frozen
+bf16 base and differ only by LoRA adapters switched on the fly ("role-based
+LoRA"). Full-FT TDM is explicitly out of scope.
+
+- **`krea2/model/lora.py`**: `LoRALinear` gained `extra_roles` (registers
+  `lora_A_{role}`/`lora_B_{role}` alongside the default pair) and an
+  `active_role` attribute (`"default"` = student, `"fake"` = fake score,
+  `None` = teacher, i.e. base only). `set_lora_role(model, role)` flips every
+  layer; `lora_role_keys(model, role)` lists one role's state-dict keys.
+  Attribute-based switching is safe under RamTorch because `functional_call`
+  swaps only tensors, never Python attributes, and pipeline calls are
+  synchronous — verified bit-exact by the new CPU check.
+- **`krea2/train_tdm.py`**: data-free trainer (captions only; VAE only for
+  previews). Per iteration: (1) no-grad K-step (default 4) student rollout
+  from noise saving `(x, x0_hat, eps_hat)` per step; (2) fake-score update —
+  pick a random segment per sample, renoise to `(x_tau, tau)`, denoising loss
+  toward the student's x0 with min-SNR(5) x importance-sampling weight;
+  (3) student update — teacher cond/uncond + fake infers (no grad), coop
+  target `x0_hat + (x0_real_cfg − x0_fake)`, Pseudo-Huber loss normalized by
+  `mean|x0_hat − x0_real_cfg|`, grad through ONE student step. The DDPM math
+  from the official demo was re-derived for K2's rectified flow
+  (`x_tau = c·x_mid + beta·xi`, `c = (1−tau)/(1−t_mid)`,
+  `beta² = tau² − (c·t_mid)²`; formulas in the file's docstrings).
+- Two AdamW optimizers, betas (0, 0.95), fake LR ~5x student (1e-4 / 2e-5),
+  clip 1.0 each, 1:1 update ratio — the demo's recipe.
+- **Per-sample loss extras through `pipe.step`**: RamTorch chunks `targets`
+  along dim 0 only, so `[x0_tgt | x_in | t | w]` are packed as extra channels
+  of one fp32 target tensor and unpacked inside the loss_fn.
+- **Gotcha that cost a debug cycle**: you CANNOT `requires_grad_(False)` the
+  shared base under RamTorch — `Stage.__init__` collects ALL params and
+  `backward_one_chunk` passes them to `torch.autograd.grad`, which rejects
+  frozen tensors. The base stays `requires_grad=True` and is frozen **by
+  exclusion**: in neither optimizer, in neither checkpoint. (`train.py`'s
+  LoRA mode never hit this because `inject_lora` leaves norms trainable.)
+- **`krea2/tools/check_tdm_roles.py`** — tiny-DiT CPU check, 22 asserts:
+  each role matches a separately-built single-LoRA reference (teacher
+  bit-exact vs un-injected base), through Pipeline resident/streamed x 1/2
+  stages, adapters never receive each other's grads, student checkpoint keys
+  match the standard "k2" convention. `check_chunk_parity.py` still 18/18
+  bit-exact after the lora.py change.
+- Configs: `train_tdm_lora.json` (pipeline, 512px, effective batch 8) and
+  `train_tdm_smoke.json` (256px, 6 steps, local e621 parquet). Checkpoints:
+  `tdm_student_step_N.safetensors` (standard lora_A/lora_B keys — loads in
+  `inference.py --lora-checkpoint` and the merge helpers as-is) plus
+  `tdm_state_step_N.safetensors` (both adapters, for `tdm_checkpoint` resume).
+- GPU smoke (2x RTX PRO 6000, 256px, pipeline): 6 iterations, exit 0,
+  loss_g 0.71->0.53, loss_d 0.003-0.013 (tiny as expected — fake and student
+  both start AT the teacher), ~22 s/iter, peak VRAM 38.3/32.4 GB. Time split:
+  rollout 39%, teacher/fake scores 29%, fake update 13%, student update 11%.
+  Student checkpoint loaded in `inference.py` at `--steps 4 --guidance 0`
+  (the student is CFG-free) and generated; blurry-but-structured output is
+  correct for 6 iterations from zero-init adapters.
+- Preview note: `preview_tdm` samples with the student's own K-step schedule
+  and no CFG; don't compare its quality against the 28-step teacher previews
+  from `train.py` early in training.
+
+## 2026-08-18 — TDM production run at 512px + the infer-memory gotcha
+
+Real TDM run on the freshest teacher: `full_step_49600.safetensors` from the
+x0-pred krea2-fullft run (51 GB fp32, clean 430-tensor state dict — loads
+strict=True, cast to bf16 by the existing `.to(dtype)`). Symlinked as
+`checkpoints/krea2/fullft_step_49600.safetensors`. Captions = the same
+5-source parquet mix the teacher was fine-tuned on, `base_resolution [512]`.
+Config: `krea2/configs/train_tdm_lora.json` (no longer a placeholder).
+
+**Gotcha that cost most of the probe time: RamTorch stage workers ignore the
+driver's `no_grad`.** `Pipeline.infer()` wraps only the DRIVER thread in
+`torch.no_grad()`, which is thread-local; the stage worker threads run their
+forwards with grad enabled, so even "no-grad" rollout/score evals build full
+autograd graphs whose activations stay alive while outputs sit in relay
+queues. Measured at 512px: ~5.3 GB per in-flight sample. `grad_ckpt: true`
+collapses it to ~0.5 GB/sample — `DiTBlockChunk` checks
+`torch.is_grad_enabled()` per worker thread, so per-block checkpointing
+kicks in on the phantom graphs too. Consequence: **TDM (7 infers + 2 steps
+per iteration) must run with grad_ckpt on at any real batch size**; without
+it, batch 4 x 8 mb at 512px OOMs 97 GB during the FIRST rollout.
+
+Probe ladder (4x RTX PRO 6000, 512px, `--max-steps 8`, means of last 4):
+
+| samples in flight | config    | s/iter | samples/s | peak VRAM (driver) |
+|-------------------|-----------|--------|-----------|--------------------|
+| 8   | bs2 x 4mb, gc off | 40  | 0.20 | 49.7 GB |
+| 16  | bs2 x 8mb, gc off | 50  | 0.32 | 91.9 GB |
+| 24  | bs3 x 8mb, gc ON  | 68  | 0.35 | 19.0 GB |
+| 64  | bs8 x 8mb, gc ON  | 115 | 0.56 | 36.1 GB |
+| 96  | bs12 x 8mb, gc ON | 161 | 0.60 | 49.7 GB |
+
+Chosen: **batch 12 x 8 microbatches (effective 96), grad_ckpt on** — scaling
+flattens past 96 (64 -> 96 bought +7%). Time split at 96: rollout 31%,
+scores 21%, fake 20%, student 16%, data 12%.
+
+- Dead end investigated: suspected the SDPA math backend was materializing
+  L^2 scores (probed raw enable_* flag combos, where math DOES outrank
+  cudnn). But `_pin_sdpa_backends` pins priority via
+  `sdpa_kernel(set_priority=True)`, and a direct test of the repo's actual
+  pinning on main AND worker threads showed cudnn serving the DiT's bool
+  mask at 0.05 GB transient. Attention was never the problem.
+- Run lives in tmux session `tdm`, log `runs/k2-tdm-512/train.log`, dirs
+  `runs/k2-tdm-512/{ckpts,previews}`. 1500 max steps, ckpt every 250,
+  preview every 50. ~130-145 s/iter steady -> ~2.3 days. Launched with
+  `PYTORCH_ALLOC_CONF=expandable_segments:True`.
+- First steps healthy: loss_g ~0.66, loss_d ~0.005 (both adapters start at
+  the teacher). Dataloader logs truncated-image errors from the NAS dataset;
+  it skips them — pre-existing, harmless.
+
+## 2026-08-19 — Decoupled-DMD ratio loss (WIP, not yet GPU-smoked)
+
+Per Decoupled DMD (arXiv:2511.22677), the TDM student target decomposes
+exactly as `delta = DM + (cfg-1) * CA` with `DM = x0_real - x0_fake`
+(distribution matching, the regularizer/"shield") and
+`CA = x0_real - x0_unc` (CFG augmentation, the engine). At cfg 4.5 that is
+a lopsided nominal 1:3.5 whose TRUE balance drifts with |DM| (near zero
+early, anneals whenever the fake catches the student) while |CA| never
+anneals.
+
+- **New config-gated mode in `krea2/train_tdm.py`** (`tdm_ca_ratio` = lam,
+  null = legacy math bit-for-bit): normalize DM and CA to unit mean-abs per
+  sample, mix `u = (1-lam) * DM_hat + lam * CA_hat`, and rescale by the
+  LEGACY delta's mean-abs so overall step size / lr / loss scales carry
+  over (a run can resume the existing `tdm_state_*` checkpoints with the
+  new mode). After normalization the shares are exact: CA carries lam of
+  the step's mean-abs magnitude, DM the rest — e.g. 0.7 / 0.3.
+- `tdm_dm_floor` (gamma, default 0.25) guards against amplifying a
+  near-zero DM to unit scale: DM's normalizer is floored at
+  `gamma * mean|CA|`, so DM's contribution fades linearly below the floor
+  (preserves DMD's annealing) and is exactly proportional above it.
+- Everything else untouched: rollout, segment/renoise, fake update,
+  packing, Huber loss, `weighting` normalizer, both optimizers.
+- Verified on CPU (fp64): decomposition identity exact; CA/DM magnitude
+  shares exactly lam/(1-lam); floor fades DM linearly; lam=1 is parallel
+  to CA; null bypass == legacy coop. **NOT GPU-smoked** — all 4 GPUs are
+  owned by the running 512px legacy-math run (tmux `tdm`); committed as
+  WIP on user request. Before the first real decoupled run, do a 6-step
+  smoke (`runs/k2-tdm-512/probe/decoupled.json` is ready:
+  smoke config + tdm_ca_ratio 0.7, `--parallelism offload` on a free GPU).

@@ -37,14 +37,15 @@
 
     "_comment_tdm": "tdm_steps = K (student sampling steps). tdm_cfg = teacher guidance baked into the student. tdm_separate_intervals keeps each segment's diffused tau range non-overlapping (paper default); tdm_randmid is the demo's optional mid-point regularizer. tdm_huber enables the Pseudo-Huber surrogate objective for the student update.",
     "tdm_steps": 4,
-    "tdm_cfg": 4.5,
+    "tdm_cfg": 3.0,
     "tdm_huber": true,
     "tdm_huber_c": 1e-3,
     "tdm_separate_intervals": true,
     "tdm_randmid": false,
 
     "_comment_decoupled": "Decoupled DMD (arXiv:2511.22677): the DMD target splits as DM + (tdm_cfg-1)*CA with DM = x0_real - x0_fake (regularizer) and CA = x0_real - x0_unc (engine) — at cfg 4.5 that is a lopsided 1:3.5 whose true balance drifts with |DM|. tdm_ca_ratio = lam replaces it with a normalized mix where CA carries exactly lam of the step's mean-abs magnitude and DM the rest (magnitude anchored to the legacy delta, so lr/loss scales transfer). null = legacy math. tdm_dm_floor = gamma floors DM's normalizer at gamma*mean|CA| so a near-zero DM (early training / matched distributions) fades out instead of being amplified to unit scale.",
-    "tdm_ca_ratio": null,
+    "_comment_ratio": "cfg-3 equivalent: legacy delta at s=3 is DM + 2*CA, i.e. 1/3 DM : 2/3 CA -> lam = 0.667. tdm_cfg 3.0 above anchors the magnitude to the same legacy delta.",
+    "tdm_ca_ratio": 0.667,
     "tdm_dm_floor": 0.25,
 
     "mu_y1": 0.5,
@@ -60,8 +61,8 @@
     "preview_samples": 4,
     "preview_quality": 95,
 
-    "ckpt_path": "runs/k2-tdm-512/ckpts",
-    "preview_path": "runs/k2-tdm-512/previews",
+    "ckpt_path": "runs/k2-tdm-512-r128/ckpts",
+    "preview_path": "runs/k2-tdm-512-r128/previews",
 
     "mmdit_config": "large_wide",
     "encoder_config": "qwen3_vl_4b",
@@ -74,8 +75,8 @@
     "lora_checkpoint": null,
     "tdm_checkpoint": null,
 
-    "lora_rank": 32,
-    "lora_alpha": 32.0,
+    "lora_rank": 128,
+    "lora_alpha": 128.0,
     "lora_exclude_prefixes": [],
 
     "_comment_data": "Same 5-source caption mix the teacher was fine-tuned on (from the fullft run's config). TDM only consumes captions; images are decoded solely for preview ground truth, so worker count is modest.",

@@ -465,8 +465,23 @@ anneals.
   packing, Huber loss, `weighting` normalizer, both optimizers.
 - Verified on CPU (fp64): decomposition identity exact; CA/DM magnitude
   shares exactly lam/(1-lam); floor fades DM linearly; lam=1 is parallel
-  to CA; null bypass == legacy coop. **NOT GPU-smoked** — all 4 GPUs are
-  owned by the running 512px legacy-math run (tmux `tdm`); committed as
-  WIP on user request. Before the first real decoupled run, do a 6-step
-  smoke (`runs/k2-tdm-512/probe/decoupled.json` is ready:
-  smoke config + tdm_ca_ratio 0.7, `--parallelism offload` on a free GPU).
+  to CA; null bypass == legacy coop. Committed as WIP (9eabc92) before
+  GPU testing since the 512px legacy run owned all GPUs.
+- GPU-smoked 2026-08-20 after that run ended (256px, pipeline 2 GPUs,
+  tdm_ca_ratio 0.7, 6 steps): exit 0, loss_g 0.40-0.52, loss_d
+  0.003-0.011, preview coherent, peak VRAM 38.1/32.3 GB (same as the
+  legacy smoke). loss_g sits a bit below legacy's ~0.66 by construction:
+  the mixed direction u has mean-abs <= 1, so |delta_new| <= the anchor
+  m = mean|delta_legacy| unless DM and CA are perfectly aligned.
+
+## 2026-08-20 — Second 512px TDM run: rank 128, decoupled loss, cfg-3 mix
+
+The first (legacy-math, rank 32, cfg 4.5) run finished its schedule;
+checkpoints/previews in `runs/k2-tdm-512/`. Second run launched with the
+ratio loss live: `lora_rank 128` (alpha 128; ~469M params per adapter,
+scale alpha/rank = 1 unchanged), `tdm_ca_ratio 0.667` + `tdm_cfg 3.0` —
+the cfg-3 equivalent, since legacy delta at s=3 is DM + 2*CA = 1/3 : 2/3;
+tdm_cfg still sets the magnitude anchor and loss normalizer in ratio mode.
+Same batch 12 x 8, grad_ckpt, teacher, dataset. tmux `tdm`,
+`runs/k2-tdm-512-r128/`. First steps: loss_g ~0.44-0.46 (ratio-mode scale),
+loss_d ~0.005, ~130 s/iter — rank 128 adds no measurable step cost.

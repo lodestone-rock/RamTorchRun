@@ -485,3 +485,150 @@ tdm_cfg still sets the magnitude anchor and loss normalizer in ratio mode.
 Same batch 12 x 8, grad_ckpt, teacher, dataset. tmux `tdm`,
 `runs/k2-tdm-512-r128/`. First steps: loss_g ~0.44-0.46 (ratio-mode scale),
 loss_d ~0.005, ~130 s/iter — rank 128 adds no measurable step cost.
+
+## 2026-08-20 — Lopsided driver VRAM: the TextFusion projector LoRA
+
+Rank-128 run showed 77.4 GB reserved on the driver vs ~33 GB on other
+stages (rank-32 run: ~54 GB). Debugged via controlled probe pair on idle
+GPUs 1-3 (24 samples, identical math, rank 32 vs 128): driver peak 20.98
+vs 28.46 GB, other stages ~unchanged — real per-sample, rank-scaled,
+driver-only allocations, NOT fragmentation/leak.
+
+Attribution via allocator snapshot (`TDM_MEM_SNAPSHOT=1` env, new
+env-gated hook in train_tdm.py; analyzer at
+`runs/k2-tdm-512-r128/probe/attrib.py`): 8.26 GB of the probe's 16.8 GB
+traced peak was the LoRA intermediate of **TextFusion's projector**
+(`mmdit.py` `self.projector(x)`). Pathology: the projector is
+Linear(num_txt_layers=36 -> 1) applied to x rearranged to [b, l, d, n],
+so its effective batch is b*l*txt_dim; LoRA injection wrapped it too, and
+the saved-for-backward `x @ A^T` is [b, l, d, rank] — rank 128 > the 36
+input features, 3.5x the input tensor. It was also the ONE op in
+TextFusion outside the grad-ckpt wrappers, so every in-flight microbatch
+graph kept it alive (24 x 344 MB at probe scale, ~33 GB at production
+96-sample scale). TextFusion = embed chunk = stage 0 = driver, hence the
+lopsidedness (also explains why the rank-32 driver was always heavier).
+
+Fix: checkpoint the projector like the neighboring blocks (`_project`
+helper in mmdit.py, gated on the same grad_ckpt flag). Verified: parity
+18/18; rank-128 probe driver peak 28.46 -> 21.23 GB (== rank-32
+baseline), losses within run-to-run bf16 noise. Also added a
+per-checkpoint "VRAM peak alloc / reserved" print in train_tdm.py.
+
+The rank-128 run was then stopped at step ~80 (postponed in favor of the
+upcoming chroma distillation; last checkpoint `tdm_state_step_50` in
+`runs/k2-tdm-512-r128/ckpts`, resumable). Full-scale reprobe with the fix
+(production config, 96 in-flight samples, rank 128): peak allocated
+40.37 / 30.85 / 33.77 / 30.38 GB — driver down from ~73 GB allocated
+(77.4 reserved), and even below the rank-32 LEGACY run's 49.7 GB, since
+the projector's non-LoRA saved activations were part of the driver
+premium all along. Remaining driver premium (~7-10 GB) is the VAE
+replica + encoder stage 0 + driver-side batch tensors — expected.
+
+## 2026-08-21 — WARNING: the tdm_ca_ratio rescale is unstable, do not use
+
+The decoupled-DMD ratio rescale (`tdm_ca_ratio`, 2026-08-19 entry above)
+destabilizes training in practice: the chroma 1024px rank-128 run in
+ratio mode (lam=0.667, floor 0.25) collapsed by step ~250 — loss_d
+exploded to 3-36 and previews degenerated — while the legacy-math run on
+the same setup is stable. Until the rescale is rediagnosed, keep
+`tdm_ca_ratio: null` (legacy math, bit-for-bit unchanged) in ALL tdm
+configs. Warnings added at the knob block and the decoupled branch of
+both `krea2/train_tdm.py` and `chroma/train_tdm.py`, in both
+`configs/train_tdm_lora.json` (krea2's flipped from 0.667 back to null),
+and here. Suspects for the rediagnosis, whenever it happens: the
+per-sample normalization removes DMD's natural annealing pressure on the
+fake score (n_dm rescaling fights the fake optimizer), and the magnitude
+anchor `mean|x0_real_cfg - x0_fake|` grows when the fake drifts,
+amplifying the very feedback loop the legacy form damps.
+
+## 2026-08-20 — chroma/: Chroma1-HD trainers (normal + TDM)
+
+New `chroma/` model folder, same shape as `krea2/`, targeting
+`lodestones/Chroma1-HD` (8.9B flux-style DiT: 19 double + 38 single blocks,
+hidden 3072, all modulation distilled from a 5-layer/5120-hidden
+Approximator producing 344 mod rows; T5-XXL encoder; flux VAE). Ported from
+lodestone-rock/flow `experimental`, `use_x0` stripped (v-pred only), zero
+krea2 imports per repo convention.
+
+- Dicing: 59 chunks (embed + 19 double + 38 single + head), uniform relay
+  `(x, mod, pe, attn_mask)`; `mod` (B,344,3072) is relayed identity through
+  every chunk so grads flow back to the Approximator in the embed chunk;
+  doubles split x at a static `txtlen` set via `set_dit_seq`. Attention mask
+  is a per-sample bool outer product (flow's `mask.T @ mask` collapses the
+  batch — deliberate deviation). `check_chunk_parity.py` 18/18 bit-exact
+  (also at blocks_per_chunk=2, and with grad_ckpt ON — verified separately).
+- `check_tdm_roles.py` ALL PASS. One relaxation: role=None vs un-injected
+  base compared at <=1e-6, not bitwise — CPU gemm results wiggle by a ULP
+  depending on weight-buffer allocation layout (verified the op, inputs and
+  weights are bit-identical; krea2's same check passing at 0.0 is luck).
+- T5-XXL (24 blocks) chunked 4-per-chunk; relay `(h, bool_mask,
+  position_bias)` — block 0 owns `relative_attention_bias`, later chunks
+  rebuild the additive mask via `create_bidirectional_mask`. New deps:
+  `sentencepiece` + `protobuf` (Chroma1-HD ships only `spiece.model`, no
+  fast tokenizer.json, so transformers must convert the slow tokenizer).
+- Ported the 2026-08-20 krea2 lopsided-driver-VRAM fix preemptively:
+  `ChromaEmbedChunk` (stage 0 = driver) now grad-checkpoints
+  img_in/txt_in/Approximator under the same `set_dit_grad_ckpt` flag —
+  chroma's analogue of the TextFusion projector (the Approximator's five
+  5120x5120 MLPs run at effective batch B*344, and img_in's LoRA rank can
+  exceed its 64 in-features). pe/mask stay outside (parameter-free).
+  Also carried over the `TDM_MEM_SNAPSHOT=1` allocator-snapshot hook and
+  the per-checkpoint "VRAM peak alloc / reserved" print in train_tdm.py.
+- **New RamTorch gotcha (latent in krea2 too)**: offload +
+  `grad_accum="cpu"` + role-swapped LoRA dies with
+  `KeyError: ...lora_A` in the writeback thread. The engine's pinned D2H
+  staging dict is allocated lazily from the FIRST backward's grad packet
+  (fake-role keys) and never extended, so the student's first update finds
+  no buffer. krea2 never hit it because its TDM GPU smoke ran in pipeline
+  mode. Fix: `prewarm_offload_staging(pipe)` in `utils/ramtorch_helpers.py`
+  (mirror `grad_acc`, which covers every param — the packet already carries
+  the frozen-by-exclusion base grads, so the extra pinned RAM is just the
+  inactive role's adapters), called from `chroma/train_tdm.py`.
+  `krea2/train_tdm.py` needs the same one-line call before anyone runs K2
+  TDM in offload mode.
+- GPU smokes (1x RTX PRO 6000, 256px, offload, e621 parquet): `train.py`
+  6 steps exit 0, loss 0.42-0.60, peak 5.40 GB, coherent previews;
+  `train_tdm.py` 6 steps exit 0, loss_g 0.58-0.76, loss_d 0.008-0.055
+  (tiny as expected — both adapters start at the teacher), peak 5.44 GB,
+  both checkpoint flavors saved. Checkpoint compatibility verified 643/643
+  tensors against `checkpoints/chroma/Chroma1-HD.safetensors`.
+
+## 2026-08-21 — chroma TDM at 1024px: two failed runs, driver-VRAM creep, hang
+
+Production chroma TDM (1024px, rank 128, pipeline 4 GPUs, batch 4x8=32
+in-flight, ~105 s/iter). Two runs, both dead ends, three fixes out of it:
+
+- **Run 1 `chroma-tdm-1024-r128` (decoupled DMD, lam=0.667, lr 2e-5)**:
+  collapsed. loss_d flat ~0.012 until step ~120 (warmup ends at 100), then
+  exponential — 0.1 @ 150, 1 @ 210, 10+ @ 260 — while loss_g kept falling:
+  student outran the critic. Note the krea2 r128 ratio-mode run was stopped
+  at step ~80, so ratio mode has never been validated past warmup anywhere.
+- **Run 2 `chroma-tdm-1024-r128-legacy` (legacy DMD, lr 2e-5)**: loss_d
+  stayed healthy (~0.02-0.04) but previews converged grainy with periodic
+  loss spikes, and the run HUNG at step ~409 (12.5 h in): tqdm frozen, GPU3
+  spinning 100%, GPU0/1 idle, driver burning 2 CPU threads — a pipeline
+  stall, cause unknown (py-spy needs sudo/ptrace, unavailable). Both
+  trainers now register `faulthandler` on SIGUSR1: next hang, run
+  `kill -USR1 <pid>` and read the log for all thread stacks. Verdict on the
+  math (user): LR too strong for both modes — the collapse in run 1 was
+  probably also LR-driven.
+- **Driver VRAM creep (the "lopsided GPU 0" question)**: nvidia-smi showed
+  the driver at ~80 GB reserved vs ~36-40 GB on other stages in both runs
+  (steady-state training alone is ~43 GB). TDM_MEM_SNAPSHOT probe (2 steps
+  + step-0 preview) + `runs/k2-tdm-512-r128/probe/attrib.py`: the peak is
+  the PREVIEW's `vae_decode` — ~13.5 GB of fp32 GroupNorm/conv activations
+  from decoding batch 4 at 1024px, driver-only (only the driver's VAE
+  replica ever decodes; TDM has no other VAE work). Each preview decodes at
+  that batch's aspect bucket, so the allocator ratchets up new odd-shaped
+  multi-GB segments every 50 steps: 43 -> 80 GB over ~5 previews.
+  Fixes: (1) `enable_slicing()` on every trainer VAE replica — per-sample
+  decode, 15.3 -> 4.2 GB measured; **`enable_tiling()` is a measured no-op
+  for this VAE/diffusers combo** (identical 15.34 GB peak — don't reach for
+  it); (2) `torch.cuda.empty_cache()` after each preview so odd-shaped
+  segments are returned. Applied to both `chroma/train.py` and
+  `chroma/train_tdm.py`.
+- **Run 3 `chroma-tdm-1024-r128-halflr`** (running): legacy DMD, lr HALVED
+  to 1e-5 / fake 5e-5 (A/B vs run 2), VAE slicing + cache release in.
+  Launched with PYTHONUNBUFFERED=1 — without it the checkpoint/VRAM prints
+  sit in the stdout block buffer forever and never reach the tee'd log
+  (tqdm goes to stderr, which is why only IT showed up in runs 1-2).

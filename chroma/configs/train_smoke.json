@@ -1,0 +1,95 @@
+{
+    "_comment": "Smoke test for chroma/train.py — 256px, 6 steps, preview at step 4. Works for every parallelism; pick one on the command line so the same config exercises all three paths, e.g.: uv run python chroma/train.py chroma/configs/train_smoke.json --parallelism pipeline-offload --devices cuda:1 cuda:3. Leaving 'devices' out means offload takes cuda:0 and the pipeline modes take every visible GPU. Point chroma_checkpoint and parquet_sources at real files before running.",
+
+    "seed": 42,
+    "initial_global_step": 0,
+
+    "parallelism": "offload",
+    "chunks_per_stage": null,
+    "n_microbatches": 2,
+    "schedule": "staggered_1b1f",
+
+    "blocks_per_chunk": 1,
+    "offload_window": 4,
+    "offload_pin": 0,
+    "offload_backward": "checkpoint",
+    "_comment_grad_accum": "'stream' here even though this smoke is lora mode: the smoke's job is to exercise the streamed-accumulator path. For real lora runs use 'cpu' (see train_offload_lora.json).",
+    "offload_grad_accum": "stream",
+    "offload_acc_slots": null,
+    "offload_activations": false,
+    "offload_act_slots": 2,
+    "enc_layers_per_chunk": 4,
+    "enc_offload_window": 2,
+    "grad_ckpt": false,
+
+    "batch_size": 2,
+    "lr": 1e-4,
+    "weight_decay": 1e-4,
+    "warmup": 200,
+    "max_grad_norm": 1.0,
+    "max_steps": 6,
+
+    "mu_y1": 0.5,
+    "mu_y2": 1.15,
+    "mu_override": null,
+    "mu_sigma": 1.0,
+    "minres": 256,
+    "maxres": 1024,
+
+    "attn_padding": 1,
+    "uncond_ratio": 0.1,
+
+    "eval_interval": 4,
+    "save_every_n_steps": 0,
+    "log_every_n_steps": 1,
+
+    "preview_samples": 2,
+    "preview_cfg_scale": 4.0,
+    "preview_steps": 8,
+    "preview_mu": null,
+    "preview_quality": 95,
+
+    "ckpt_path": "runs/chroma-smoke/ckpts",
+    "preview_path": "runs/chroma-smoke/previews",
+
+    "chroma_config": "chroma1",
+    "encoder_config": "t5_xxl",
+
+    "vae_model_id": "lodestones/Chroma1-HD",
+    "encoder_model_id": "lodestones/Chroma1-HD",
+
+    "chroma_checkpoint": "checkpoints/chroma/Chroma1-HD.safetensors",
+
+    "mode": "lora",
+    "full_checkpoint": null,
+    "lora_checkpoint": null,
+
+    "lora_rank": 32,
+    "lora_alpha": 32.0,
+    "lora_exclude_prefixes": [],
+
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "e621": {
+                "path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=e621",
+                "n_samples": 2000
+            }
+        },
+        "caption_columns": {
+            "tags": {"weight": 1.0, "is_tag_based": true}
+        },
+        "filename_column": "file_path",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [256],
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "ratio_cutoff": 2.0,
+        "resolution_step": 64,
+        "num_workers": 4,
+        "prefetch_factor": 2,
+        "offset": 0
+    }
+}

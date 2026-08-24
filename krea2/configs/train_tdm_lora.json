@@ -44,8 +44,8 @@
     "tdm_randmid": false,
 
     "_comment_decoupled": "Decoupled DMD (arXiv:2511.22677): the DMD target splits as DM + (tdm_cfg-1)*CA with DM = x0_real - x0_fake (regularizer) and CA = x0_real - x0_unc (engine) — at cfg 4.5 that is a lopsided 1:3.5 whose true balance drifts with |DM|. tdm_ca_ratio = lam replaces it with a normalized mix where CA carries exactly lam of the step's mean-abs magnitude and DM the rest (magnitude anchored to the legacy delta, so lr/loss scales transfer). null = legacy math. tdm_dm_floor = gamma floors DM's normalizer at gamma*mean|CA| so a near-zero DM (early training / matched distributions) fades out instead of being amplified to unit scale.",
-    "_comment_ratio": "cfg-3 equivalent: legacy delta at s=3 is DM + 2*CA, i.e. 1/3 DM : 2/3 CA -> lam = 0.667. tdm_cfg 3.0 above anchors the magnitude to the same legacy delta.",
-    "tdm_ca_ratio": 0.667,
+    "_comment_ratio": "!! WARNING (2026-08-21): the ratio rescale caused training instability in practice — keep tdm_ca_ratio null (legacy math) until rediagnosed, see memory/worklog.md. (For reference, the cfg-3 equivalent mix was lam = 0.667 with tdm_cfg 3.0.)",
+    "tdm_ca_ratio": null,
     "tdm_dm_floor": 0.25,
 
     "mu_y1": 0.5,
@@ -55,7 +55,7 @@
     "maxres": 1280,
 
     "eval_interval": 50,
-    "save_every_n_steps": 250,
+    "save_every_n_steps": 50,
     "log_every_n_steps": 10,
 
     "preview_samples": 4,

@@ -1,14 +1,19 @@
 # RamTorchRun
 
 Standalone, runnable examples of [RamTorch](https://pypi.org/project/RamTorch/)
-on a single node with multiple GPUs — **no NVLink required**. The demo model is
-Krea-2 (K2): a ~12B-parameter MMDiT text-to-image diffusion model with a
-Qwen-Image VAE and a Qwen3-VL-4B text encoder.
+on a single node with multiple GPUs — **no NVLink required**.
+
+Two demo models, one folder each, both the same shape:
+
+| folder | model | notes |
+|---|---|---|
+| `krea2/` | Krea-2, ~12B MMDiT | Qwen-Image VAE + Qwen3-VL-4B encoder |
+| `chroma/` | Chroma1-HD, 8.9B flux-style DiT | T5-XXL + flux VAE, distilled modulation |
 
 Everything starts from the same idea: the model is **diced once** into a flat
 list of chunk modules (one per transformer block), and how those chunks are
 executed is a flag. That gives three hardware strategies from one code path,
-for both training (`krea2/train.py`) and inference (`krea2/inference.py`):
+for both training (`<model>/train.py`) and inference (`<model>/inference.py`):
 
 | strategy | GPUs | weights live in | use it when |
 |---|---|---|---|
@@ -32,6 +37,14 @@ What the examples demonstrate:
 4. **Pipeline-parallel training** (`parallelism: "pipeline"` /
    `"pipeline-offload"`) — LoRA or full fine-tune split across GPUs over plain
    PCIe (`Pipeline.step()`, staggered 1B1F schedule).
+
+Each model folder also carries `train_tdm.py`, a TDM few-step distillation
+trainer (teacher / fake-score / student share one frozen base and differ only by
+LoRA role, so there are no extra weight copies).
+
+The commands and measurements below use `krea2/`; substitute `chroma/` freely —
+the CLI, config keys and strategy flags are identical. The performance numbers
+are K2's and do not transfer directly.
 
 ## Setup
 
@@ -268,7 +281,8 @@ harness — it checks the chunked forward AND every gradient against the
 monolithic model, across all execution modes, on CPU in seconds:
 
 ```bash
-uv run python krea2/tools/check_chunk_parity.py
+uv run python krea2/tools/check_chunk_parity.py     # or chroma/
+uv run python krea2/tools/check_tdm_roles.py        # after touching LoRA roles
 ```
 
 ## Repo layout
@@ -281,10 +295,12 @@ krea2/                 # Krea-2: owns its trainer, inference, model code, config
   model/               #   MMDiT, VAE, text encoder, LoRA, sampling
     chunks.py          #   flat chunk dicing: build_dit_chunks / build_encoder_chunks
   train.py             #   trainer: offload / pipeline / pipeline-offload, LoRA or full
+  train_tdm.py         #   TDM few-step distillation (role-based LoRA)
   train_utils.py       #   K2 helpers (VAE encode/decode, timesteps, SDPA pinning)
   inference.py         #   single-GPU / --pipeline / --offload (combinable)
   tools/               #   check_chunk_parity.py: chunked vs monolithic, CPU, seconds
   configs/             #   train_{offload,pipeline,pipeline_offload}_{lora,full}.json
+chroma/                # Chroma1-HD, same layout (59 chunks)
 dataloaders/           # shared: parquet dataset with aspect-ratio bucketing
 utils/
   checkpoint.py        # shared: LoRA checkpoint load / merge helpers

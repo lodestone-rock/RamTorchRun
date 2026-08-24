@@ -1,10 +1,10 @@
-"""train_tdm.py — TDM few-step distillation for Krea-2 (K2) with role-based LoRA.
+"""train_tdm.py — TDM few-step distillation for Chroma with role-based LoRA.
 
-Trajectory Distribution Matching (arXiv:2503.06674) distills the K2 teacher
-into a K-step deterministic student, data-free (captions only). The classic
-recipe needs THREE copies of the model — frozen teacher, trainable fake
-score, trainable student. Here all three share ONE frozen 12.8B weight
-buffer: two LoRA adapters ride on the same base (`krea2/model/lora.py`
+Trajectory Distribution Matching (arXiv:2503.06674) distills the Chroma
+teacher into a K-step deterministic student, data-free (captions only). The
+classic recipe needs THREE copies of the model — frozen teacher, trainable
+fake score, trainable student. Here all three share ONE frozen 8.9B weight
+buffer: two LoRA adapters ride on the same base (`chroma/model/lora.py`
 ``extra_roles``), and ``set_lora_role`` flips which delta a forward applies:
 
     role "default"  -> student   (lora_A / lora_B — standard checkpoint keys)
@@ -12,9 +12,10 @@ buffer: two LoRA adapters ride on the same base (`krea2/model/lora.py`
     role None       -> teacher   (base weights alone)
 
 Per iteration (ported from the official demo, DDPM/eps -> rectified flow;
-K2 convention: x_t = (1-t) x0 + t eps, model predicts v = eps - x0, t: 1->0):
+Chroma convention: x_t = (1-t) x0 + t eps, model predicts v = eps - x0,
+t: 1->0):
 
-  1. Rollout (no grad, role=student): K Euler steps from noise on K2's
+  1. Rollout (no grad, role=student): K Euler steps from noise on Chroma's
      shifted schedule, CFG-free, saving each step's input x_{t_m} and its
      x0 / eps predictions.
   2. Fake-score update: per sample pick a segment m, take the student's ODE
@@ -28,12 +29,12 @@ K2 convention: x_t = (1-t) x0 + t eps, model predicts v = eps - x0, t: 1->0):
      step WITH grad and pull its x0 prediction toward sg(coop)
      (Pseudo-Huber by default, DMD normalizer).
 
-Execution strategy is the same flag as `krea2/train.py`: ``parallelism`` in
+Execution strategy is the same flag as `chroma/train.py`: ``parallelism`` in
 {"offload", "pipeline", "pipeline-offload"} drives one Pipeline construction.
 
 Run:
-    uv run python krea2/train_tdm.py krea2/configs/train_tdm_lora.json
-    uv run python -m krea2.train_tdm krea2/configs/train_tdm_smoke.json --parallelism pipeline
+    uv run python chroma/train_tdm.py chroma/configs/train_tdm_lora.json
+    uv run python -m chroma.train_tdm chroma/configs/train_tdm_smoke.json --parallelism pipeline
 """
 from __future__ import annotations
 
@@ -46,12 +47,11 @@ import shutil
 import sys
 import time
 
-# Allow running both as `python krea2/train_tdm.py` and `python -m krea2.train_tdm`.
+# Allow running both as `python chroma/train_tdm.py` and `python -m chroma.train_tdm`.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn as nn
-from einops import rearrange
 from safetensors.torch import load_file, save_file
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR
@@ -67,23 +67,28 @@ except ImportError:
 
 from ramtorch import Pipeline
 
-from krea2.model.mmdit import SingleStreamDiT
-from krea2.model.autoencoder import QwenAutoencoder
-from krea2.model.sampling import prepare, timesteps as k2_timesteps
-from krea2.model.lora import (
+from chroma.model.model import Chroma
+from chroma.model.autoencoder import FluxAutoencoder
+from chroma.model.sampling import (
+    prepare,
+    timesteps as chroma_timesteps,
+    vae_unflatten,
+)
+from chroma.model.lora import (
     inject_lora,
     lora_role_keys,
     set_lora_role,
     trainable_param_count,
 )
-from krea2.model.configs import ENCODER_CONFIGS, MMDIT_CONFIGS
-from krea2.model.chunks import (
-    K2CaptionTokenizer,
+from chroma.model.configs import CHROMA_CONFIGS, ENCODER_CONFIGS
+from chroma.model.chunks import (
+    ChromaCaptionTokenizer,
     balance_chunks_by_bytes,
     build_dit_chunks,
     build_encoder_chunks,
     chunk_bytes,
     set_dit_grad_ckpt,
+    set_dit_seq,
 )
 
 from utils.checkpoint import _strip_compiled_keys, load_lora_checkpoint
@@ -93,20 +98,21 @@ from utils.ramtorch_helpers import (
     flush_grads,
     make_scheduler,
     offload_stages,
+    prewarm_offload_staging,
     set_resident_out_no_grad,
     zero_grads,
 )
 
 from dataloaders.parquet_dataloader import ParquetTextImageDataset
 
-from krea2.train import (
+from chroma.train import (
     PARALLELISM,
     _BACKWARD_MODES,
     encode_captions,
     parallel_vae_encode,
     resolve_topology,
 )
-from krea2.train_utils import _pin_sdpa_backends, vae_decode
+from chroma.train_utils import _pin_sdpa_backends, vae_decode
 
 FAKE_ROLE = "fake"
 
@@ -157,11 +163,11 @@ def make_tdm_loss(huber_c: float | None):
 @torch.no_grad()
 def preview_tdm(
     dit_pipe: Pipeline,
-    head_chunk,
+    dit_chunks: list[nn.Module],
     dit: nn.Module,
     enc_pipe: Pipeline,
-    tokenizer: K2CaptionTokenizer,
-    ae: QwenAutoencoder,
+    tokenizer: ChromaCaptionTokenizer,
+    ae: FluxAutoencoder,
     patch: int,
     compression: int,
     x0_clean_latent: torch.Tensor,   # [B, 16, H/8, W/8] on the driver device
@@ -172,7 +178,7 @@ def preview_tdm(
     y1: float = 0.5,
     y2: float = 1.15,
     minres: int = 256,
-    maxres: int = 1280,
+    maxres: int = 1024,
 ) -> torch.Tensor:
     """K-step deterministic student sampling (role=student, no CFG). Returns a
     float32 CPU tensor [2*n, 3, H, W] in [-1, 1]: samples then decoded GT."""
@@ -189,28 +195,25 @@ def preview_tdm(
     txt, txtmask = txt_mbs[0], txtmask_mbs[0]
 
     noise = torch.randn_like(x0_ref)
-    img_tok, pos, mask = prepare(noise, txt.shape[1], patch, txtmask)
+    img_tok, img_ids = prepare(noise, patch)
+    guid = torch.zeros(n_samples, dtype=torch.float32, device=device)
 
     x1_res = (minres // (compression * patch)) ** 2
     x2_res = (maxres // (compression * patch)) ** 2
-    ts = k2_timesteps(img_tok.shape[1], steps, x1_res, x2_res, y1=y1, y2=y2, mu=mu)
+    ts = chroma_timesteps(img_tok.shape[1], steps, x1_res, x2_res, y1=y1, y2=y2, mu=mu)
 
-    head_chunk.set_seq(txt.shape[1], img_tok.shape[1])
+    set_dit_seq(dit_chunks, txt.shape[1], img_tok.shape[1])
     set_lora_role(dit, "default")
 
     img = img_tok
     for tcurr, tprev in zip(ts[:-1], ts[1:]):
         t_vec = torch.full((n_samples,), tcurr, dtype=torch.float32, device=device)
-        v = dit_pipe.infer((img, txt, t_vec, pos, mask), n_microbatches=1).to(device)
+        v = dit_pipe.infer(
+            (img, img_ids, txt, txtmask, t_vec, guid), n_microbatches=1
+        ).to(device)
         img = img + (tprev - tcurr) * v.to(img.dtype)
 
-    latent = rearrange(
-        img,
-        "b (h w) (c ph pw) -> b c (h ph) (w pw)",
-        ph=patch, pw=patch,
-        h=latent_h // patch,
-        w=latent_w // patch,
-    )
+    latent = vae_unflatten(img, latent_h, latent_w, patch)
     pixels_out = vae_decode(ae, latent).clamp(-1, 1).cpu().float()
     return torch.cat([pixels_out, gt_pixels], dim=0)
 
@@ -220,6 +223,13 @@ def preview_tdm(
 # ---------------------------------------------------------------------------
 
 def train(cfg: dict, config_path: str):
+    # `kill -USR1 <pid>` dumps every thread's stack to stderr — the only way
+    # to see where a wedged run is stuck when ptrace (py-spy) is unavailable
+    # (the 2026-08-21 run hung at step ~409 with one stage spinning).
+    import faulthandler
+    import signal
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+
     _pin_sdpa_backends()
     parallelism, devices, offload = resolve_topology(cfg)
     n_stages = len(devices)
@@ -234,15 +244,15 @@ def train(cfg: dict, config_path: str):
     shutil.copy(config_path, os.path.join(cfg["ckpt_path"], os.path.basename(config_path)))
 
     dtype = torch.bfloat16
-    encoder_id   = cfg.get("encoder_model_id", "Qwen/Qwen3-VL-4B-Instruct")
-    enc_cfg      = ENCODER_CONFIGS[cfg.get("encoder_config", "qwen3_vl_4b")]
-    dit_cfg      = MMDIT_CONFIGS[cfg.get("mmdit_config", "large_wide")]
+    enc_cfg = ENCODER_CONFIGS[cfg.get("encoder_config", "t5_xxl")]
+    encoder_id = cfg.get("encoder_model_id", enc_cfg.model_id)
+    dit_cfg = CHROMA_CONFIGS[cfg.get("chroma_config", "chroma1")]
 
     # ------------------------------------------------------------------
-    # Chunking / offload knobs (same surface as krea2/train.py)
+    # Chunking / offload knobs (same surface as chroma/train.py)
     # ------------------------------------------------------------------
     blocks_per_chunk = cfg.get("blocks_per_chunk", 1)
-    enc_layers_per_chunk = cfg.get("enc_layers_per_chunk", 1)
+    enc_layers_per_chunk = cfg.get("enc_layers_per_chunk", 4)
     offload_window = cfg.get("offload_window", 2)
     offload_pin    = cfg.get("offload_pin", 0)
     backward_mode  = cfg.get("offload_backward", "checkpoint")
@@ -256,6 +266,7 @@ def train(cfg: dict, config_path: str):
     act_offload     = cfg.get("offload_activations", False)
     act_slots       = cfg.get("offload_act_slots", 2)
     enc_window      = cfg.get("enc_offload_window", 2)
+    attn_padding    = cfg.get("attn_padding", 1)
 
     grad_ckpt = cfg.get("grad_ckpt", False)
     if grad_ckpt and offload:
@@ -280,7 +291,7 @@ def train(cfg: dict, config_path: str):
     # TDM knobs
     # ------------------------------------------------------------------
     tdm_steps    = cfg.get("tdm_steps", 4)              # K
-    tdm_cfg      = cfg.get("tdm_cfg", 4.5)              # teacher guidance
+    tdm_cfg      = cfg.get("tdm_cfg", 4.0)              # teacher guidance
     tdm_huber    = cfg.get("tdm_huber", True)
     tdm_huber_c  = cfg.get("tdm_huber_c", 1e-3)
     tdm_separate = cfg.get("tdm_separate_intervals", True)
@@ -312,30 +323,41 @@ def train(cfg: dict, config_path: str):
     # VAE — one resident replica per GPU (preview encode/decode only)
     # ------------------------------------------------------------------
     print("Loading VAE...")
-    base_ae = QwenAutoencoder()
+    base_ae = FluxAutoencoder(cfg.get("vae_model_id", enc_cfg.model_id))
     base_ae.ae = base_ae.ae.to(dtype).eval().requires_grad_(False)
-    aes: dict[str, QwenAutoencoder] = {}
+    aes: dict[str, FluxAutoencoder] = {}
     for dev in devices:
         a = copy.deepcopy(base_ae).to(dev).eval()
         a.requires_grad_(False)
+        # Sliced (per-sample) encode/decode: the preview's full-batch 1024px
+        # decode otherwise peaks ~15 GB in fp32 GroupNorm/conv activations ON
+        # THE DRIVER (the only GPU whose replica ever decodes), and each
+        # preview's different bucket shape leaves the allocator holding new
+        # multi-GB segments — probed at 43 -> 80 GB reserved over 5 previews.
+        # NOTE: enable_tiling() is a measured no-op for this VAE/diffusers
+        # combo; slicing caps the decode at 4.2 GB (worklog 2026-08-21).
+        a.ae.enable_slicing()
         aes[dev] = a
     compression = base_ae.compression
     latent_ch = base_ae.channels
     del base_ae
-    print(f"  VAE replicated on {n_stages} GPU(s).")
+    print(f"  VAE replicated on {n_stages} GPU(s), sliced.")
 
     # ------------------------------------------------------------------
     # Frozen text encoder — chunked, forward-only
     # ------------------------------------------------------------------
-    print("Loading text encoder (Qwen3-VL)...")
-    from transformers import Qwen3VLForConditionalGeneration
+    print("Loading text encoder (T5-XXL)...")
+    from transformers import T5EncoderModel
 
-    tokenizer = K2CaptionTokenizer(encoder_id, max_length=enc_cfg.max_length)
-    qwen = Qwen3VLForConditionalGeneration.from_pretrained(encoder_id, dtype=dtype)
-    qwen = qwen.eval().requires_grad_(False)
-    enc_chunks = build_encoder_chunks(
-        qwen, enc_cfg.select_layers, layers_per_chunk=enc_layers_per_chunk
+    tokenizer = ChromaCaptionTokenizer(
+        encoder_id, subfolder=enc_cfg.tokenizer_subfolder,
+        max_length=enc_cfg.max_length,
     )
+    t5 = T5EncoderModel.from_pretrained(
+        encoder_id, subfolder=enc_cfg.subfolder, dtype=dtype
+    )
+    t5 = t5.eval().requires_grad_(False)
+    enc_chunks = build_encoder_chunks(t5, layers_per_chunk=enc_layers_per_chunk)
     enc_pipe = Pipeline(
         chunk_modules=enc_chunks,
         chunks_per_stage=balance_chunks_by_bytes(enc_chunks, n_stages),
@@ -346,41 +368,42 @@ def train(cfg: dict, config_path: str):
     )
     drop_grad_accumulators(enc_pipe)
     allow_tuple_infer(enc_pipe)
-    del qwen
+    del t5
     n_enc = sum(p.numel() for c in enc_chunks for p in c.parameters())
     print(f"  Encoder ready ({n_enc/1e9:.2f}B params, {len(enc_chunks)} chunks "
           f"over {n_stages} stage(s)).")
 
     # ------------------------------------------------------------------
-    # DiT — teacher weights + two LoRA roles (student=default, fake)
+    # Chroma — teacher weights + two LoRA roles (student=default, fake)
     # ------------------------------------------------------------------
-    print("Loading DiT (teacher base + student/fake LoRA roles)...")
+    print("Loading Chroma (teacher base + student/fake LoRA roles)...")
     with torch.device("meta"):
-        dit = SingleStreamDiT(dit_cfg)
+        dit = Chroma(dit_cfg)
 
-    mmdit_ckpt    = cfg.get("mmdit_checkpoint")
+    chroma_ckpt   = cfg.get("chroma_checkpoint")
     lora_ckpt_cfg = cfg.get("lora_checkpoint")   # student adapter only
     tdm_ckpt_cfg  = cfg.get("tdm_checkpoint")    # both adapters (resume)
     lora_rank     = cfg.get("lora_rank", 32)
     lora_alpha    = cfg.get("lora_alpha", float(lora_rank))
     lora_exclude  = tuple(cfg.get("lora_exclude_prefixes", []))
 
-    if not mmdit_ckpt:
+    if not chroma_ckpt:
         raise RuntimeError(
-            "TDM distills a pretrained teacher — mmdit_checkpoint is required."
+            "TDM distills a pretrained teacher — chroma_checkpoint is required."
         )
-    print(f"  Loading teacher weights from {mmdit_ckpt}...")
-    dit.load_state_dict(load_file(mmdit_ckpt), strict=True, assign=True)
+    print(f"  Loading teacher weights from {chroma_ckpt}...")
+    dit.load_state_dict(load_file(chroma_ckpt), strict=True, assign=True)
 
     inject_lora(dit, rank=lora_rank, alpha=lora_alpha,
                 exclude_prefixes=lora_exclude, extra_roles=(FAKE_ROLE,))
     # Roles must differ ONLY through their own adapters. The non-LoRA
     # trainables inject_lora leaves requires_grad=True (RMSNorm scales,
-    # modulation, biases) are SHARED between student and fake, so they are
-    # excluded from both optimizers and both checkpoints — they stay at the
-    # teacher's values forever. They cannot be requires_grad_(False)-frozen:
-    # RamTorch's Stage puts every module parameter into its autograd inputs
-    # list, and torch.autograd.grad rejects non-grad-requiring tensors.
+    # LayerNorm-free here, but excluded-prefix Linears would count) are
+    # SHARED between student and fake, so they are excluded from both
+    # optimizers and both checkpoints — they stay at the teacher's values
+    # forever. They cannot be requires_grad_(False)-frozen: RamTorch's Stage
+    # puts every module parameter into its autograd inputs list, and
+    # torch.autograd.grad rejects non-grad-requiring tensors.
     student_keys = lora_role_keys(dit, "default")
     fake_keys = lora_role_keys(dit, FAKE_ROLE)
     n_shared = sum(
@@ -400,20 +423,20 @@ def train(cfg: dict, config_path: str):
     named_shapes = dict(dit.named_parameters())
     n_student = sum(named_shapes[k].numel() for k in student_keys)
     n_fake = sum(named_shapes[k].numel() for k in fake_keys)
-    print(f"  DiT [tdm mode]: student {n_student/1e6:.1f}M + fake "
+    print(f"  Chroma [tdm mode]: student {n_student/1e6:.1f}M + fake "
           f"{n_fake/1e6:.1f}M adapter params / {total_n/1e6:.1f}M total.")
 
     # ------------------------------------------------------------------
-    # DiT chunks -> Pipeline
+    # Chunks -> Pipeline
     # ------------------------------------------------------------------
     dit_chunks = build_dit_chunks(dit, blocks_per_chunk=blocks_per_chunk)
-    head_chunk = dit_chunks[-1]
+    dit_chunks[0].attn_padding = attn_padding
     counts = cfg.get("chunks_per_stage") or balance_chunks_by_bytes(dit_chunks, n_stages)
     if grad_ckpt:
         set_dit_grad_ckpt(dit_chunks, True)
-        print("  Gradient checkpointing ENABLED (DiT blocks + text fusion).")
+        print("  Gradient checkpointing ENABLED (embed + double + single blocks).")
 
-    print(f"  Dicing DiT into {len(dit_chunks)} chunks "
+    print(f"  Dicing Chroma into {len(dit_chunks)} chunks "
           f"(blocks_per_chunk={blocks_per_chunk}) over {n_stages} stage(s)"
           + (f", window={offload_window} pin={offload_pin} "
              f"backward={backward_mode} grad_accum={grad_accum_mode}"
@@ -434,8 +457,12 @@ def train(cfg: dict, config_path: str):
         offload=offload,
         **offload_kw,
     )
-    set_resident_out_no_grad(dit_pipe, (3,))   # the relayed RoPE table
+    set_resident_out_no_grad(dit_pipe, (2,))   # the relayed RoPE table
     allow_tuple_infer(dit_pipe)                # rollout/scores go through infer()
+    # grad_accum="cpu" staging is lazily keyed by the FIRST grad packet; with
+    # role-swapped LoRA the student's first update would KeyError in the
+    # writeback thread. Pre-warm with full coverage (see the helper).
+    prewarm_offload_staging(dit_pipe)
 
     # ------------------------------------------------------------------
     # Optimizers — one per role (paper/demo: fake LR ~5x the student LR,
@@ -469,6 +496,11 @@ def train(cfg: dict, config_path: str):
     sched = make_scheduler(opt_g, lambda o: LinearLR(
         o, start_factor=1e-5, end_factor=1.0, total_iters=warmup_steps
     ))
+    # On resume (initial_global_step > 0) fast-forward the warmup so the
+    # student LR continues where it left off; LinearLR saturates at
+    # total_iters, so stepping past warmup is a no-op.
+    for _ in range(min(cfg.get("initial_global_step", 0), warmup_steps)):
+        sched.step()
 
     # ------------------------------------------------------------------
     # Checkpoint save
@@ -546,7 +578,7 @@ def train(cfg: dict, config_path: str):
     mu_y2         = cfg.get("mu_y2", 1.15)
     mu_override   = cfg.get("mu_override", None)
     minres        = cfg.get("minres", 256)
-    maxres        = cfg.get("maxres", 1280)
+    maxres        = cfg.get("maxres", 1024)
     preview_n     = cfg.get("preview_samples", 4)
     preview_quality = cfg.get("preview_quality", 95)
     max_steps     = cfg.get("max_steps", 0)
@@ -602,26 +634,33 @@ def train(cfg: dict, config_path: str):
     # ------------------------------------------------------------------
     # Pipeline call helpers
     # ------------------------------------------------------------------
-    def dit_infer(x, t, txt_mbs, pos, mask):
-        """Forward the chunked DiT on a full batch, chunked into microbatches.
-        Caller sets the LoRA role and head_chunk.set_seq beforehand."""
+    def dit_infer(x, t, txt_mbs, txtmask_mbs, img_ids):
+        """Forward the chunked model on a full batch, chunked into
+        microbatches. Caller sets the LoRA role and set_dit_seq beforehand."""
+        guid = torch.zeros_like(t)
         if n_mb == 1:
-            out = dit_pipe.infer((x, txt_mbs[0], t, pos, mask), n_microbatches=1)
+            out = dit_pipe.infer(
+                (x, img_ids, txt_mbs[0], txtmask_mbs[0], t, guid),
+                n_microbatches=1,
+            )
             return out.to(driver)
         nested = tuple(
-            (x_mb, txt_mbs[k], t_mb, p_mb, m_mb)
-            for k, (x_mb, t_mb, p_mb, m_mb) in enumerate(
-                zip(x.chunk(n_mb), t.chunk(n_mb), pos.chunk(n_mb), mask.chunk(n_mb))
+            (x_mb, ids_mb, txt_mbs[k], txtmask_mbs[k], t_mb, g_mb)
+            for k, (x_mb, ids_mb, t_mb, g_mb) in enumerate(
+                zip(x.chunk(n_mb), img_ids.chunk(n_mb), t.chunk(n_mb),
+                    guid.chunk(n_mb))
             )
         )
         outs = dit_pipe.infer(nested, n_microbatches=n_mb)
         return torch.cat([o.to(driver) for o in outs], dim=0)
 
-    def dit_step(x, t, txt_mbs, pos, mask, targets, loss_fn):
+    def dit_step(x, t, txt_mbs, txtmask_mbs, img_ids, targets, loss_fn):
+        guid = torch.zeros_like(t)
         nested = tuple(
-            (x_mb, txt_mbs[k], t_mb, p_mb, m_mb)
-            for k, (x_mb, t_mb, p_mb, m_mb) in enumerate(
-                zip(x.chunk(n_mb), t.chunk(n_mb), pos.chunk(n_mb), mask.chunk(n_mb))
+            (x_mb, ids_mb, txt_mbs[k], txtmask_mbs[k], t_mb, g_mb)
+            for k, (x_mb, ids_mb, t_mb, g_mb) in enumerate(
+                zip(x.chunk(n_mb), img_ids.chunk(n_mb), t.chunk(n_mb),
+                    guid.chunk(n_mb))
             )
         )
         return dit_pipe.step(
@@ -719,13 +758,11 @@ def train(cfg: dict, config_path: str):
                 enc_pipe, tokenizer, list(captions), n_mb, driver
             )
             txtlen = txt_mbs[0].shape[1]
-            txtmask = torch.cat(txtmask_mbs, dim=0)
             if untxt_cache is None or untxt_cache[0][0].shape[0] * n_mb != B:
                 untxt_cache = encode_captions(
                     enc_pipe, tokenizer, [""] * B, n_mb, driver
                 )
             untxt_mbs, untxtmask_mbs = untxt_cache
-            untxtmask = torch.cat(untxtmask_mbs, dim=0)
 
             # ---------- Latent geometry + K-step schedule ----------
             lat_h = images.shape[2] // compression
@@ -733,16 +770,15 @@ def train(cfg: dict, config_path: str):
             noise = torch.randn(
                 B, latent_ch, lat_h, lat_w, device=driver, dtype=dtype
             )
-            img_tok, pos, mask = prepare(noise, txtlen, patch, txtmask)
-            _, unpos, unmask = prepare(noise, txtlen, patch, untxtmask)
+            img_tok, img_ids = prepare(noise, patch)
             imglen = img_tok.shape[1]
-            ts = k2_timesteps(
+            ts = chroma_timesteps(
                 imglen, tdm_steps, x1_res, x2_res,
                 y1=mu_y1, y2=mu_y2, mu=mu_override,
             )
             ts_t = torch.tensor(ts, device=driver, dtype=torch.float32)
 
-            head_chunk.set_seq(txtlen, imglen)
+            set_dit_seq(dit_chunks, txtlen, imglen)
             _t = time.perf_counter()
             phase_s["data"] += _t - _t_data
 
@@ -753,7 +789,7 @@ def train(cfg: dict, config_path: str):
                 x = img_tok
                 for k in range(tdm_steps):
                     t_vec = torch.full((B,), ts[k], dtype=torch.float32, device=driver)
-                    v = dit_infer(x, t_vec, txt_mbs, pos, mask).float()
+                    v = dit_infer(x, t_vec, txt_mbs, txtmask_mbs, img_ids).float()
                     xf = x.float()
                     xs.append(x)
                     x0s.append(xf - ts[k] * v)
@@ -779,7 +815,8 @@ def train(cfg: dict, config_path: str):
 
             set_lora_role(dit, FAKE_ROLE)
             result_d = dit_step(
-                x_tau.to(dtype), tau, txt_mbs, pos, mask, fake_targets, loss_fn_fake
+                x_tau.to(dtype), tau, txt_mbs, txtmask_mbs, img_ids,
+                fake_targets, loss_fn_fake,
             )
             _optimize(opt_d, fake_params)
             loss_d = result_d.loss.item()
@@ -796,10 +833,10 @@ def train(cfg: dict, config_path: str):
                 ta4 = tau.view(B, 1, 1)
 
                 set_lora_role(dit, None)   # teacher
-                v_real = dit_infer(x_tau_b, tau, txt_mbs, pos, mask).float()
-                v_unc = dit_infer(x_tau_b, tau, untxt_mbs, unpos, unmask).float()
+                v_real = dit_infer(x_tau_b, tau, txt_mbs, txtmask_mbs, img_ids).float()
+                v_unc = dit_infer(x_tau_b, tau, untxt_mbs, untxtmask_mbs, img_ids).float()
                 set_lora_role(dit, FAKE_ROLE)
-                v_fake = dit_infer(x_tau_b, tau, txt_mbs, pos, mask).float()
+                v_fake = dit_infer(x_tau_b, tau, txt_mbs, txtmask_mbs, img_ids).float()
 
                 x0_real = x_tau - ta4 * v_real
                 x0_unc = x_tau - ta4 * v_unc
@@ -837,7 +874,7 @@ def train(cfg: dict, config_path: str):
             # 3b. Re-run the ONE student step with grad against sg(coop).
             set_lora_role(dit, "default")
             result_g = dit_step(
-                x_tm, t_m, txt_mbs, pos, mask, gen_targets, loss_fn_gen
+                x_tm, t_m, txt_mbs, txtmask_mbs, img_ids, gen_targets, loss_fn_gen
             )
             _t, _prev = time.perf_counter(), _t
             phase_s["student"] += _t - _prev
@@ -874,7 +911,7 @@ def train(cfg: dict, config_path: str):
                     aes, devices, images[: min(preview_n, B)], driver
                 )
                 rows = preview_tdm(
-                    dit_pipe, head_chunk, dit, enc_pipe, tokenizer, aes[driver],
+                    dit_pipe, dit_chunks, dit, enc_pipe, tokenizer, aes[driver],
                     patch, compression,
                     x0_clean, list(captions),
                     steps=tdm_steps,
@@ -892,7 +929,12 @@ def train(cfg: dict, config_path: str):
                     from torchvision.utils import save_image
                     save_image(grid, img_path)
                 print(f"[preview] Saved {img_path}")
+                # Restore the training seq split clobbered by preview_tdm().
+                set_dit_seq(dit_chunks, txtlen, imglen)
                 dit.train()
+                # Each preview decodes at that batch's bucket shape; return the
+                # odd-shaped segments so reserved memory doesn't ratchet up.
+                torch.cuda.empty_cache()
 
             global_step += 1
             if max_steps > 0 and global_step >= max_steps:
@@ -906,7 +948,7 @@ def train(cfg: dict, config_path: str):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("config", nargs="?",
-                    default="krea2/configs/train_tdm_lora.json")
+                    default="chroma/configs/train_tdm_lora.json")
     ap.add_argument("--parallelism", choices=list(PARALLELISM),
                     help="override the config's parallelism (hardware strategy)")
     ap.add_argument("--devices", nargs="+", help="override the config's devices")

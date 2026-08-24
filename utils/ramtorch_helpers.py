@@ -90,6 +90,36 @@ def zero_grads(pipe):
         st.zero_grad_acc()
 
 
+def prewarm_offload_staging(pipe):
+    """Pre-allocate the ``grad_accum="cpu"`` D2H staging buffers with FULL
+    parameter coverage.
+
+    `OffloadModel._do_writeback` allocates a streamed chunk's pinned staging
+    dict lazily, keyed by the FIRST backward's grad packet — and never extends
+    it. With role-swapped LoRA (TDM) the first packet only carries one role's
+    ``lora_*`` keys, so the other role's first update dies in the writeback
+    thread with a KeyError. ``grad_acc`` always covers every parameter, so
+    mirroring it is a strict superset of any packet. The extra pinned RAM over
+    the lazy path is just the inactive role's adapters: the packet already
+    contains the frozen-by-exclusion base grads (RamTorch computes grads for
+    every param it streams). No-op for resident stages and "stream" accum.
+    """
+    import torch
+
+    for st in offload_stages(pipe):
+        eng = st.engine
+        if getattr(eng, "grad_accum", None) != "cpu":
+            continue
+        for state in eng._state:
+            if state.gpu_pinned or state.staging is not None:
+                continue
+            state.staging = {
+                n: torch.empty(a.shape, dtype=a.dtype, device="cpu",
+                               pin_memory=eng._cuda)
+                for n, a in state.grad_acc.items()
+            }
+
+
 def drop_grad_accumulators(pipe):
     """Free the grad accumulators RamTorch allocates for a FROZEN module.
 

@@ -1,0 +1,98 @@
+{
+    "_comment": "Smoke test for chroma/train_tdm.py — 256px, 6 steps, preview at step 4. Works for every parallelism; pick one on the command line, e.g.: uv run python chroma/train_tdm.py chroma/configs/train_tdm_smoke.json --parallelism pipeline --devices cuda:0 cuda:1. Point chroma_checkpoint and parquet_sources at real files before running.",
+
+    "seed": 42,
+    "initial_global_step": 0,
+
+    "parallelism": "offload",
+    "chunks_per_stage": null,
+    "n_microbatches": 2,
+    "schedule": "staggered_1b1f",
+
+    "blocks_per_chunk": 1,
+    "offload_window": 4,
+    "offload_pin": 0,
+    "offload_backward": "checkpoint",
+    "offload_grad_accum": "cpu",
+    "offload_acc_slots": null,
+    "offload_activations": false,
+    "offload_act_slots": 2,
+    "enc_layers_per_chunk": 4,
+    "enc_offload_window": 2,
+    "grad_ckpt": false,
+
+    "batch_size": 2,
+    "lr": 2e-5,
+    "fake_lr": 1e-4,
+    "weight_decay": 1e-4,
+    "betas": [0.0, 0.95],
+    "warmup": 100,
+    "max_grad_norm": 1.0,
+    "max_steps": 6,
+
+    "tdm_steps": 4,
+    "tdm_cfg": 4.0,
+    "tdm_huber": true,
+    "tdm_huber_c": 1e-3,
+    "tdm_separate_intervals": true,
+    "tdm_randmid": false,
+    "tdm_ca_ratio": null,
+    "tdm_dm_floor": 0.25,
+
+    "mu_y1": 0.5,
+    "mu_y2": 1.15,
+    "mu_override": null,
+    "minres": 256,
+    "maxres": 1024,
+
+    "attn_padding": 1,
+
+    "eval_interval": 4,
+    "save_every_n_steps": 0,
+    "log_every_n_steps": 1,
+
+    "preview_samples": 2,
+    "preview_quality": 95,
+
+    "ckpt_path": "runs/chroma-tdm-smoke/ckpts",
+    "preview_path": "runs/chroma-tdm-smoke/previews",
+
+    "chroma_config": "chroma1",
+    "encoder_config": "t5_xxl",
+
+    "vae_model_id": "lodestones/Chroma1-HD",
+    "encoder_model_id": "lodestones/Chroma1-HD",
+
+    "chroma_checkpoint": "checkpoints/chroma/Chroma1-HD.safetensors",
+    "lora_checkpoint": null,
+    "tdm_checkpoint": null,
+
+    "lora_rank": 32,
+    "lora_alpha": 32.0,
+    "lora_exclude_prefixes": [],
+
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "e621": {
+                "path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=e621",
+                "n_samples": 2000
+            }
+        },
+        "caption_columns": {
+            "tags": {"weight": 1.0, "is_tag_based": true}
+        },
+        "filename_column": "file_path",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [256],
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "ratio_cutoff": 2.0,
+        "resolution_step": 64,
+        "num_workers": 4,
+        "prefetch_factor": 2,
+        "offset": 0
+    }
+}

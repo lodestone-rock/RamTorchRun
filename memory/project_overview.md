@@ -6,7 +6,8 @@
 **real, usable examples** (not snippets) on a single node with multiple GPUs,
 deliberately avoiding NVLink-dependent techniques. The first demo model is
 Krea-2 (K2), a ~12B-parameter MMDiT text-to-image diffusion model with a
-Qwen-Image VAE and a Qwen3-VL-4B text encoder.
+Qwen-Image VAE and a Qwen3-VL-4B text encoder. The second is Chroma
+(`chroma/`, lodestones/Chroma1-HD, 8.9B flux-style DiT with T5-XXL).
 
 Three target use cases, all implemented:
 
@@ -21,16 +22,18 @@ Three target use cases, all implemented:
 
 ## Structure: one folder per model
 
-The repo is organized per model, not per concern. `krea2/` owns its trainer,
-inference script, model code, and configs. Only generic infra is shared:
+The repo is organized per model, not per concern. `krea2/` and `chroma/` each
+own their trainers, inference script, model code, and configs. Only generic
+infra is shared:
 `dataloaders/` (parquet image+caption dataset with aspect-ratio bucketing;
 the scipy-based OT variant was intentionally not ported),
 `utils/checkpoint.py` (LoRA load / merge helpers), `utils/profiling.py`
 (`TraceCapture`, Perfetto capture over a sampling loop) and
 `utils/ramtorch_helpers.py` (grad-flush / accumulator plumbing that differs
-between resident and streamed stages). **Model folders never import from each
-other** — a future `flux/` is a sibling with the same shape, built by
-copy-and-adapt rather than by generalizing `krea2/`.
+between resident and streamed stages, plus `prewarm_offload_staging` for
+role-swapped LoRA under offload+cpu grad accum). **Model folders never import
+from each other** — `chroma/` was built by copy-and-adapt from `krea2/`, not
+by generalizing it; any future model folder follows the same pattern.
 
 ## Architecture: dice once, flag the strategy
 
@@ -104,6 +107,28 @@ Adding an execution mode means adding a flag, never a second trainer.
   Dataset paths and `mmdit_checkpoint` are placeholders the user must point at
   real files (the smoke config points at a local e621 parquet on this machine).
 
+## Current state: chroma/ (2026-08-20)
+
+Same shape as `krea2/`, targeting `lodestones/Chroma1-HD` (8.9B flux-style
+DiT: 19 double + 38 single blocks, modulation distilled from an Approximator,
+T5-XXL encoder + flux VAE, both auto-downloaded from the same HF repo; the
+DiT base is a local safetensors file, `chroma_checkpoint`). Key differences
+from krea2, all documented in the 2026-08-20 worklog entry:
+
+- Dicing is 59 chunks (embed + 19 double + 38 single + head) relaying
+  `(x, mod, pe, attn_mask)`; the modulation tensor rides the relay so its
+  grads reach the Approximator in the embed chunk. `set_dit_seq` fixes the
+  txt/img split before every step.
+- The embed chunk (stage 0 = driver) is grad-checkpointed along with the
+  blocks — the ported krea2 lopsided-driver-VRAM fix (there it was the
+  TextFusion projector, here the Approximator + input projections).
+- TDM in offload mode requires `prewarm_offload_staging` (see Key facts).
+- `guidance` input to the model is always 0; CFG is applied externally in
+  sampling (Chroma distilled guidance out of the model).
+- Both trainers, inference, parity/role tools, and 9 configs mirror krea2's.
+  Parity 18/18 bit-exact; TDM roles all pass; GPU smokes of both trainers
+  exit 0 with sane losses and coherent previews.
+
 ## Key facts
 
 - Launch is **plain `python`** (one process drives all pipeline stages via
@@ -140,9 +165,12 @@ Adding an execution mode means adding a flag, never a second trainer.
 
 ## Roadmap
 
-- [ ] Second model folder (`flux/`) following the same per-model shape. The
-      chunk-based layout is what makes this cheap: copy `chunks.py` + `train.py`
-      and re-dice, the execution strategies come for free.
+- [x] Second model folder following the same per-model shape — done as
+      `chroma/` (2026-08-20): copied `chunks.py` + trainers and re-diced,
+      the execution strategies came for free.
+- [ ] Call `prewarm_offload_staging` from `krea2/train_tdm.py` too (same
+      latent offload+cpu-accum+role-swap KeyError; krea2 TDM has only ever
+      run in pipeline mode).
 - [ ] Scripted offload-vs-baseline inference benchmark (currently manual: run
       `krea2/inference.py` with and without `--offload` on the same
       prompt/seed).

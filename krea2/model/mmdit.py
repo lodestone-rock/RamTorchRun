@@ -296,6 +296,9 @@ class TextFusionTransformer(torch.nn.Module):
             ]
         )
 
+    def _project(self, x: Tensor) -> Tensor:
+        return self.projector(x).squeeze(-1)
+
     def forward(self, x: Tensor, mask: Tensor | None = None) -> Tensor:
         b, l, n, d = x.shape
         x = x.reshape(b * l, n, d)
@@ -305,8 +308,13 @@ class TextFusionTransformer(torch.nn.Module):
             else:
                 x = block(x.contiguous(), mask=None)
         x = rearrange(x, "(b l) n d -> b l d n", b=b, l=l)
-        x = self.projector(x)
-        x = x.squeeze(-1)
+        # The projector's "batch" is b*l*d elements, so its saved-for-backward
+        # activations (especially the LoRA [.., rank] intermediate) dominate
+        # stage-0 VRAM per in-flight microbatch. Checkpoint it like the blocks.
+        if torch.is_grad_enabled() and getattr(self, 'grad_ckpt', False):
+            x = _ckpt.checkpoint(self._project, x, use_reentrant=False)
+        else:
+            x = self._project(x)
 
         for block in self.refiner_blocks:
             if torch.is_grad_enabled() and getattr(self, 'grad_ckpt', False):

@@ -1,0 +1,106 @@
+{
+    "_comment": "Radiance x0 patch-16 SINGLE-GPU offload LoRA fine-tune. See radiance/train.py. The whole 9.5B model is diced into one chunk per block (64 chunks: embed + 19 double + 38 single + nerf-embed + 4 NerfGLUBlock + head) and streams from pinned CPU RAM through a small GPU window; the frozen T5-XXL encoder streams the same way. Needs ~24 GB host RAM for the bf16 masters + grad accumulators + AdamW state on the LoRA params. There is NO VAE: the model reads and writes pixels, and the dataloader's [-1, 1] images are already the target.",
+
+    "seed": 42,
+    "initial_global_step": 0,
+
+    "_comment_topology": "parallelism: 'offload' = 1 GPU with weight streaming, 'pipeline' = N GPUs resident, 'pipeline-offload' = N GPUs with streaming. Independent of 'mode' (lora/full), which is the fine-tuning target. devices defaults to cuda:0 for offload.",
+    "parallelism": "offload",
+    "devices": ["cuda:0"],
+    "n_microbatches": 4,
+    "schedule": "staggered_1b1f",
+
+    "_comment_chunks": "blocks_per_chunk: transformer blocks per streamed chunk (1 = finest; doubles, singles and NeRF blocks never share a chunk). offload_window: GPU slots streamed ahead (>=2 overlaps load with compute). offload_pin: chunks kept permanently resident. offload_backward: 'checkpoint' (per-chunk recompute, dropout-safe, cheapest VRAM) or 'keep' (fastest, holds every chunk's graph). offload_grad_accum: where microbatch gradients accumulate — 'cpu' for LoRA (small trainable slice, host adds are cheap), 'stream' for full FT. enc_layers_per_chunk: T5-XXL layers per encoder chunk (24 layers; 4 -> 6 chunks of ~680M).",
+    "blocks_per_chunk": 1,
+    "offload_window": 4,
+    "offload_pin": 0,
+    "offload_backward": "checkpoint",
+    "offload_grad_accum": "cpu",
+    "offload_acc_slots": null,
+    "offload_activations": false,
+    "offload_act_slots": 2,
+    "enc_layers_per_chunk": 4,
+    "enc_offload_window": 2,
+
+    "_comment_batch": "batch_size is PER MICROBATCH; effective batch = batch_size * n_microbatches.",
+    "batch_size": 2,
+    "lr": 1e-4,
+    "weight_decay": 1e-4,
+    "warmup": 200,
+    "max_grad_norm": 1.0,
+    "max_steps": 0,
+
+    "_comment_timeshift": "Resolution-aware shifted logit-uniform schedule, unchanged from chroma: mu = ln(alpha) interpolated between (256px, 0.5) and (1024px, 1.15) in IMAGE-TOKEN count. Patch 16 on pixels gives the same token counts as chroma's f8 VAE + patch 2 (8*2 = 16), so these anchors transfer exactly.",
+    "mu_y1": 0.5,
+    "mu_y2": 1.15,
+    "mu_override": null,
+    "mu_sigma": 1.0,
+    "minres": 256,
+    "maxres": 1024,
+
+    "_comment_attn": "attn_padding: number of T5 padding tokens after each caption left attendable (flow's modify_mask_to_attend_padding).",
+    "attn_padding": 1,
+    "uncond_ratio": 0.1,
+
+    "_comment_eval": "eval_interval: steps between preview grids (0 disables previews; each preview streams the whole model once per CFG branch per sampler step). Previews need no decode — the model emits pixels.",
+    "eval_interval": 200,
+    "save_every_n_steps": 1000,
+    "log_every_n_steps": 10,
+
+    "preview_samples": 4,
+    "preview_cfg_scale": 4.0,
+    "preview_steps": 28,
+    "preview_mu": null,
+    "preview_quality": 95,
+
+    "ckpt_path": "runs/radiance-offload-lora/ckpts",
+    "preview_path": "runs/radiance-offload-lora/previews",
+
+    "radiance_config": "radiance_x0_p16",
+    "encoder_config": "t5_xxl",
+
+    "encoder_model_id": "lodestones/Chroma1-HD",
+
+    "_comment_txt_pos": "RoPE axis-0 positions for the TEXT stream: 'zeros' (chroma's convention) or 'arange' (flow's radiance.py::make_text_position_ids). SETTLED EMPIRICALLY for latest_x0.safetensors: 'zeros' scores 7.7% lower training loss on 8/8 real samples and 'arange' streaks visibly at 512px. Re-run radiance/tools/check_txt_pos_ids.py if you ever point radiance_checkpoint at a differently-trained base.",
+    "txt_pos_ids": "zeros",
+
+    "_comment_ckpt": "Path to the Radiance x0 patch-16 base weights (safetensors, native flow keys, 659 tensors). See checkpoints/README.md.",
+    "radiance_checkpoint": "checkpoints/radiance/latest_x0.safetensors",
+
+    "_comment_mode": "mode='lora' (default): LoRA adapters on all nn.Linear + unfrozen RMSNorm scales, whole model bf16 (halves PCIe traffic vs fp32). mode='full': fp32 masters + bf16 autocast compute — see train_offload_full.json for the host-RAM budget. In full mode, resume priority: full_checkpoint > lora_checkpoint (merged into radiance_checkpoint) > radiance_checkpoint.",
+    "mode": "lora",
+    "full_checkpoint": null,
+    "lora_checkpoint": null,
+
+    "_comment_lora": "lora_exclude_prefixes: the frozen Approximator, plus nerf_image_embedder — Linear(67 -> 64) at p16, where a rank-32 adapter is larger than the layer it adapts. frozen_prefixes drops matching params from the optimizer; the Approximator also runs under no_grad inside the embed chunk.",
+    "lora_rank": 32,
+    "lora_alpha": 32.0,
+    "lora_exclude_prefixes": ["distilled_guidance_layer", "nerf_image_embedder"],
+    "frozen_prefixes": ["distilled_guidance_layer"],
+
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "my_dataset": {
+                "path": "data/my_dataset.parquet",
+                "n_samples": null
+            }
+        },
+        "caption_columns": {
+            "tags": {"weight": 1.0, "is_tag_based": true}
+        },
+        "filename_column": "file_path",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [256, 512, 1024],
+        "base_resolution_weights": [1.0, 1.0, 1.0],
+        "ratio_cutoff": 2.0,
+        "resolution_step": 16,
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "offset": 0,
+        "num_workers": 4,
+        "prefetch_factor": 2
+    }
+}

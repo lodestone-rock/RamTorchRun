@@ -59,6 +59,26 @@ def set_resident_out_no_grad(pipe, out_no_grad: tuple[int, ...]):
             st.module.out_no_grad = out_no_grad
 
 
+def set_resident_out_no_grad_per_stage(pipe, chunks, chunks_per_stage):
+    """`set_resident_out_no_grad`, but read off each stage's LAST chunk.
+
+    Needed when the relay tuple CHANGES SHAPE partway down the chunk list, so
+    no single index set describes every boundary — radiance relays
+    ``(x, img_px, t, mod, pe, attn_mask)`` through the transformer and
+    ``(img_dct, nerf_cond, img_px, t)`` through the NeRF head. A stage's output
+    is its last chunk's output, so that chunk's own declaration is the right
+    one; streamed stages already read it there themselves.
+    """
+    idx = 0
+    ends = []
+    for cnt in chunks_per_stage:
+        idx += cnt
+        ends.append(chunks[idx - 1])
+    for st, last in zip(pipe.stages, ends):
+        if not isinstance(st, OffloadStage):
+            st.module.out_no_grad = tuple(getattr(last, "out_no_grad", ()))
+
+
 def flush_grads(pipe, n_microbatches: int):
     """Scale accumulated grads by 1/k and expose them as ``.grad``.
 
@@ -169,19 +189,27 @@ def chunk_params_by_stage(
     devices: list[str],
     *,
     trainable_only: bool = True,
+    exclude_ids: set[int] | None = None,
 ) -> list[tuple[str, list]]:
     """``[(device, params owned by the stage on it), ...]``.
 
     A chunk's parameters belong to exactly one stage, which is what lets the
     optimizer be sharded the same way the model is. Deduplicates by identity in
     case two chunks share a module.
+
+    ``exclude_ids`` drops params by ``id()``. Under RamTorch nothing can be
+    frozen with ``requires_grad_(False)``, so "frozen" always means "kept out of
+    the optimizer" — this is how a caller passes that decision through.
     """
+    exclude_ids = exclude_ids or set()
     groups, idx, seen = [], 0, set()
     for dev, cnt in zip(devices, chunks_per_stage):
         params = []
         for c in chunks[idx:idx + cnt]:
             for p in c.parameters():
                 if (trainable_only and not p.requires_grad) or id(p) in seen:
+                    continue
+                if id(p) in exclude_ids:
                     continue
                 seen.add(id(p))
                 params.append(p)
@@ -278,6 +306,7 @@ def build_offload_adamw(
     window: int = 2,
     state_dtype=None,
     stochastic_rounding: bool = False,
+    exclude_ids: set[int] | None = None,
 ) -> MultiOptimizer:
     """AdamW whose state lives in host RAM and whose math runs on the GPUs.
 
@@ -297,6 +326,9 @@ def build_offload_adamw(
     of 102 GB for 12.8B params) and the PCIe traffic; pair it with
     ``stochastic_rounding=True`` so repeated round-to-nearest does not bias the
     small updates.
+
+    ``exclude_ids`` is forwarded to `chunk_params_by_stage` — params to keep out
+    of the optimizer despite ``requires_grad=True`` (frozen-by-exclusion).
     """
     try:
         from ramtorch.offload_optimizer import OffloadAdamW
@@ -310,7 +342,9 @@ def build_offload_adamw(
     import torch
 
     opts = []
-    for dev, params in chunk_params_by_stage(chunks, chunks_per_stage, devices):
+    for dev, params in chunk_params_by_stage(
+        chunks, chunks_per_stage, devices, exclude_ids=exclude_ids
+    ):
         if not params:
             continue
         opts.append(OffloadAdamW(

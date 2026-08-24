@@ -1,0 +1,117 @@
+{
+    "_comment": "TDM few-step distillation (radiance/train_tdm.py) with role-based LoRA: one frozen 9.5B Radiance x0 base + a student adapter (standard lora_A/lora_B keys) + a fake-score adapter (lora_A_fake/lora_B_fake). Data-free w.r.t. images — the parquet dataset supplies captions (and preview ground truth). The student is a tdm_steps-step CFG-free sampler; the saved tdm_student_*.safetensors loads directly into inference.py --lora with --steps 4 and guidance 0. Works for every parallelism (override with --parallelism/--devices).",
+
+    "seed": 42,
+    "initial_global_step": 0,
+
+    "parallelism": "pipeline",
+    "devices": ["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+    "chunks_per_stage": null,
+    "n_microbatches": 8,
+    "schedule": "staggered_1b1f",
+
+    "blocks_per_chunk": 1,
+    "offload_window": 4,
+    "offload_pin": 0,
+    "offload_backward": "checkpoint",
+    "_comment_grad_accum": "'cpu' for LoRA-sized trainables (see memory/worklog.md).",
+    "offload_grad_accum": "cpu",
+    "offload_acc_slots": null,
+    "offload_activations": false,
+    "offload_act_slots": 2,
+    "enc_layers_per_chunk": 4,
+    "enc_offload_window": 2,
+    "_comment_grad_ckpt": "MUST stay true at this batch: RamTorch stage workers run forwards on their own threads where the driver's (thread-local) no_grad does not apply, so even infer() builds graphs and keeps activations alive — per-block checkpointing collapses that footprint (krea2 2026-08-18 probes). It also covers each NerfGLUBlock, whose [B*N, 49152] generated weights are the largest activation in the model.",
+    "grad_ckpt": true,
+
+    "_comment_batch": "2x8=16 in-flight samples at 1024px. Halved from chroma's 4x8 as a starting point: the same 4096 image tokens per sample, but the NeRF head adds a per-patch hypernetwork on top, so the last stage is the constraint. Raise it once the first run's peak-VRAM line is known.",
+    "batch_size": 2,
+    "_comment_lr": "Demo recipe: fake-score LR ~5x the student LR, betas (0, 0.95), clip 1.0 on both. Chroma's halved LRs, carried over — at full LR (2e-5/1e-4) both chroma modes showed periodic loss spikes and grainy 4-step convergence.",
+    "lr": 1e-5,
+    "fake_lr": 5e-5,
+    "weight_decay": 1e-4,
+    "betas": [0.0, 0.95],
+    "warmup": 100,
+    "max_grad_norm": 1.0,
+    "max_steps": 1500,
+
+    "_comment_tdm": "tdm_steps = K (student sampling steps). tdm_cfg = teacher guidance baked into the student — NOTE this is external CFG against the empty prompt; the model's own guidance input stays 0 (Chroma1 convention, which radiance inherits). tdm_separate_intervals keeps each segment's diffused tau range non-overlapping (paper default); tdm_randmid is the demo's optional mid-point regularizer. tdm_huber enables the Pseudo-Huber surrogate objective for the student update.",
+    "tdm_steps": 4,
+    "tdm_cfg": 3.0,
+    "tdm_huber": true,
+    "tdm_huber_c": 1e-3,
+    "tdm_separate_intervals": true,
+    "tdm_randmid": false,
+
+    "_comment_decoupled": "Decoupled DMD (arXiv:2511.22677): the DMD target splits as DM + (tdm_cfg-1)*CA with DM = x0_real - x0_fake (regularizer) and CA = x0_real - x0_unc (engine). tdm_ca_ratio = lam replaces the legacy sum with a normalized mix. null = legacy math.",
+    "_comment_ratio": "!! WARNING (2026-08-21, reconfirmed 2026-08-23): DO NOT USE the ratio rescale — keep tdm_ca_ratio null (legacy math). Three chroma runs in ratio mode collapsed (loss_d exploding while previews degenerated). Legacy delta at cfg 3 is DM + 2*CA. See memory/worklog.md.",
+    "tdm_ca_ratio": null,
+    "tdm_dm_floor": 0.25,
+
+    "_comment_x0_eps": "Note for readers: this trainer forces the x0->v residual epsilon to 0.0 (set_x0_eps), unlike train.py's 5e-2, because TDM reconstructs x0 = x - t*v and that identity only holds at eps = 0. Not configurable.",
+
+    "mu_y1": 0.5,
+    "mu_y2": 1.15,
+    "mu_override": null,
+    "minres": 256,
+    "maxres": 1024,
+
+    "attn_padding": 1,
+
+    "eval_interval": 50,
+    "save_every_n_steps": 50,
+    "log_every_n_steps": 10,
+
+    "preview_samples": 4,
+    "preview_quality": 95,
+
+    "ckpt_path": "runs/radiance-tdm-1024-r128/ckpts",
+    "preview_path": "runs/radiance-tdm-1024-r128/previews",
+
+    "radiance_config": "radiance_x0_p16",
+    "encoder_config": "t5_xxl",
+
+    "encoder_model_id": "lodestones/Chroma1-HD",
+
+    "txt_pos_ids": "zeros",
+
+    "_comment_teacher": "Teacher = Radiance x0 patch-16 base weights (bf16, native flow keys, 659 tensors).",
+    "radiance_checkpoint": "checkpoints/radiance/latest_x0.safetensors",
+    "lora_checkpoint": null,
+    "tdm_checkpoint": null,
+
+    "lora_rank": 128,
+    "lora_alpha": 128.0,
+    "lora_exclude_prefixes": ["distilled_guidance_layer", "nerf_image_embedder"],
+
+    "_comment_data": "TDM only consumes captions; images are loaded solely for preview ground truth, so worker count is modest.",
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "e621":       {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=e621",       "n_samples": 21702},
+            "danbooru":   {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=danbooru",   "n_samples": 19987},
+            "deviantart": {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=deviantart", "n_samples": 6717},
+            "midjourney": {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=midjourney", "n_samples": 10000},
+            "reddit":     {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=reddit",     "n_samples": 19260}
+        },
+        "caption_columns": {
+            "tags":                     {"weight": 0.25, "is_tag_based": true},
+            "midjourney_style_summary": {"weight": 0.25, "is_tag_based": false},
+            "brief_summary":            {"weight": 0.25, "is_tag_based": false},
+            "10_word_summary":          {"weight": 0.25, "is_tag_based": false}
+        },
+        "filename_column": "file_path",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [1024],
+        "base_resolution_weights": [1.0],
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "ratio_cutoff": 2.0,
+        "resolution_step": 64,
+        "num_workers": 16,
+        "prefetch_factor": 4,
+        "offset": 0
+    }
+}

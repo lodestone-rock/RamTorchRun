@@ -7,7 +7,9 @@
 deliberately avoiding NVLink-dependent techniques. The first demo model is
 Krea-2 (K2), a ~12B-parameter MMDiT text-to-image diffusion model with a
 Qwen-Image VAE and a Qwen3-VL-4B text encoder. The second is Chroma
-(`chroma/`, lodestones/Chroma1-HD, 8.9B flux-style DiT with T5-XXL).
+(`chroma/`, lodestones/Chroma1-HD, 8.9B flux-style DiT with T5-XXL). The third
+is Radiance (`radiance/`, 9.5B x0-prediction sibling of Chroma that reads and
+writes **pixels** through a NeRF decoder head — no VAE at all).
 
 Three target use cases, all implemented:
 
@@ -22,9 +24,9 @@ Three target use cases, all implemented:
 
 ## Structure: one folder per model
 
-The repo is organized per model, not per concern. `krea2/` and `chroma/` each
-own their trainers, inference script, model code, and configs. Only generic
-infra is shared:
+The repo is organized per model, not per concern. `krea2/`, `chroma/` and
+`radiance/` each own their trainers, inference script, model code, and configs.
+Only generic infra is shared:
 `dataloaders/` (parquet image+caption dataset with aspect-ratio bucketing;
 the scipy-based OT variant was intentionally not ported),
 `utils/checkpoint.py` (LoRA load / merge helpers), `utils/profiling.py`
@@ -33,7 +35,8 @@ the scipy-based OT variant was intentionally not ported),
 between resident and streamed stages, plus `prewarm_offload_staging` for
 role-swapped LoRA under offload+cpu grad accum). **Model folders never import
 from each other** — `chroma/` was built by copy-and-adapt from `krea2/`, not
-by generalizing it; any future model folder follows the same pattern.
+by generalizing it, and `radiance/` from `chroma/` the same way; any future
+model folder follows the same pattern.
 
 ## Architecture: dice once, flag the strategy
 
@@ -129,6 +132,64 @@ from krea2, all documented in the 2026-08-20 worklog entry:
   Parity 18/18 bit-exact; TDM roles all pass; GPU smokes of both trainers
   exit 0 with sane losses and coherent previews.
 
+## Current state: radiance/ (2026-08-23)
+
+Radiance x0 patch-16: Chroma's transformer (19 double + 38 single, hidden 3072,
+24 heads, `axes_dim [16,56,56]`, the same 5-layer Approximator producing 344 mod
+rows, the same T5-XXL) with two swaps and **no autoencoder**:
+
+- `img_in: Linear(64->3072)` becomes `img_in_patch: Conv2d(3, 3072, k=16, s=16)`,
+  so the model consumes and emits `[B, 3, H, W]` pixels directly.
+- `final_layer: LastLayer` becomes a NeRF decoder head: `nerf_image_embedder`
+  (DCT positional embedding over each patch's raw pixels, the one **fp32** layer
+  in the checkpoint) -> 4 x `NerfGLUBlock` (a hypernetwork whose
+  `param_generator: Linear(3072->49152)` generates per-patch GLU weights) ->
+  `nerf_final_layer_conv` (RMSNorm + `fold` + `Conv2d(64, 3, k=3)`).
+- The head predicts **x0**; `v = (noisy - x0) / (t + eps)` converts it, so every
+  v-space formula downstream (flow loss, Euler sampler, TDM's `x0 = x - t*v`) is
+  unchanged. Base weights: `checkpoints/radiance/latest_x0.safetensors`, 659
+  tensors, 9.506B params, strict-loaded (659/659, no missing/unexpected).
+
+Patch 16 on pixels gives the **same token counts** as chroma's f8 VAE + patch 2
+(`8*2 = 16`), so `_mu_from_seq_len`'s (256, 0.5) / (4096, 1.15) anchors,
+`minres`/`maxres` and the dataloader's buckets all carry over untouched.
+Wherever chroma writes `align = ae.compression * patch`, radiance writes
+`align = patch_size`. The dataloader already hands back `[-1, 1]` images, which
+is exactly the model's input space.
+
+Differences that matter, all in the 2026-08-23 worklog entry:
+
+- Dicing is **64 chunks** (embed + 19 double + 38 single + nerf-embed + 4 NeRF
+  blocks + head). The transformer relays
+  `(x, img_px, t, mod, pe, attn_mask)` with `out_no_grad=(1,2,3,4)`; the NeRF
+  head relays `(img_dct, nerf_cond, img_px, t)`. `img_px` (the raw noisy image)
+  must reach the far end twice — the NeRF embedder reads each patch's raw pixels
+  and the head needs `noisy`/`t` for the x0->v residual, plus `H, W` for `fold`.
+- Because the relay **changes shape** mid-list, no single `out_no_grad` index set
+  describes every stage boundary. `utils/ramtorch_helpers.py` grew
+  `set_resident_out_no_grad_per_stage`, which reads the declaration off each
+  stage's LAST chunk instead.
+- The **Approximator is frozen** (the reference's choice): it runs under
+  `torch.no_grad()` in the embed chunk and is excluded from LoRA and from both
+  optimizers, so `mod` is a pure no-grad relay and 62 chunks stop computing
+  `dL/dmod`. `chunk_params_by_stage`/`build_offload_adamw` grew `exclude_ids`
+  for this (you cannot `requires_grad_(False)` under RamTorch).
+- `x0_eps` is **explicit state** (`set_x0_eps`), not `self.training`: `train.py`
+  uses `5e-2` to match its target `(noisy - x1) / (t + 5e-2)`; `train_tdm.py`
+  and inference use `0.0` because they invert the residual.
+- `LoRA excludes `nerf_image_embedder`` (`Linear(67->64)` — a rank-32 adapter is
+  bigger than the layer, the same pathology as krea2's TextFusion projector).
+- **`txt_pos_ids: "zeros"`**, settled empirically, NOT as the plan assumed. See
+  the worklog; `radiance/tools/check_txt_pos_ids.py` is the tool that settled it.
+- TDM's `pack_targets` concatenates on the **channel** dim
+  (`[x0_tgt(3) | x_in(3) | t(1) | w(1)]` -> `[B, 8, H, W]`) since the output is
+  4-D; noise is sampled at pixel resolution; previews need no decode.
+
+Verified: parity 18/18 bit-exact across all execution modes, TDM roles all pass,
+strict 659/659 load, and 6-step smokes of both trainers in **both** offload
+(peak 5.72 / 5.33 GB) and 4-GPU resident pipeline (peak 7.0-8.5 GB/GPU) exit 0
+with matching losses and coherent previews.
+
 ## Key facts
 
 - Launch is **plain `python`** (one process drives all pipeline stages via
@@ -168,6 +229,14 @@ from krea2, all documented in the 2026-08-20 worklog entry:
 - [x] Second model folder following the same per-model shape — done as
       `chroma/` (2026-08-20): copied `chunks.py` + trainers and re-diced,
       the execution strategies came for free.
+- [x] Third model folder — done as `radiance/` (2026-08-23), and the first one
+      with no VAE and a non-uniform relay. Confirms the pattern scales: the
+      only shared-infra change needed was `set_resident_out_no_grad_per_stage`
+      plus `exclude_ids` on the optimizer builders.
+- [ ] Production radiance run (the port is verified only to 6-step smokes at
+      256px). Watch the LAST pipeline stage: the byte-balancer cannot see the
+      NeRF head's `[B*N, 49152]` generated-weight activations, so a manual
+      `chunks_per_stage` may be needed at 1024px.
 - [ ] Call `prewarm_offload_staging` from `krea2/train_tdm.py` too (same
       latent offload+cpu-accum+role-swap KeyError; krea2 TDM has only ever
       run in pipeline mode).

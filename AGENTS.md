@@ -1,9 +1,9 @@
 # Agent guide for RamTorchRun
 
 This repo is a set of **standalone, runnable RamTorch examples** built around
-large diffusion models (Krea-2 ~12B, Chroma1-HD 8.9B): pipeline-parallel
-training, single-GPU offload training, and offloaded / pipelined inference on a
-single node with multiple GPUs and **no NVLink**.
+large diffusion models (Krea-2 ~12B, Chroma1-HD 8.9B, Radiance x0 9.5B):
+pipeline-parallel training, single-GPU offload training, and offloaded /
+pipelined inference on a single node with multiple GPUs and **no NVLink**.
 
 ## Read this first
 
@@ -52,9 +52,14 @@ seconds, and catches the contract bugs (`out_no_grad`, grad-requiring float
 leaves, tuple relay) that are expensive to find on GPU. Likewise run
 `tools/check_tdm_roles.py` after touching `model/lora.py` or the role plumbing.
 
+Note that `radiance/` relays a tuple that **changes shape** partway down the
+chunk list, so it needs `set_resident_out_no_grad_per_stage` rather than
+RamTorch's global `set_resident_out_no_grad`. If you add a model whose relay is
+not uniform, reuse that helper.
+
 ## Repo map
 
-Two model folders, both the same shape:
+Three model folders, all the same shape:
 
 ```
 krea2/                    # Krea-2 ~12B MMDiT + Qwen-Image VAE + Qwen3-VL encoder
@@ -68,6 +73,11 @@ krea2/                    # Krea-2 ~12B MMDiT + Qwen-Image VAE + Qwen3-VL encode
   configs/                #   train_{offload,pipeline,pipeline_offload}_{lora,full}.json + train_smoke.json
 chroma/                   # Chroma1-HD 8.9B flux-style DiT + T5-XXL + flux VAE
                           #   59 chunks; same file layout as krea2/
+radiance/                 # Radiance x0 patch-16, 9.5B: Chroma in PIXEL space, NO VAE
+  model/                  #   + NerfEmbedder / NerfGLUBlock / NerfFinalLayerConv, no autoencoder.py
+  model/chunks.py         #   64 chunks; the relay CHANGES SHAPE at the NeRF head
+  tools/                  #   + check_txt_pos_ids.py — scores a checkpoint's own
+                          #     loss to settle the text-RoPE convention
 dataloaders/              # SHARED: parquet image+caption dataset, aspect-ratio bucketing
 utils/
   checkpoint.py           # SHARED: LoRA checkpoint load / merge helpers

@@ -632,3 +632,120 @@ in-flight, ~105 s/iter). Two runs, both dead ends, three fixes out of it:
   Launched with PYTHONUNBUFFERED=1 — without it the checkpoint/VRAM prints
   sit in the stdout block buffer forever and never reach the tee'd log
   (tqdm goes to stderr, which is why only IT showed up in runs 1-2).
+
+## 2026-08-23 — radiance/ port: Radiance x0 patch-16, pixel-space with a NeRF head
+
+New standalone `radiance/` folder (copy-and-adapt from `chroma/`, zero
+cross-model imports): the 9.5B x0-prediction sibling of Chroma that reads and
+writes **pixels** — no VAE anywhere. `img_in: Linear(64->3072)` becomes
+`img_in_patch: Conv2d(3, 3072, k=16, s=16)`; `final_layer` becomes a NeRF
+decoder head (`nerf_image_embedder` DCT embedding -> 4 x `NerfGLUBlock`
+hypernetwork -> `nerf_final_layer_conv`); the head predicts x0 and
+`v = (noisy - x0) / (t + eps)` converts it, so every v-space consumer downstream
+is untouched. Both trainers, inference, 3 CPU tools and 9 configs ported.
+
+Patch 16 on pixels gives the SAME token counts as chroma's f8 VAE + patch 2
+(`8*2 = 16`), so the `_mu_from_seq_len` anchors, `minres`/`maxres` and the
+dataloader buckets carried over with no retuning. `align = patch_size` replaces
+`align = ae.compression * patch`.
+
+Things that were not obvious going in:
+
+- **The relay changes shape mid-list**, which breaks RamTorch's
+  `set_resident_out_no_grad`: the transformer relays
+  `(x, img_px, t, mod, pe, attn_mask)` (64 chunks: embed + 19 double + 38 single
+  + nerf-embed + 4 NeRF + head) but the NeRF head relays
+  `(img_dct, nerf_cond, img_px, t)`, so no single index set describes every stage
+  boundary. Added `set_resident_out_no_grad_per_stage` to
+  `utils/ramtorch_helpers.py`, which reads the declaration off each stage's LAST
+  chunk (a stage's output IS its last chunk's output). Streamed stages already
+  read it there themselves.
+- **`img_px` must ride the relay to the far end.** The NeRF embedder consumes
+  each patch's RAW pixels and the head needs `noisy` + `t` for the x0->v residual
+  (and `H, W` for `fold`, read off `img_px.shape`, so no extra state). Costs
+  `B*3*H*W` per boundary vs `x`'s `B*(512+N)*3072` — ~20% on top, and it is what
+  keeps the chunked output identical to `Radiance.forward`.
+- **`NerfEmbedder.forward` calls `self.embedder.float()`** in the reference — an
+  in-place module cast on every forward, which under RamTorch's
+  `functional_call` weight swapping writes into the streamed GPU copy or the CPU
+  master. Made it functional instead (`torch.autocast(enabled=False)` + an
+  fp32-designated module via `FP32_MODULES`/`cast_weights`). Confirmed correct
+  from the checkpoint: exactly 2 of its 659 tensors are F32, and they are
+  `nerf_image_embedder.embedder.0.{weight,bias}`.
+- **`x0_eps` cannot come from `self.training`** (chunk modules are not children
+  of the model and RamTorch's stage wrappers touch the flag). It is explicit
+  state via `set_x0_eps`: `train.py` uses `5e-2` to match its target
+  `(noisy - x1) / (t + 5e-2)`; `train_tdm.py` and inference use `0.0` because
+  TDM reconstructs `x0 = x - t*v`, an identity that only holds at eps = 0.
+- **Frozen Approximator** (the reference's choice): runs under `no_grad()` in the
+  embed chunk, excluded from LoRA and from both optimizers. So `mod` is a pure
+  no-grad relay and 62 chunks stop computing `dL/dmod`, and the embed chunk's
+  grad-ckpt wrapper shrinks to `img_in_patch` + `txt_in` — which removes
+  chroma's driver-VRAM pathology at the source. Since you cannot
+  `requires_grad_(False)` under RamTorch, `chunk_params_by_stage` and
+  `build_offload_adamw` grew an `exclude_ids` parameter to drop them from the
+  optimizer by identity. Smokes confirm: 278.3M params kept out.
+- **LoRA excludes `nerf_image_embedder`** — `Linear(67 -> 64)` at p16
+  (in_channels 3 + max_freqs^2 64), where a rank-32 adapter is bigger than the
+  layer it adapts. Same `rank > in_features` pathology as krea2's TextFusion
+  projector.
+- **TDM packs targets on the CHANNEL dim** (`[x0_tgt(3) | x_in(3) | t(1) |
+  w(1)]` -> `[B, 8, H, W]`) because the output is 4-D, not `[B, L, D]`.
+
+### `txt_pos_ids` is "zeros", not "arange" — the plan's assumption was wrong
+
+flow's `radiance.py::make_text_position_ids` puts `arange(L)` on RoPE axis 0 for
+the text stream where chroma/Flux put zeros, and it was unknown which trainer
+made the 659-tensor checkpoint. The plan expected "the wrong convention produces
+obvious garbage" — it does not. **Both render plausible images**, which is the
+trap: a 512px A/B over 4 prompts was suggestive (arange showed horizontal
+streaking and posterization on 2 of 4) but not conclusive.
+
+Settled by scoring the model's OWN objective instead: new
+`radiance/tools/check_txt_pos_ids.py` computes `train.py`'s exact
+flow-matching loss on real image/caption pairs under both conventions with
+identical noise and timesteps. Result: **zeros 0.05753 vs arange 0.06233, lower
+on 8/8 samples (7.7%)**. A mismatched text RoPE is a systematic error the weights
+cannot compensate for, so this is decisive where eyeballing was not. Flipped the
+`RadianceParams` default and all 9 configs to `"zeros"`. Re-run that tool if
+`radiance_checkpoint` is ever pointed at a differently-trained base.
+
+### Verification
+
+- `check_chunk_parity.py` 18/18 bit-exact (tiny config, patch 4, **non-square**
+  8x12 images -> 2x3 patches to catch a wrong `fold`, non-zero `x0_eps`, and the
+  NeRF head weights explicitly initialized non-zero so gradients are meaningful).
+- `check_tdm_roles.py` all pass. One tolerance note: `role=None ==
+  un-injected base` compares at 1.3e-6 absolute, which is fp32 noise amplified by
+  the x0->v division, so that one check uses a RELATIVE tolerance.
+- Strict load of the real base: **659/659 tensors, 0 missing, 0 unexpected, 0
+  shape mismatches, 9.506B params**. (`current_x0_x32.safetensors` is the patch-32
+  sibling — 14,155,832 bytes larger in `img_in_patch` — and will not load.)
+- 6-step 256px smokes, all exit 0 with matching losses and coherent previews
+  whose subjects track their ground-truth pairs:
+
+  | trainer | offload (1 GPU) | resident pipeline (4 GPUs) |
+  |---|---|---|
+  | `train.py` (lora) | peak 5.72 GB | peak 7.65 / 8.46 / 8.43 / 7.04 GB |
+  | `train_tdm.py` | peak 5.33 GB | peak 7.96 / 8.61 / 8.91 / 7.89 GB |
+
+  Step-0 loss is identical (0.0630) in offload and pipeline, and matches the
+  independent loss probe's ~0.058, so the three execution paths agree. `loss_d`
+  0.0002-0.0022 (tiny as expected — both adapters start at the teacher).
+  Byte-balanced split is [10, 11, 21, 22] chunks: stage 0 carries the embed
+  chunk's Approximator, and the NeRF head makes the tail chunks heavy.
+
+Gotcha for whoever runs this at high resolution: `balance_chunks_by_bytes` sizes
+stages by WEIGHT and cannot see that each `NerfGLUBlock` materializes
+`[B*N, 49152]` of generated weights (1.6 GB bf16 at 1024px batch 4) — the
+largest activations in the model, all in the LAST stage. At 256px the last stage
+was not the peak, but if anything OOMs at 1024px it will be there, and the fix is
+a manual `chunks_per_stage`. Each NerfGLUBlock is its own chunk and its own
+grad-ckpt unit for exactly this reason.
+
+Unrelated observation: the surviving `chroma-tdm` legacy run (1024px r128
+halflr) is no longer running. Its `loss_log.csv` reaches step 1400 of 1500, then
+has a single step-1350 row at elapsed 173.8 s — i.e. something restarted it from
+the step-1300 checkpoint and it stopped again shortly after. Not touched by this
+session; flagged for the next agent since `tdm_student_step_1400.safetensors`
+exists and is probably the one worth evaluating.

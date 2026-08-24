@@ -10,7 +10,8 @@ This folder holds model weights. Everything except this README is gitignored.
 | Qwen-Image VAE | Auto-downloaded from HuggingFace (`Qwen/Qwen-Image`, subfolder `vae`) on first run | HF cache (`~/.cache/huggingface` or `$HF_HOME`) |
 | Qwen3-VL-4B text encoder | Auto-downloaded from HuggingFace (`Qwen/Qwen3-VL-4B-Instruct`) on first run | HF cache |
 | Chroma1-HD base weights (~8.9B, 643 tensors, native flow keys) | `hf download lodestones/Chroma1-HD` — or symlink a local copy | `chroma_checkpoint` in `chroma/configs/*.json` (default `checkpoints/chroma/Chroma1-HD.safetensors`) |
-| T5-XXL text encoder + tokenizer + flux VAE | Auto-downloaded from HuggingFace (`lodestones/Chroma1-HD`, subfolders `text_encoder` / `tokenizer` / `vae`) on first run | HF cache |
+| Radiance x0 patch-16 base weights (~9.5B, 659 tensors, native flow keys) | Local file — symlink the trained base (see below) | `radiance_checkpoint` in `radiance/configs/*.json` (default `checkpoints/radiance/latest_x0.safetensors`) |
+| T5-XXL text encoder + tokenizer (shared by chroma and radiance) | Auto-downloaded from HuggingFace (`lodestones/Chroma1-HD`, subfolders `text_encoder` / `tokenizer`) on first run | HF cache. Offline alternative: set `encoder_config` to `t5_xxl_local`, which reads `/mnt/datapool_u2/models/radiance/chroma/{text_encoder_2,tokenizer_2}` |
 
 ## Layout convention
 
@@ -19,9 +20,26 @@ checkpoints/
 ├── README.md          # this file (tracked)
 ├── krea2/
 │   └── raw.safetensors            # K2 DiT base weights (bring your own)
-└── chroma/
-    └── Chroma1-HD.safetensors     # Chroma1-HD base weights
+├── chroma/
+│   └── Chroma1-HD.safetensors     # Chroma1-HD base weights
+└── radiance/
+    └── latest_x0.safetensors      # symlink -> /mnt/datapool_u2/models/radiance/latest_x0.safetensors
 ```
+
+### Radiance base weights
+
+The patch-16 x0 base lives outside the repo and is symlinked in:
+
+```bash
+mkdir -p checkpoints/radiance
+ln -sfn /mnt/datapool_u2/models/radiance/latest_x0.safetensors \
+        checkpoints/radiance/latest_x0.safetensors
+```
+
+Pick the right file: `latest_x0.safetensors` is **patch 16** (659 tensors,
+9.506B params). Its sibling `current_x0_x32.safetensors` is 14,155,832 bytes
+larger — that delta is the bigger `img_in_patch` of a **patch-32** model, which
+`RADIANCE_CONFIGS["radiance_x0_p16"]` will not load.
 
 ## Run outputs
 
@@ -30,7 +48,7 @@ Training runs write their own checkpoints to `runs/<run-name>/ckpts/`
 `tdm_student_step_N.safetensors` plus a resumable
 `tdm_state_step_N.safetensors`). The matching `inference.py` consumes them
 directly via `--lora-checkpoint`, or via `--mmdit-checkpoint` /
-`--chroma-checkpoint` for a merged full model. TDM
+`--chroma-checkpoint` / `--radiance-checkpoint` for a merged full model. TDM
 student checkpoints use the standard LoRA key convention, so
 `--lora-checkpoint ... --steps 4 --guidance 0` runs them as-is.
 

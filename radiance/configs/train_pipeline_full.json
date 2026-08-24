@@ -1,0 +1,94 @@
+{
+    "_comment": "Radiance x0 patch-16 MULTI-GPU pipeline-parallel FULL fine-tune (no LoRA), weights RESIDENT. See radiance/train.py. fp32 masters + grads + AdamW state are ~48 GB/GPU across 4 GPUs — keep batch_size small and grad_ckpt on. If it does not fit, switch parallelism to 'pipeline-offload': the masters move to host RAM and only a streaming window stays on each GPU.",
+
+    "seed": 42,
+    "initial_global_step": 0,
+
+    "_comment_split": "chunks_per_stage null = balance by weight bytes. Stage 0 carries the embed chunk (the ~603M Approximator) plus driver-side tensors; the LAST stage carries the NeRF head, whose [B*N, 49152] generated-weight activations the balancer cannot see — that is where OOM shows up first.",
+    "parallelism": "pipeline",
+    "devices": ["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+    "chunks_per_stage": null,
+    "n_microbatches": 8,
+    "schedule": "staggered_1b1f",
+
+    "blocks_per_chunk": 1,
+    "grad_ckpt": true,
+    "enc_layers_per_chunk": 4,
+
+    "_comment_batch": "batch_size is PER MICROBATCH; effective batch = batch_size * n_microbatches.",
+    "batch_size": 1,
+    "lr": 1.732e-5,
+    "weight_decay": 1e-4,
+    "warmup": 200,
+    "max_grad_norm": 1.0,
+    "max_steps": 0,
+
+    "mu_y1": 0.5,
+    "mu_y2": 1.15,
+    "mu_override": null,
+    "mu_sigma": 1.0,
+    "minres": 256,
+    "maxres": 1024,
+
+    "attn_padding": 1,
+    "uncond_ratio": 0.1,
+
+    "eval_interval": 200,
+    "save_every_n_steps": 200,
+    "log_every_n_steps": 10,
+
+    "preview_samples": 4,
+    "preview_cfg_scale": 4.0,
+    "preview_steps": 28,
+    "preview_mu": null,
+    "preview_quality": 95,
+
+    "ckpt_path": "runs/radiance-pipeline-fullft/ckpts",
+    "preview_path": "runs/radiance-pipeline-fullft/previews",
+
+    "radiance_config": "radiance_x0_p16",
+    "encoder_config": "t5_xxl",
+
+    "encoder_model_id": "lodestones/Chroma1-HD",
+
+    "txt_pos_ids": "zeros",
+
+    "_comment_ckpt": "Path to the Radiance x0 patch-16 base weights (safetensors, native flow keys, 659 tensors). See checkpoints/README.md.",
+    "radiance_checkpoint": "checkpoints/radiance/latest_x0.safetensors",
+
+    "_comment_mode": "full mode resume priority: full_checkpoint > lora_checkpoint (merged into radiance_checkpoint) > radiance_checkpoint.",
+    "mode": "full",
+    "full_checkpoint": null,
+    "lora_checkpoint": null,
+
+    "lora_rank": 32,
+    "lora_alpha": 32.0,
+    "lora_exclude_prefixes": ["distilled_guidance_layer", "nerf_image_embedder"],
+    "frozen_prefixes": ["distilled_guidance_layer"],
+
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "my_dataset": {
+                "path": "data/my_dataset.parquet",
+                "n_samples": null
+            }
+        },
+        "caption_columns": {
+            "tags": {"weight": 1.0, "is_tag_based": true}
+        },
+        "filename_column": "file_path",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [512],
+        "base_resolution_weights": [1.0],
+        "ratio_cutoff": 2.0,
+        "resolution_step": 64,
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "offset": 0,
+        "num_workers": 8,
+        "prefetch_factor": 4
+    }
+}

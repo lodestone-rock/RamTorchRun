@@ -1,0 +1,101 @@
+{
+    "_comment": "Radiance x0 patch-16 MULTI-GPU pipeline parallelism WITH weight streaming, FULL fine-tune. See radiance/train.py. The fp32 masters (~38 GB), grad accumulators, pinned .grad buffers and AdamW state (~190 GB total) all live in HOST RAM; each GPU holds only (window+pin) chunks of weights plus its activations. This is the config for full-FT at resolutions where resident pipeline stages OOM.",
+
+    "seed": 42,
+    "initial_global_step": 0,
+
+    "parallelism": "pipeline-offload",
+    "devices": ["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+    "chunks_per_stage": null,
+    "n_microbatches": 8,
+    "schedule": "staggered_1b1f",
+
+    "_comment_chunks": "fp32 chunks are 2x the bf16 size, so both the H2D window and the D2H gradient traffic double. offload_grad_accum='stream' keeps that off the critical path: gradients accumulate on the GPU and cross PCIe once per step at flush instead of once per microbatch. Start with backward='checkpoint' (cheapest activation memory) and only switch to 'keep'+offload_activations if there is VRAM to spare — the NeRF head's generated-weight tensors make that unlikely above 512px.",
+    "blocks_per_chunk": 1,
+    "offload_window": 2,
+    "offload_pin": 0,
+    "offload_backward": "checkpoint",
+    "offload_grad_accum": "stream",
+    "offload_acc_slots": null,
+    "offload_activations": false,
+    "offload_act_slots": 2,
+    "enc_layers_per_chunk": 4,
+    "enc_offload_window": 2,
+
+    "_comment_batch": "batch_size is PER MICROBATCH; effective batch = batch_size * n_microbatches.",
+    "batch_size": 1,
+    "lr": 1.732e-5,
+    "weight_decay": 1e-4,
+    "warmup": 200,
+    "max_grad_norm": 1.0,
+    "max_steps": 0,
+
+    "mu_y1": 0.5,
+    "mu_y2": 1.15,
+    "mu_override": null,
+    "mu_sigma": 1.0,
+    "minres": 256,
+    "maxres": 1024,
+
+    "attn_padding": 1,
+    "uncond_ratio": 0.1,
+
+    "eval_interval": 200,
+    "save_every_n_steps": 200,
+    "log_every_n_steps": 10,
+
+    "preview_samples": 4,
+    "preview_cfg_scale": 4.0,
+    "preview_steps": 28,
+    "preview_mu": null,
+    "preview_quality": 95,
+
+    "ckpt_path": "runs/radiance-pipeline-offload-fullft/ckpts",
+    "preview_path": "runs/radiance-pipeline-offload-fullft/previews",
+
+    "radiance_config": "radiance_x0_p16",
+    "encoder_config": "t5_xxl",
+
+    "encoder_model_id": "lodestones/Chroma1-HD",
+
+    "txt_pos_ids": "zeros",
+
+    "_comment_ckpt": "Path to the Radiance x0 patch-16 base weights (safetensors, native flow keys, 659 tensors). See checkpoints/README.md.",
+    "radiance_checkpoint": "checkpoints/radiance/latest_x0.safetensors",
+
+    "_comment_mode": "full mode resume priority: full_checkpoint > lora_checkpoint (merged into radiance_checkpoint) > radiance_checkpoint.",
+    "mode": "full",
+    "full_checkpoint": null,
+    "lora_checkpoint": null,
+
+    "lora_rank": 32,
+    "lora_alpha": 32.0,
+    "lora_exclude_prefixes": ["distilled_guidance_layer", "nerf_image_embedder"],
+    "frozen_prefixes": ["distilled_guidance_layer"],
+
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "my_dataset": {
+                "path": "data/my_dataset.parquet",
+                "n_samples": null
+            }
+        },
+        "caption_columns": {
+            "tags": {"weight": 1.0, "is_tag_based": true}
+        },
+        "filename_column": "file_path",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [512],
+        "base_resolution_weights": [1.0],
+        "ratio_cutoff": 2.0,
+        "resolution_step": 64,
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "offset": 0,
+        "num_workers": 8,
+        "prefetch_factor": 4
+    }
+}

@@ -3,12 +3,13 @@
 Standalone, runnable examples of [RamTorch](https://pypi.org/project/RamTorch/)
 on a single node with multiple GPUs — **no NVLink required**.
 
-Two demo models, one folder each, both the same shape:
+Three demo models, one folder each, all the same shape:
 
 | folder | model | notes |
 |---|---|---|
 | `krea2/` | Krea-2, ~12B MMDiT | Qwen-Image VAE + Qwen3-VL-4B encoder |
 | `chroma/` | Chroma1-HD, 8.9B flux-style DiT | T5-XXL + flux VAE, distilled modulation |
+| `radiance/` | Radiance x0 patch-16, 9.5B | **pixel space, no VAE** — NeRF decoder head, predicts x0 |
 
 Everything starts from the same idea: the model is **diced once** into a flat
 list of chunk modules (one per transformer block), and how those chunks are
@@ -42,9 +43,9 @@ Each model folder also carries `train_tdm.py`, a TDM few-step distillation
 trainer (teacher / fake-score / student share one frozen base and differ only by
 LoRA role, so there are no extra weight copies).
 
-The commands and measurements below use `krea2/`; substitute `chroma/` freely —
-the CLI, config keys and strategy flags are identical. The performance numbers
-are K2's and do not transfer directly.
+The commands and measurements below use `krea2/`; substitute `chroma/` or
+`radiance/` freely — the CLI, config keys and strategy flags are identical. The
+performance numbers are K2's and do not transfer directly.
 
 ## Setup
 
@@ -281,8 +282,17 @@ harness — it checks the chunked forward AND every gradient against the
 monolithic model, across all execution modes, on CPU in seconds:
 
 ```bash
-uv run python krea2/tools/check_chunk_parity.py     # or chroma/
+uv run python krea2/tools/check_chunk_parity.py     # or chroma/, radiance/
 uv run python krea2/tools/check_tdm_roles.py        # after touching LoRA roles
+```
+
+`radiance/` has one extra tool. Its text RoPE convention (`txt_pos_ids`) differs
+between the two upstream trainers, and both settings render plausible images, so
+it is settled by scoring a checkpoint against its own training objective rather
+than by eye:
+
+```bash
+uv run python radiance/tools/check_txt_pos_ids.py --config radiance/configs/train_smoke.json
 ```
 
 ## Repo layout
@@ -301,6 +311,7 @@ krea2/                 # Krea-2: owns its trainer, inference, model code, config
   tools/               #   check_chunk_parity.py: chunked vs monolithic, CPU, seconds
   configs/             #   train_{offload,pipeline,pipeline_offload}_{lora,full}.json
 chroma/                # Chroma1-HD, same layout (59 chunks)
+radiance/              # Radiance x0 patch-16, same layout (64 chunks), NO autoencoder
 dataloaders/           # shared: parquet dataset with aspect-ratio bucketing
 utils/
   checkpoint.py        # shared: LoRA checkpoint load / merge helpers

@@ -23,3 +23,6 @@ loss_log.csv
 
 # Profiler traces (hundreds of MB)
 profiles/
+
+# Scratch folder unrelated to this project (Engram paper visualization)
+engram_viz/

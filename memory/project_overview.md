@@ -106,9 +106,43 @@ Adding an execution mode means adding a flag, never a second trainer.
   (`MMDIT_CONFIGS`, `ENCODER_CONFIGS`).
 - `configs/` — `train_{offload,pipeline,pipeline_offload}_{lora,full}.json`
   plus one `train_smoke.json` (any strategy via `--parallelism`/`--devices`),
-  and `train_tdm_{lora,smoke}.json` for the TDM trainer.
+  `train_tdm_{lora,smoke}.json` for the TDM trainer, and
+  `train_mass_lora{,_smoke}.json` for the mass-LoRA trainer below.
   Dataset paths and `mmdit_checkpoint` are placeholders the user must point at
   real files (the smoke config points at a local e621 parquet on this machine).
+
+### Mass LoRA: many adapters, one base (2026-08-24)
+
+`krea2/train_mass_lora.py` trains L per-concept adapters SIMULTANEOUSLY off one
+frozen base — no hotswapping and no extra weight copies. `model/lora_bank.py`
+stacks every `nn.Linear`'s adapter into a bank (`[L, rank, in]`) and applies it
+with a grouped `bmm` over a batch whose slots are contiguous on dim 0, so slot
+i's gradient only ever touches adapter i and one base GEMM serves every slot.
+Slots ROTATE (`slots_per_step` of L per step), which makes the per-microbatch
+batch independent of L. The same `parallelism` flag applies; there is no `mode`
+(a bank is always LoRA).
+
+Three things differ from `train.py` and matter if you touch it:
+
+- The shared norms / modulation tensors are **frozen by exclusion**. One copy
+  serves every slot, so training them (as `train.py`'s LoRA mode does) would
+  cross-contaminate the adapters.
+- `utils/bank_optimizer.py::BankAdamW` replaces fused AdamW. Vanilla AdamW is
+  incorrect under rotation — an inactive slot has zero grad but still drifts
+  under momentum and weight decay — so it updates active rows only and keeps
+  **per-slot** step counters for bias correction and warmup. Clipping is
+  per-slot too.
+- `dataloaders/mass_lora_dataloader.py` plans each step (one bucket, S slots,
+  microbatch-major packing) from per-`(slot, bucket)` deficit targets. A slot
+  with no samples in the chosen bucket is simply absent and keeps a zero
+  gradient. Read the 2026-08-24 worklog entry before changing the planner: the
+  obvious least-scheduled-slot heuristic starves whole buckets.
+
+`tools/check_lora_bank.py` (18 CPU checks: bank == L solo models resident and
+streamed, per-slot grad equivalence, exact zero for inactive slots, export
+round-trip) and `tools/export_lora_bank.py` (slice slots into standard
+`lora_A`/`lora_B` files that `inference.py --lora-checkpoint` consumes
+unchanged) complete the folder.
 
 ## Current state: chroma/ (2026-08-20)
 
@@ -223,6 +257,11 @@ with matching losses and coherent previews.
   stream weights for headroom (18.6 vs 68.7 GB peak), never for speed.
 - Offload full FT needs ~256 GB host RAM (fp32 masters + grad accumulators +
   pinned flush buffers + AdamW state for 12.8B params).
+- Mass LoRA's cost scales with ACTIVE slots per step, never with the number of
+  adapters L — that is the whole point of the bank. The exception is the CPU
+  optimizer under `offload`: ~3 s/step for 8 active rank-16 slots on
+  `large_wide`, memory-bandwidth bound on the fp32 moments (2% of the step on
+  resident GPU stages).
 
 ## Roadmap
 
@@ -233,6 +272,14 @@ with matching losses and coherent previews.
       with no VAE and a non-uniform relay. Confirms the pattern scales: the
       only shared-infra change needed was `set_resident_out_no_grad_per_stage`
       plus `exclude_ids` on the optimizer builders.
+- [x] Mass LoRA for krea2 (2026-08-24): L adapters trained at once off one
+      frozen base via stacked banks + grouped bmm. Fourth execution shape for
+      the same chunk list, no dicing or relay change.
+- [ ] Production mass-LoRA run (verified only to 6-step 256px smokes on a
+      3-slot `rating` grouping). Real runs want a real `group_column` (artist /
+      character) and should watch the trainer's bank-budget print.
+- [ ] Port the bank to `chroma/` and `radiance/` once mass LoRA is proven in
+      production (copy-and-adapt, per the per-model convention).
 - [ ] Production radiance run (the port is verified only to 6-step smokes at
       256px). Watch the LAST pipeline stage: the byte-balancer cannot see the
       NeRF head's `[B*N, 49152]` generated-weight activations, so a manual

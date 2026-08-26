@@ -1,0 +1,103 @@
+{
+    "_comment": "Krea-2 (K2) MASS-LoRA: train many per-concept adapters at once off ONE frozen base. See krea2/train_mass_lora.py. Every nn.Linear carries a BANK of n_slots adapters ([L, rank, in]); each step packs S slots' samples contiguously on dim 0 and a grouped bmm routes them, so slot i's gradient only touches adapter i. Slots ROTATE: only slots_per_step of them train per step, so cost is independent of how many adapters you are training. 'parallelism' works exactly as in train.py; there is no 'mode' (a bank is always LoRA).",
+
+    "seed": 42,
+    "initial_global_step": 0,
+
+    "_comment_topology": "parallelism 'pipeline' = N GPUs, resident weights. Switch to 'pipeline-offload' if the bank pushes a stage over its GPU, or 'offload' for a single GPU. chunks_per_stage overrides the automatic split (balanced by WEIGHT BYTES; the bank makes block chunks heavier, which the balancer already accounts for).",
+    "parallelism": "pipeline",
+    "devices": ["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+    "chunks_per_stage": null,
+    "n_microbatches": 16,
+    "schedule": "staggered_1b1f",
+
+    "blocks_per_chunk": 1,
+    "grad_ckpt": true,
+
+    "_comment_slots": "group_column's distinct values become the slots (one adapter per artist / character / concept). It must be a column holding ONE plain string per row: the value is used verbatim after .strip(), so normalize casing/punctuation upstream, and a null or empty value means 'skip this row' (which is how you drop collabs and non-artist keys). A JSON column like artist_weights will NOT work — materialize a plain column instead. slots_per_step * per_slot_batch is the PER-MICROBATCH batch and does not depend on the slot count; each active slot sees n_microbatches * per_slot_batch samples per step, which is the batch its learning rate should be read against. min_samples_per_slot drops the long tail (counted on raw rows, before the aspect-ratio filter); max_slots keeps only the largest groups and MUST be set unless the vocabulary is already small, since the bank grows linearly in the slot count.",
+    "_comment_slots_tuning": "min_samples_per_slot must sit BELOW the per-artist sample cap of the source parquet — artist_samples holds <=25 images per artist, so 32 would leave zero slots and raise. n_microbatches * per_slot_batch = 4 is the per-slot draw; at resolution_step 128 (7 live buckets) the median (slot, bucket) pool is 4, so this draws ~1.8x duplicated images per step. Measured with dataloaders/probe_mass_lora_plan.py --fast.",
+    "group_column": "artist",
+    "slots_per_step": 8,
+    "per_slot_batch": 1,
+    "min_samples_per_slot": 20,
+    "max_slots": 64,
+    "slot_allowlist": null,
+
+    "_comment_plan": "steps_per_epoch defaults to one full pass over every slot's samples. slot_step_balance in [0,1] resolves 'every slot gets the same number of steps' against 'each slot's buckets follow its own aspect-ratio mix' — they conflict for a slot whose data is all one aspect ratio, since it can take at most one seat per step. 0 = follow the data, 1 = equalize step counts and let the narrow buckets dominate.",
+    "steps_per_epoch": 2000,
+    "slot_step_balance": 0.5,
+
+    "_comment_bank": "bank_exclude_patterns is the memory lever: ['.mlp.'] adapts attention only and roughly halves the bank. bank_dtype 'bf16' matches train.py's LoRA path; 'fp32' doubles the master memory for safer long runs. Layers where rank >= min(in, out) are skipped automatically. The trainer prints the full memory budget (masters + AdamW state + RamTorch grad accumulators) before building the pipeline — read it before scaling n_slots up.",
+    "lora_rank": 16,
+    "lora_alpha": 16.0,
+    "bank_exclude_prefixes": [],
+    "bank_exclude_patterns": [],
+    "bank_dtype": "bf16",
+    "bank_state_dtype": "fp32",
+
+    "_comment_optim": "BankAdamW updates only the active slots and warms up on each slot's OWN step count, so a rarely-scheduled slot still gets a full warmup. Gradient clipping is per slot: a global norm would let one spiking adapter shrink everyone else's update.",
+    "lr": 1e-4,
+    "weight_decay": 1e-4,
+    "warmup": 20,
+    "max_grad_norm": 1.0,
+    "max_steps": 0,
+
+    "mu_y1": 0.5,
+    "mu_y2": 1.15,
+    "mu_override": null,
+    "mu_sigma": 1.0,
+    "minres": 256,
+    "maxres": 1280,
+
+    "uncond_ratio": 0.1,
+
+    "_comment_eval": "Previews render ONE slot per eval, round-robin over that step's active set, named after the group value. save_every_n_steps writes the WHOLE bank, so keep it conservative — at rank 16 that is ~59M params per slot.",
+    "eval_interval": 100,
+    "save_every_n_steps": 100,
+    "log_every_n_steps": 10,
+
+    "preview_samples": 2,
+    "preview_cfg_scale": 4.5,
+    "preview_steps": 28,
+    "preview_mu": null,
+    "preview_quality": 95,
+
+    "ckpt_path": "runs/k2-mass-lora/ckpts",
+    "preview_path": "runs/k2-mass-lora/previews",
+
+    "mmdit_config": "large_wide",
+    "encoder_config": "qwen3_vl_4b",
+
+    "ae_model_id": "Qwen/Qwen-Image",
+    "encoder_model_id": "Qwen/Qwen3-VL-4B-Instruct",
+
+    "_comment_ckpt": "Path to the K2 DiT base weights (safetensors). See checkpoints/README.md. bank_checkpoint resumes a mass run; its sibling slots.json restores the per-slot step counts.",
+    "mmdit_checkpoint": "checkpoints/krea2/raw.safetensors",
+    "bank_checkpoint": null,
+
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "artist_samples": {
+                "path": "/mnt/datapool_u2/lodestone/caption_workspace/output/artist_samples",
+                "n_samples": null
+            }
+        },
+        "caption_columns": {
+            "tags": {"weight": 1.0, "is_tag_based": true}
+        },
+        "filename_column": "file_path",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [1024],
+        "base_resolution_weights": [1.0],
+        "ratio_cutoff": 2.0,
+        "resolution_step": 256,
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "offset": 0,
+        "num_workers": 8,
+        "prefetch_factor": 2
+    }
+}

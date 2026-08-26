@@ -749,3 +749,579 @@ has a single step-1350 row at elapsed 173.8 s — i.e. something restarted it fr
 the step-1300 checkpoint and it stopped again shortly after. Not touched by this
 session; flagged for the next agent since `tdm_student_step_1400.safetensors`
 exists and is probably the one worth evaluating.
+
+## 2026-08-24 — krea2 mass-LoRA: L adapters at once off one frozen base
+
+Goal: train one LoRA per concept (artist / character / ...) for many concepts
+without paying for many base models or hotswapping adapters between batches.
+
+### The mechanism
+
+Every `nn.Linear` gets a **bank** instead of a single adapter
+(`krea2/model/lora_bank.py`): `lora_A_bank [L, rank, in]`,
+`lora_B_bank [L, out, rank]`. The batch is packed so each slot's samples are
+contiguous on dim 0, and the delta is two `bmm`s over `S = len(active_slots)`
+groups. Slot i's samples only ever touch `A[i]`, so **gradient isolation is
+structural, not enforced**. Cost is one base GEMM for the whole packed batch
+(not S of them), and under `offload` the base streams over PCIe once per step
+instead of once per adapter — the reason not to hotswap.
+
+Slots ROTATE: `slots_per_step` of L train per step, so the per-microbatch batch
+is `slots_per_step * per_slot_batch` and is **independent of L**. Which slots
+are active is per-STEP module state, like `set_lora_role`/`set_seq` —
+per-microbatch would race the in-flight microbatches of `staggered_1b1f`, and
+RamTorch's `functional_call` swaps tensors but never touches attributes, so a
+plain attribute survives streaming.
+
+Packing must be **microbatch-major** (`index = mb * S*b + slot * b + j`)
+because `Pipeline.step` chunks `targets` uniformly on dim 0 while nested inputs
+are the caller's. The loss is `per_slot_mse.mean(dim=1).sum()` — mean WITHIN a
+slot, SUM across slots. A plain global mean would divide every slot's gradient
+by S, making the effective LR depend on how many slots happened to be active;
+with the sum, a slot's gradient equals a solo run at batch
+`n_microbatches * per_slot_batch` and single-LoRA LRs transfer unchanged.
+
+### Things that had to be different from `train.py`
+
+- **Shared params are frozen by exclusion.** `train.py`'s LoRA mode trains
+  RMSNorm scales / modulation / LastLayer bias alongside the adapters. Here
+  there is one copy of those serving every slot, so training them would
+  cross-contaminate the adapters. `bank_parameters()` returns only the banks.
+- **`BankAdamW`** (`utils/bank_optimizer.py`) instead of fused AdamW. Vanilla
+  AdamW is *wrong* under rotation: an inactive slot has zero grad but still
+  moves under `exp_avg` and decoupled weight decay, and its bias correction
+  would count steps it never took. `BankAdamW` updates only the active rows
+  (`index_select`/`index_copy_`) and keeps a **per-slot step counter** driving
+  both bias correction and warmup, so a rarely-scheduled slot still gets a full
+  warmup. Moments are fp32 regardless of master dtype.
+- **Per-slot gradient clipping** (`clip_bank_grads_per_slot`). A global
+  `clip_grad_norm_` couples the slots: one adapter spiking would scale down
+  everyone else's update that step.
+- **No `prewarm_offload_staging`.** The TDM role-swap KeyError does not apply:
+  a bank is one tensor per layer whatever slots are active, so the offload grad
+  packet's key set never changes between steps.
+- Layers where `rank >= min(in, out)` are skipped automatically —
+  `txtfusion.projector` is a `Linear(12, 1)`, and L copies of a pointless
+  adapter is L times the waste. `bank_exclude_patterns: [".mlp."]` is the
+  memory lever (attention-only roughly halves the bank).
+
+### The planner problem (worth reading before touching the dataloader)
+
+`dataloaders/mass_lora_dataloader.py` must pick, per step, ONE resolution
+bucket and S slots that have samples in it. The user's requirement was that a
+slot with nothing in that bucket (the artist who never draws landscapes) just
+sits out with zero gradient — which the bank gives for free by omission.
+
+The obvious planner (anchor on the least-scheduled slot, take the bucket from
+its pools) has a **bad equilibrium**, measured on a 6-slot synthetic set with
+two single-bucket slots: those two are permanently behind, so they anchor
+nearly every step and their buckets win nearly every step, while the broad
+slots ride along as passengers and never train on their own square images —
+**299 of 300 steps landed in the two narrow buckets**.
+
+Replaced with per-`(slot, bucket)` deficit targets: `target[s]` equal steps for
+every slot, split across buckets by that slot's OWN sample distribution. Draw
+the bucket from a fixed distribution, then seat the slots with the largest
+unmet deficit in it. Square went from 1/300 to ~18% of steps; per-slot step
+counts land within ~25% of each other instead of exactly equal. The residual
+spread is inherent, not a bug: a slot can occupy at most one seat per step, so
+a slot whose data is all portrait needs `target[s]` DISTINCT portrait steps, and
+exact step equality across slots would force the narrow buckets to take every
+step. `slot_step_balance` in [0, 1] exposes the trade-off (0 = follow the data,
+1 = equalize step counts).
+
+### Verification
+
+- `krea2/tools/check_lora_bank.py` — 18 checks, all pass on CPU in ~10 s:
+  packed forward == L separately-injected single-LoRA models (monolithic, and
+  through `Pipeline` resident + streamed, p=1 and p=2, max diff 6.6e-7);
+  `active_slots=None` == every slot in order; a permuted reference does NOT
+  match (so a slot/position mix-up cannot pass); `dL/dA[i]` == that slot's solo
+  model under the sum-of-slot-means loss (8.4e-9); inactive slots' grads,
+  weights and Adam state **exactly** zero/bit-identical across a step; export
+  round-trip + `_classify_keys` -> `k2`.
+- `check_chunk_parity.py` still 18/18 bit-exact (the relay is untouched).
+- 6-step 256px smokes, both exit 0, groups on `rating` (3 slots, 2 active per
+  step so every step leaves one out):
+
+  | parallelism | peak VRAM | time split |
+  |---|---|---|
+  | `offload`, 1 GPU | 8.67 GB | fwdbwd 59%, opt 20%, data 18% |
+  | `pipeline`, 4 GPUs | 23.2 / 15.9 / 18.0 / 12.2 GB | fwdbwd 62%, data 35%, opt 2% |
+
+  Step-by-step losses agree to 1e-4 across the two modes (0.19194 / 0.23569 /
+  0.20557 ...), so packing and routing are identical whether weights are
+  resident or streamed. Previews (one slot per eval, round-robin, named after
+  the group value) are coherent.
+- End-to-end zero check on GPU: a 2-step run with `--slots-per-step 1` left two
+  of three slots unscheduled, and their `lora_B` in the saved bank is
+  **bitwise zero** (still at init) while the trained slot moved.
+- `tools/export_lora_bank.py` output loads into a real `inject_lora`'d
+  `large_wide` DiT with 0 unexpected keys and 0 shape mismatches. The only
+  missing keys are `txtfusion.projector.lora_{A,B}`, which the bank skips by
+  design; an un-loaded adapter keeps `lora_B = 0` and contributes nothing.
+
+### Gotchas / numbers for whoever runs this for real
+
+- **The optimizer is the offload-mode tax.** `BankAdamW.step` + clipping is
+  ~3 s per step for 8 active slots at rank 16 on `large_wide` (measured: 2.1 s
+  + 0.86 s over 585M active params). It is memory-bandwidth bound on the fp32
+  moments, not op overhead, so it scales with ACTIVE slots (never with L) and
+  `torch._foreach_*` would not help. On resident pipeline stages the same work
+  is on-GPU and costs 2% of the step. `bank_state_dtype: "bf16"` halves the
+  traffic if it ever matters.
+- A full-coverage adapter is **3.67M params per rank unit** on `large_wide`
+  (58.7M at rank 16, confirmed by the trainer's own print). The trainer prints
+  masters + AdamW state + RamTorch grad accumulators before building the
+  `Pipeline` — read that line before scaling `n_slots`. L=64 at rank 16 is
+  ~9.4 GB masters + 37.5 GB fp32 state: fine in host RAM under `offload`,
+  ~2.4 GB/GPU of masters under resident `pipeline` on 4 GPUs.
+- Checkpoints are ONE safetensors holding every slot (352 MB for 3 slots at
+  rank 16), plus `slots.json` with the slot -> group mapping and per-slot step
+  counts. Keep `save_every_n_steps` conservative.
+- `slot_loss_log.csv` has one row per active slot per step (loss, that slot's
+  own step count, its pre-clip grad norm) — the per-slot progress record;
+  `loss_log.csv` keeps the mean-per-sample loss comparable to `train.py`'s.
+- Deliberately out of scope: per-slot trainable norms/modulations (would need
+  stacked `[L, D]` scales and a second contamination surface to verify),
+  per-microbatch slot routing, and porting the bank to `chroma/`/`radiance/`
+  (copy-and-adapt once this is proven in production).
+
+## 2026-08-24 — measuring the slot/bucket conflict: it is not the real problem
+
+Added `dataloaders/probe_mass_lora_plan.py`: reads a parquet, builds the real
+`(slot, bucket)` pools with the real bucketing logic, and scores the step plan
+without a model, a GPU, or an image decode. Its core number is a **feasibility
+index** `D = sum_b max(step_need_b, seat_need_b)`, the step budget that "equal
+share per slot" plus "each slot's own bucket mix" jointly demand as a multiple
+of the budget that exists. `D = 1` means no conflict; it is reported for both
+fairness targets (equal steps vs equal epochs) because the same data is often
+infeasible under one and comfortable under the other. Also reports per-slot
+step ceilings, and replays the real planner (and optionally the naive anchor
+planner) to measure realized step fairness, bucket-mix drift, seat fill and
+data utilization. `--synthetic` needs no data.
+
+`--fast` streams the corpus with arrow and counts `(slot, bucket)` pairs
+instead of building real samples — bucketing is a pure function of
+`(width, height)`, so it memoizes over the few thousand distinct resolutions,
+and the planner never looks inside a sample, so pools can hold placeholders.
+That is the only way to probe the 20.6M-row corpus (48s for all of it, versus
+4 minutes for a 21.7k-row sample the slow way). It also scans one hive
+partition at a time under a pinned schema, because the partitions disagree on
+`source`'s type (large_string vs string) and refuse to merge.
+
+**Verdict on the real corpus** (`output/training_parquet_clean`, 20.6M rows,
+5 sources, `artist_weights` first JSON key, `min_samples 20`, 8 seats,
+`base_res 1024` -> 11 buckets): **the slot/bucket conflict does not exist
+there, and the dataloader needs no cleverer planner.** 49,228 distinct artists,
+43,776 of them with >= 20 images. Taking the largest L:
+
+| L | median img/slot | median pool | thin pools | dup | drift med/max | steps/share |
+|------|------|-----|-----|------|-------------|-------------|
+| 512  | 780  | 40  | 19% | 1.5x | 0.032/0.047 | 0.97-1.03   |
+| 2048 | 439  | 24  | 24% | 1.6x | 0.043/0.084 | 0.90-1.09   |
+| 8192 | 210  | 13  | 36% | 2.0x | 0.144/0.326 | 0.64-1.41   |
+
+D = 1.00 for equal steps at every L, and 1.00-1.07 for equal epochs. The 8192
+row degrades mostly because 8000 planned steps give each slot only ~8 of them
+(granularity, not the planner) — probe with a longer plan before reading
+anything into it. The binding constraint on L is bank VRAM, not the data.
+
+Findings from the earlier pass, on 216 artist slots from the 21.7k-row
+`tag_samples_clean/source=e621` SAMPLE (`min_samples 8`) plus a 40-slot
+synthetic set. Kept because they show what an unhealthy corpus looks like —
+that sample has a median of 11 images per artist against the real corpus's 780:
+
+- **The bucket conflict is a non-issue at realistic slot counts.** D = 1.00 for
+  216 slots / 8 seats, and 1/216 slots is capped below 90% of its fair share.
+  The one-seat-per-step limit only binds when `slots_per_step` is a large
+  fraction of the slot count: the 6-slot toy case that motivated the deficit
+  planner scores D = 1.23, and the 40-slot synthetic set is already 1.00.
+  No cleverer bucket planner is needed.
+- **The deficit planner is still the right one**: on the 6-slot case it holds
+  bucket-mix drift to 0.015 median / 0.065 max against the anchor planner's
+  0.220 / 0.410, for a few percent of step fairness. At 216 slots both are
+  fine, so the rewrite bought robustness rather than throughput.
+- **Real problem 1 — thin pools.** A step draws `n_microbatches *
+  per_slot_batch` samples from ONE `(slot, bucket)` pool, and the median pool
+  here holds **2** images: 96% of pools are smaller than one draw, so a slot's
+  per-step gradient averages **5.2x duplicated images** — full FLOPs, no extra
+  gradient information. Measured levers: `resolution_step` 64 -> 256 cuts
+  buckets 11 -> 3 and duplication to 3.0x; `n_microbatches` 8 -> 2 cuts it to
+  1.4x, and 8 -> 1 to exactly 1.0x. Note `per_slot_draw >= n_microbatches` is
+  structural (every microbatch carries every active slot), so on long-tail data
+  prefer WIDTH (`slots_per_step`) over accumulation DEPTH.
+- **Real problem 2 — equal steps means wildly unequal epochs.** With equal
+  step counts the 760-image slot gets ~1.3 epochs while 7-image slots get ~129
+  (on the real corpus at L=512 it is 0.01 to 56). A fairness-target knob would
+  fix it (t_s proportional to `count_s ** alpha`: alpha=0 equal steps, alpha=1
+  equal epochs). **Deliberately NOT implemented** — asked, and the answer was
+  that runs are short enough that unequal epochs are acceptable. Revisit only
+  if slots start overfitting at very different rates.
+- **Fixed a defect the probe exposed**: `steps_per_epoch=None` meant "one pass
+  over the data", which for 216 slots / 8 seats is **68 steps** — one to two
+  steps per slot, one slot never scheduled at all, and the trainer reuses the
+  same plan every epoch, so that slot would never train. Added a
+  `min_steps_per_slot` floor (default 25). Same data now plans 675 steps with
+  per-slot counts 22-28 and step fairness 0.88-1.12 (was 0.00-1.99).
+- Added an opt-in `keep_pools` flag so the probe (and a future `replan()`) can
+  re-plan without re-reading the parquet. Off by default: the plan only
+  references the samples it drew, and the dataset is pickled into every
+  DataLoader worker.
+
+### Short buckets were DROPPED, not echoed (`parquet_dataloader.py`, shared)
+
+`_load_batches` step 6 packed each bucket into full batches and dropped the
+incomplete tail, which meant:
+
+- a bucket with 3 samples at `batch_size 8` produced **zero** batches and
+  silently discarded all 3;
+- 10 samples at `batch_size 8` produced 1 batch and discarded 2;
+- if that took every bucket to zero, the only symptom was
+  `IndexError: list index out of range` from `self.batches[index]` — the
+  "empty batch" fallback below it never runs, because the index error fires
+  first.
+
+Up to `batch_size - 1` samples lost *per bucket* is nothing on a large set but
+most of the data on a small or heavily-bucketed one (25 images over 11 buckets
+at batch 8 = nothing left). The tail is now **echoed** from elsewhere in the
+same bucket — drawn from the whole bucket so the leftovers are not
+over-weighted — which is what `__getitem__` already did for a batch whose
+images failed to load, so the drop was inconsistent with the file's own intent.
+Zero batches overall now raises with the sample/bucket counts instead of an
+IndexError. Verified: 3 samples -> 1 batch, 10 -> 2, and on the 21.7k-row e621
+sample 21,142 pairs over 11 buckets go from 2,642 batches to 2,647 with 34
+samples echoed — the minimum possible.
+
+This affects every trainer, not just mass LoRA. The mass-LoRA path was already
+correct and is untouched: `_plan_steps._draw` wraps with a reshuffle when a
+`(slot, bucket)` pool is smaller than the draw, and `__getitem__` echoes WITHIN
+a slot so slots never borrow each other's images (verified: a slot with a
+single image and a draw of 8 yields 8 copies of it, and the packing stays
+uniform).
+
+### Planner was O(L log L) per step — fixed (this one bites in TRAINING)
+
+`_plan_steps` shuffled and re-sorted a bucket's whole candidate slot list on
+every step to find the S largest deficits. At 44k slots that is a ~30k-element
+sort with a Python key, 137,857 times: the probe ran for 30 minutes without
+finishing, and `_load_batches` would have hung the trainer identically. Now
+each bucket keeps a **min-heap** keyed by that `(slot, bucket)`'s deficit, with
+a random second key for tie-breaks. Seating a slot changes only
+`done[(s, bucket)]`, so the bucket's heap stays valid and the other buckets'
+heaps are untouched — a step costs O(S log L). Same run: **29 seconds**.
+Selection is equivalent (verified on the synthetic set: step fairness
+0.96/1.00/1.04 and drift 0.012-0.034, matching the sort-based version).
+`_plan_steps` also prints a "Planning N steps over L slots" line before the
+loop when the plan is large, so a long wait is visible rather than a mystery.
+
+### `output/artist_samples` — the corpus the trainer will actually use
+
+1.16M rows, 49,468 artists sampled to <= 25 images each, 44,118 clearing
+`min_samples 20`, and it has a real `artist` string column so no derivation is
+needed. Fairness is ideal here: uniform 25-per-slot makes equal steps and equal
+epochs the same thing, D = 1.00 for both, drift 0.000 median, per-slot steps
+23-29 over the 137,857-step plan, 100% of samples drawn.
+
+The one problem is thin pools, and it is bucket coarseness that drives it —
+25 images over a median of 6 buckets is ~4 per pool against a draw of 8:
+
+| resolution_step | live buckets | median pool | duplication @ draw 8 / 4 / 2 |
+|-----|----|----|--------------------|
+| 64  | 11 | 2  | 4.1x / -    / -    |
+| 128 | 7  | 4  | 3.1x / 1.8x / 1.2x |
+| 256 | 3  | 7  | 2.2x / 1.4x / 1.1x |
+| 384 | 1  | 25 | 1.0x / -    / -    |
+
+Count the LIVE buckets, not what `_bucket_generator` returns: at step 256 it
+emits 5 but 512x1536 (ar 0.33) and 1536x512 (ar 3.0) are outside
+`ratio_cutoff 2.0` and never get chosen, so only 3 are reachable. Step 384
+collapses to a single 1024x1024 — no aspect bucketing at all, everything
+cropped square — a data-fidelity loss, not a free win.
+
+Coarseness and draw size substitute for each other, and at draw 2 the gap
+nearly closes (1.2x for 7 buckets vs 1.1x for 3), so a smaller draw buys back
+the finer bucketing almost for free. **Chosen for this corpus:
+`resolution_step: 128`** (7 live buckets, ar 0.45-2.20) with `n_microbatches`
+4 -> 1.8x or 2 -> 1.2x. Its outer buckets are 0.90M px against 1.05M for
+square, so step times vary ~15% across buckets; harmless, just uneven.
+Note `per_slot_batch` does NOT help:
+2.2x at n_mb=4/b=2 is identical to n_mb=8/b=1, because the draw is their
+product. Also `max_slots` must be set (44k slots will not fit a bank), and
+`min_samples_per_slot` counts raw rows before the aspect filter, so a few slots
+land as low as 1 usable image.
+
+Reading the sweep: step-fairness columns in short-plan runs (`--steps 20000`
+gives each of 44k slots ~3.6 steps) are integer-granularity artifacts. Only the
+full-length plan's 0.92-1.16 is meaningful.
+
+**The grouping is dumber than the probe makes it look.** The dataset uses
+`group_column`'s value verbatim (`str(g).strip()`); nothing parses JSON, and
+`tags` is only ever a caption source. The probe's `--group-from-json` derives
+the artist from `artist_weights` (`{"name": weight}`, ~82% one artist / 17%
+none / 0.2% collabs on danbooru) **for probing only** — the training path needs
+a materialized plain-string column, which is what `group_column: "artist"` in
+`train_mass_lora.json` expects and what the corpus will grow. Two behaviors do
+the filtering work for free, so no denylist was added: a null/empty value skips
+the row (use it for collabs, and for non-artist keys like e621's
+`conditional_dnp`, 3.7% of rows, and `unknown_artist`), and matching is exact
+after stripping, so normalize upstream.
+
+Rule of thumb the probe leaves behind: the number that matters is
+**images per slot per bucket** versus `n_microbatches * per_slot_batch`. Keep
+the median pool at or above that product and everything else falls into place;
+`min_samples_per_slot` and bucket coarseness are the levers. `--fast` makes
+re-probing a new corpus a one-minute job, so do that before tuning.
+
+## 2026-08-24 — first real mass-LoRA run: two concurrent instances, and why
+
+Launched mass LoRA on `caption_workspace/output/artist_samples` (`artist`
+column, ~25 images/artist, 44,118 artists with >=20). Three configurations were
+measured on the 4x RTX PRO 6000 (97.9 GB each) before settling, and the
+surprises are worth recording.
+
+**VRAM does not scale with `n_microbatches`.** 64 slots at rank 16 is 58.7M
+params/slot = 3.75B total: masters 6.99 GB + AdamW fp32 state 27.97 GB +
+RamTorch grad accumulators 6.99 GB = **41.95 GB** of bank, ~10.5 GB per stage on
+top of ~8.3 GB of DiT weights. Going `n_microbatches` 4 -> 16 moved measured
+usage from 69/73/72/50 GB to 68/72/74/52 GB — i.e. not at all. Under
+`staggered_1b1f` with grad checkpointing only a couple of microbatches are in
+flight, so activation memory tracks the *stage count*, not the microbatch count.
+The knob that does move VRAM is `slots_per_step`, because it sets the
+per-microbatch batch: S=8 costs ~44 GB/stage more than S=4.
+
+**More microbatches buys pipeline utilization and spends it on duplicates.**
+`n_microbatches` 16 ran 105 s/step for 128 samples (0.82 s/sample) against 39 s
+for 32 (1.22 s/sample), a 33% raw gain consistent with the 1b1f bubble falling
+from ~43% to ~16%. But the draw per slot is `n_microbatches * per_slot_batch`,
+and with ~25 images/artist the median `(slot, bucket)` pool is 4 at
+`resolution_step` 128 (8 at 256), so draw 16 means **6.5x duplication** (4.0x at
+256). Counting only distinct images, `n_mb`=16 was *worse*: ~0.31 distinct/s
+against ~0.46 for `n_mb`=4. On a low-shot corpus the bubble is not worth filling
+with repeats.
+
+**Two concurrent instances beat both.** Final layout: two processes, 64 slots
+each from disjoint `slot_allowlist`s (top 128 artists split alternately so the
+size distributions match), `n_microbatches` 4, `slots_per_step` 4,
+`resolution_step` 128, `max_steps` 1200 (~75 steps/slot). Each fills the other's
+bubble. Instance A runs `devices` `cuda:0..3`, instance B runs them
+**reversed** `cuda:3..0`, because a stage's cost is not uniform — stage 0-2 sit
+near 44 GB and stage 3 near 35 GB, so reversing pairs each heavy stage with the
+other run's light one: 80/93/95/81 GB instead of stacking two heavies.
+
+Measured: 28.7 s/step each, **1.11 samples/s aggregate** vs 0.82 for one
+`n_mb`=4/S=8 process — 36% more throughput, 0.62 vs 0.46 distinct images/s, and
+128 artists covered instead of 64. Solo, an S=4 instance is *less* efficient
+(1.67 s/sample vs 1.22 for S=8); the win comes entirely from overlapping two
+bubbly pipelines.
+
+Gotchas for the next run:
+- Headroom is ~3 GB on the busiest GPU. `eval_interval` previews allocate on top
+  of the training peak, so **stagger the two instances' eval steps** (or start
+  them minutes apart, which is what happened here) rather than letting them
+  preview simultaneously.
+- All matmuls are already bf16 (DiT, VAE, RamTorch autocast, and the bank's
+  `bmm` casts A/B to the activation dtype); only AdamW moments are fp32 via
+  `bank_state_dtype`.
+- A bank checkpoint is ~7 GB and the trainer prunes nothing. Added root-level
+  `housekeep.py` (adapted from x0-pred): auto-discovers `runs/*/{ckpts,previews}`,
+  keeps the 4 newest per extension **plus every `--milestone` (default 1000)
+  step forever, so history survives**. Its first sweep freed 108 GiB. Run it
+  beside training; `--once --dry-run` to preview.
+
+## 2026-08-24 (cont.) — split the two workers by SOURCE, ranked by aggregate favs
+
+The concurrent pair now trains disjoint sources instead of an arbitrary half of
+a merged artist list: `train_mass_lora_danbooru.json` (`cuda:0..3`) and
+`train_mass_lora_e621.json` (`cuda:3..0`, reversed as before). Each points
+`parquet_sources` at one hive partition
+(`artist_samples/source=<src>`) — 811,326 danbooru rows and 347,592 e621 rows —
+so the two banks never share an artist vocabulary and each source's fav scale
+stays internally comparable (e621 favs run ~10x danbooru's; ranking across the
+merged set would have been meaningless).
+
+Slots are the **top 64 by aggregate fav count** (summed `fav_count` over the
+artist's ~25 sampled rows, requiring >=24 rows), i.e. `slot_allowlist` is written
+in popularity order. `artists.csv` next to each parquet already carries
+`n_samples`/`avg_fav`/`best_tier` if a cheaper ranking is ever wanted.
+
+**Gotcha: two metadata keys outrank real artists.** The `artist` column contains
+non-artist e6/danbooru keys that pool many artists into one value, and they win
+on aggregate favs: `conditional_dnp` was e621's **#1** (257k favs) and
+`third-party_edit` was danbooru's **#19**. Both would have burned a slot on a
+grab-bag. They are now denylisted in the ranking step along with
+`unknown_artist`, `anonymous_artist`, `avoid_posting`, `sound_warning`,
+`epilepsy_warning`. Re-check this list whenever the corpus is regenerated —
+nulls/empties are skipped by the dataset itself, but these are non-empty strings.
+
+Also set `eval_interval` to 100 (danbooru) and **101** (e621) so the two runs'
+previews cannot land on the same step; previews allocate on top of a training
+peak that already leaves only ~7 GB free. Measured together: 80/91/90/79 GB of
+97.9, ~29-31 s/step each, 72-80 steps/slot over 1200 steps.
+
+The earlier `train_mass_lora_{a,b}.json` pair (arbitrary top-128 split, stopped
+at steps 176/147) is superseded; its `runs/k2-mass-lora-{a,b}/` checkpoints are
+orphaned because the slot vocabulary differs, so they are not resumable here.
+
+## 2026-08-25 — e621 OOM, and why pipeline-offload was the wrong fix
+
+The concurrent pair ended split: **danbooru finished all 1200 steps**
+(`bank_step_1200_final.safetensors`, peak 41.1/39.9/41.5/29.9 GB, time split
+`fwdbwd 85% / data 14% / opt 1%`), while **e621 died at step 138** with a CUDA
+OOM on GPU 2 — 576 MiB requested, 426 MiB free. Its own process was holding
+6.75 GiB "reserved but unallocated", so allocator fragmentation was a real
+contributor, not just the tight budget.
+
+**Weight streaming does not fix this.** Two 30-step smokes (`slots_per_step` 4,
+one process, previews on) against the resident baseline:
+
+| config | peak VRAM per stage (GB) | s/step | opt |
+|---|---|---|---|
+| resident | 41.1 / 39.9 / 41.5 / 29.9 | ~21 | 0.17 s |
+| `pipeline-offload` `pin=5` | 39.1 / 35.9 / 35.2 / 27.9 | 41.5 | 1.7 s |
+| `pipeline-offload` `pin=8` | 41.6 / 38.5 / 40.5 / 31.0 | ~21 | 0.17 s |
+
+`pin=8` pins every chunk, so the optimizer sees the GPU-resident copies and the
+state never leaves the device — it is plain resident with extra machinery.
+`pin=5` frees only 3.6 GB/GPU and **doubles the step time**. The reason is that
+per stage only ~17 GB is static (8.6 weights + 7 optimizer state + 1.75 grad
+acc); the other ~24 GB is activations. Streaming weights attacks the small half
+and pays PCIe for it every microbatch. **Rule: on this model the memory lever is
+activations (`slots_per_step`, microbatch size), not weights.**
+
+**What did work: `bank_state_device: "cpu"`.** `BankAdamW` now takes
+`state_device`; with `"cpu"` the moments live in host RAM and each step gathers
+only the ACTIVE slot rows into pinned staging, uploads, updates, and scatters
+back. Rotation is what makes it cheap — 4 of 64 slots is 1/16th of the state, so
+a step moves ~0.44 GB per stage instead of 7 GB. GPU cost of the bank drops
+**41.95 -> 13.98 GB** (the startup line now prints `27.97 GB (HOST)` and
+`13.98 GB on GPU`). Concurrent pair measured **59/69/70/60 GB of 97.9**, against
+80/93/95/81 before: headroom went from ~3 GB to ~28 GB. Only the small staging
+buffers are pinned; pinning all 28 GB would lock host RAM to save a copy that
+never happens.
+
+`check_lora_bank.py` gained two cases proving `state_device="cpu"` is
+**bit-identical** to the GPU-resident path (params and both moments, 0.000e+00)
+and that the state really sits on the host. `_staging` falls back to unpinned
+buffers when there is no CUDA context, so the CPU-only parity tool still runs.
+
+Current runs: 4000 steps (250 steps/slot), `eval_interval` 25/26,
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` on both. Median ~32.5 s/step,
+mean ~41 s/step — **previews every 25 steps cost ~8.5 s/step averaged in, about
+9 h of the ~45 h ETA**. Raise `eval_interval` if that is not worth it. The old
+1200-step danbooru bank is kept at `runs/k2-mass-lora-danbooru-1200step/`;
+resuming it would have restored per-slot step counts (slots.json) but not the
+Adam moments.
+
+## 2026-08-25 (cont.) — rebased on the fullft checkpoint, rank 16 -> 32
+
+Both runs restarted from the in-house fine-tune
+(`x0-pred/runs/krea2-fullft/ckpts/full_step_49600.safetensors`) instead of
+`checkpoints/krea2/raw.safetensors`. Verified compatible before launching by
+diffing safetensors headers: **430 tensors, identical keys and shapes**, the
+only difference being all-fp32 (51.28 GB, 12.82B params) against raw's mixed
+BF16/F32. That is fine because `train_mass_lora.py` loads with `assign=True`
+and only then runs `dit.to(dtype)`, so the cast to bf16 happens on the host and
+nothing fp32 reaches a GPU — but it does mean a ~77 GB transient host spike
+per process during load, so stagger the two launches.
+
+Rank 32 with **alpha 32** (`scale = alpha / rank`, so leaving alpha at 16 would
+have silently halved adapter strength). Everything about the bank doubles:
+117.3M params/slot, 7.51B total, masters 13.98 + grad acc 13.98 =
+**27.97 GB on GPU**, AdamW state **55.94 GB on HOST**. Checkpoints double too —
+13.98 GiB each, every 100 steps.
+
+Measured concurrent, through previews and a step-100 save: **70/79/79/69 GB of
+97.9**, ~19 GB headroom. Step time is unchanged at **31.0 / 31.7 s/step**
+preview-free, against 31.0 at rank 16 — doubling the adapter costs nothing
+measurable, because the grouped `bmm` is negligible beside the 12.8B base's
+forward/backward and the optimizer only grew by ~1 s of host traffic.
+
+Note the base checkpoint lives under the gitignored `x0-pred/` symlink, whose
+own housekeeper keeps just 2 `.safetensors` in that directory. The fullft run is
+stopped (interrupted at step 49648) so nothing will prune it now, but if that
+run resumes, `full_step_49600` becomes deletable — copy it into `checkpoints/`
+before relying on it for a restart.
+
+## 2026-08-26 — Engram n-gram footprint of the artist tag corpus
+
+Scratch (`engram_viz/`, not part of the training stack). Answered "how big
+would DeepSeek's Engram hash table be for our tags?" by actually counting,
+which the paper (arXiv:2601.07372) never does — it divides a parameter budget.
+
+Added `engram_viz/ngram_stats.py` (real Qwen3-VL-4B vocab projection +
+exact distinct-n-gram counting via 64-bit splitmix fingerprints, one pass
+over 1.16M rows, ~35 min) and `engram_viz/ngram_report.py` (sizing tables +
+`out/04_tag_sizing.png`). Findings written up in `engram_viz/README.md`.
+
+Numbers: Qwen3-VL vocab 151,669 -> 106,400 compressed (29.8%, vs the paper's
+23% on a 128k tokenizer). 163.9M subword tokens; 386k distinct 2-grams,
+2.51M 3-grams. **2^20 rows/head saturates** (100% / 98.7% of traffic,
+1.34B params at 8 heads x 80 dims x 2 orders) — Engram-27B's 2,262,400
+rows/head is ~2x oversized for a closed tag vocabulary.
+
+Gotcha worth remembering for any tag-conditioning work, not just Engram:
+**88% of danbooru tag lists are alphabetically sorted**. Suffix n-grams over
+that column memorize alphabetical adjacency, not co-occurrence. Shuffle tag
+order per sample, or hash unordered tag pairs, before reading anything
+semantic into tag n-gram statistics.
+
+## 2026-08-26 (cont.) — materialized the Engram table, fixed a collision metric
+
+`ngram_stats.py` fingerprints n-grams one-way, so its output was countable but
+not readable. Added `engram_viz/build_table.py`, which packs the n-gram
+LOSSLESSLY into a uint64 (compressed vocab 106,400 = 17 bits, 3-gram = 51
+bits) — exact counts AND decodable rows. Writes
+`out/table_{token,tag}_{2,3}gram.parquet` + `.top.tsv`, and `out/05_table.png`.
+`--from-parquet` re-runs the addressing analysis without re-scanning the corpus
+(the corpus pass is ~4 min; loading the 14.7M-row tag 3-gram table dominates).
+
+Gotchas hit, worth not repeating:
+- Reading a parquet list column with `.to_pylist()` on 14.7M rows hangs for
+  20+ min. Use `.combine_chunks().flatten().to_numpy()` and reshape.
+- Plotting a 14.7M-point Zipf line with matplotlib's default `loc="best"`
+  legend is effectively an infinite loop. Log-subsample to ~2k points and
+  pin the legend location.
+- **Collision metric bug (fixed).** I first reported "46% of token 3-grams
+  collide on all 8 heads", which was measuring whether an n-gram shares a row
+  with *someone* on every head — but that someone differs per head, so the
+  8-tuple still identifies it. It is just `(1-e^-λ)^8`. The real quantity is
+  n-grams sharing the SAME 8-tuple; measured over all four tables it is
+  **exactly zero**, even for the tag 3-gram at λ=14. Paper's claim holds.
+
+The decoded tables also make the sorted-tag problem undeniable: top tag
+2-grams are `long hair│looking at viewer`, `canid│canine`, `bad id│bad pixiv
+id`; the top tag 3-gram is `canid│canine│canis`. All alphabetical neighbours,
+zero semantic content. Top token 2-gram is `hair│,`.
+
+## 2026-08-26 (cont.) — tag-level only; tag ORDER is the sizing knob
+
+Dropped the token/subword unit for Engram sizing: its n-grams mostly straddle
+`, ` boundaries (top 2-gram was `hair │ ,`), so it measures the separator.
+Added `engram_viz/tag_orderings.py` — orders 1/2/3 x {alpha, freq, random},
+one parse, ~2 h. Writes `out/tagorder_*.{parquet,top.tsv}`,
+`out/tag_orderings.json`, `out/06_tag_orderings.png`.
+
+Correctness check built in: order 1 is permutation-invariant, so all three
+orderings must return identical counts. They do (315,966 rows). Keep that
+check if this script is edited.
+
+Distinct rows (1.16M docs, 316k tags, 51.0M tag instances):
+n=1 315,966 for all three. n=2: alpha 4.63M, freq 6.06M, random 14.06M.
+n=3: alpha 14.77M, freq 15.78M, random 42.96M.
+
+Random ordering has **no fixed table size** — 1/2/4/8 epochs give 14.1/22.9/
+36.4/56.2M distinct 2-grams, against an exact ceiling of 202,459,220 ordered
+co-occurring pairs (130B params at 8 heads x 80 dims). Do not size a suffix
+n-gram table under shuffled tags.
+
+Recommendation recorded in the README: **frequency ordering**. Deterministic
+(budgetable), semantically real pairs (`solo│1girl`, `1girl│breasts` vs
+alpha's `canid│canine│canis`), sharper Zipf head (top-1 share 0.94% vs 0.36%)
+so rows get more traffic each. Orders {1,2} at M=2^20/head = 1.34B params for
+100%/88% coverage. If augmentation by shuffling is wanted, hash UNORDERED tag
+pairs, not suffix n-grams.
+
+Runtime gotcha: the exact order-2 ceiling needs all C(len,2) pairs per doc
+(1.1B pair instances). Dedupe per batch before concatenating or it will not
+fit; peak was ~14 GB doing it that way.

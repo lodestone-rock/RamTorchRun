@@ -643,16 +643,41 @@ class ParquetTextImageDataset(Dataset):
         print(f"There are {post_count:,} text-image pairs across {len(buckets)} buckets.")
 
         # ---- 6. Pack into full batches ----
+        # A batch must be exactly batch_size: every sample in it shares one
+        # resolution, and `_round_robin` slices it per rank. The tail of a
+        # bucket that is not a multiple of batch_size is therefore ECHOED from
+        # elsewhere in the same bucket rather than dropped — dropping silently
+        # discarded up to batch_size-1 samples *per bucket*, which for a small
+        # or heavily-bucketed set could be most of the data, and if it took
+        # every bucket to zero the only symptom was an IndexError from an empty
+        # dataset. This matches what __getitem__ already does for a batch whose
+        # images failed to load.
         batches = []
+        n_echoed = 0
         for b in buckets.values():
-            samples = []
-            for s in b:
-                samples.append(s)
-                if len(samples) == self.batch_size:
-                    batches.append(samples)
-                    samples = []
-            # drop incomplete tail batch
+            for i in range(0, len(b), self.batch_size):
+                samples = b[i:i + self.batch_size]
+                short = self.batch_size - len(samples)
+                if short:
+                    # Draw from the whole bucket, not just the tail, so the few
+                    # leftover samples are not over-weighted.
+                    samples = samples + [b[rng.randrange(len(b))]
+                                         for _ in range(short)]
+                    n_echoed += short
+                batches.append(samples)
 
+        if not batches:
+            raise RuntimeError(
+                f"no batches: {post_count:,} sample(s) across {len(buckets)} "
+                f"bucket(s) and batch_size={self.batch_size}. Every bucket was "
+                f"empty — check the caption/dimension columns and the aspect "
+                f"ratio cutoff."
+            )
+        if n_echoed:
+            log.info(
+                f"Echoed {n_echoed:,} sample(s) to fill the last batch of "
+                f"{len(buckets)} bucket(s) (was: dropped)."
+            )
         print(f"We got {len(batches):,} batches.")
         rng.shuffle(batches)
         return batches

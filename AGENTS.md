@@ -57,6 +57,15 @@ chunk list, so it needs `set_resident_out_no_grad_per_stage` rather than
 RamTorch's global `set_resident_out_no_grad`. If you add a model whose relay is
 not uniform, reuse that helper.
 
+`krea2/` has a fourth way of using that same chunk list: **mass LoRA**
+(`train_mass_lora.py`), which trains L per-concept adapters at once by stacking
+each `nn.Linear`'s adapter into a bank and routing a slot-packed batch through
+a grouped `bmm`. It needs no change to the dicing or the relay — only per-step
+module state. Run `krea2/tools/check_lora_bank.py` after touching
+`model/lora_bank.py`, `utils/bank_optimizer.py`, or the slot packing; it proves
+on CPU that the bank equals L separate LoRA models and that inactive slots move
+by exactly zero.
+
 ## Repo map
 
 Three model folders, all the same shape:
@@ -67,6 +76,7 @@ krea2/                    # Krea-2 ~12B MMDiT + Qwen-Image VAE + Qwen3-VL encode
   model/chunks.py         #   flat dicing: build_dit_chunks / build_encoder_chunks
   train.py                #   THE trainer: offload / pipeline / pipeline-offload, LoRA or full
   train_tdm.py            #   TDM few-step distillation (role-based LoRA)
+  train_mass_lora.py      #   L per-concept LoRAs at once (stacked banks + grouped bmm)
   train_utils.py          #   K2 helpers (VAE encode/decode, timesteps, SDPA pinning)
   inference.py            #   single-GPU / --pipeline / --offload (combinable)
   tools/                  #   check_chunk_parity.py — chunked vs monolithic, CPU, seconds
@@ -79,10 +89,14 @@ radiance/                 # Radiance x0 patch-16, 9.5B: Chroma in PIXEL space, N
   tools/                  #   + check_txt_pos_ids.py — scores a checkpoint's own
                           #     loss to settle the text-RoPE convention
 dataloaders/              # SHARED: parquet image+caption dataset, aspect-ratio bucketing
+                          #   + mass_lora_dataloader.py: slot-packed step plans
+                          #   + probe_mass_lora_plan.py: scores a step plan with
+                          #     no model/GPU/decode; --fast streams 20M rows in ~1min
 utils/
   checkpoint.py           # SHARED: LoRA checkpoint load / merge helpers
   profiling.py            # SHARED: Perfetto trace capture over a sampling loop
   ramtorch_helpers.py     # SHARED: grad flush / accumulator plumbing for Pipeline
+  bank_optimizer.py       # SHARED: BankAdamW — AdamW over a LoRA bank's ACTIVE slots only
 checkpoints/              # weights (gitignored, see its README)
 memory/                   # agent context files (tracked)
 runs/, profiles/          # training artifacts / profiler traces (gitignored)

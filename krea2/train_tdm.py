@@ -257,7 +257,13 @@ def train(cfg: dict, config_path: str):
     act_slots       = cfg.get("offload_act_slots", 2)
     enc_window      = cfg.get("enc_offload_window", 2)
 
-    grad_ckpt = cfg.get("grad_ckpt", False)
+    # A bool or a fraction of each stage's chunks; validated here rather than
+    # at the call site so a bad value fails before the ~51 GB checkpoint load.
+    grad_ckpt = float(cfg.get("grad_ckpt", False))
+    if not 0.0 <= grad_ckpt <= 1.0:
+        raise ValueError(
+            f"grad_ckpt must be a bool or a fraction in [0, 1], got {grad_ckpt!r}"
+        )
     if grad_ckpt and offload:
         raise ValueError(
             "grad_ckpt is incompatible with weight streaming — use "
@@ -409,9 +415,11 @@ def train(cfg: dict, config_path: str):
     dit_chunks = build_dit_chunks(dit, blocks_per_chunk=blocks_per_chunk)
     head_chunk = dit_chunks[-1]
     counts = cfg.get("chunks_per_stage") or balance_chunks_by_bytes(dit_chunks, n_stages)
+    ckpt_per_stage = [0] * len(counts)
     if grad_ckpt:
-        set_dit_grad_ckpt(dit_chunks, True)
-        print("  Gradient checkpointing ENABLED (DiT blocks + text fusion).")
+        ckpt_per_stage = set_dit_grad_ckpt(dit_chunks, grad_ckpt, counts)
+        print(f"  Gradient checkpointing at {grad_ckpt:.0%} of each stage's "
+              f"chunks (DiT blocks + text fusion): {ckpt_per_stage} per stage.")
 
     print(f"  Dicing DiT into {len(dit_chunks)} chunks "
           f"(blocks_per_chunk={blocks_per_chunk}) over {n_stages} stage(s)"

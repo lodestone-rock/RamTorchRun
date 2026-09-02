@@ -99,6 +99,7 @@ from utils.ramtorch_helpers import (
 from dataloaders.mass_lora_dataloader import MassLoraParquetDataset
 
 from krea2.train_utils import (
+    TagTrainer,
     _mu_from_seq_len,
     _pin_sdpa_backends,
     sample_timesteps,
@@ -225,6 +226,8 @@ def preview(
     y2: float = 1.15,
     minres: int = 256,
     maxres: int = 1280,
+    tag_ids: torch.Tensor | None = None,
+    tag_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Euler+CFG sampling through the chunked DiT. Returns a float32 CPU tensor
     [2*n, 3, H, W] in [-1, 1]: generated samples followed by decoded GT.
@@ -249,23 +252,37 @@ def preview(
     txt, txtmask = txt_mbs[0], txtmask_mbs[0]
     untxt, untxtmask = untxt_mbs[0], untxtmask_mbs[0]
 
+    taglen = 0
+    if tag_ids is not None:
+        tag_ids, tag_mask = tag_ids[:n_samples], tag_mask[:n_samples]
+        taglen = tag_ids.shape[1]
+        untag_mask = torch.zeros_like(tag_mask)   # CFG negative drops tags too
+
     noise = torch.randn_like(x0_ref)
-    img_tok, pos, mask = prepare(noise, txt.shape[1], patch, txtmask)
-    _, unpos, unmask = prepare(noise, untxt.shape[1], patch, untxtmask)
+    img_tok, pos, mask = prepare(noise, txt.shape[1], patch, txtmask,
+                                 taglen=taglen, tagmask=tag_mask)
+    if taglen:
+        _, unpos, unmask = prepare(noise, untxt.shape[1], patch, untxtmask,
+                                   taglen=taglen, tagmask=untag_mask)
+    else:
+        _, unpos, unmask = prepare(noise, untxt.shape[1], patch, untxtmask)
 
     x1_res = (minres // (compression * patch)) ** 2
     x2_res = (maxres // (compression * patch)) ** 2
     ts = k2_timesteps(img_tok.shape[1], steps, x1_res, x2_res, y1=y1, y2=y2, mu=mu)
 
-    head_chunk.set_seq(txt.shape[1], img_tok.shape[1])
+    head_chunk.set_seq(txt.shape[1], img_tok.shape[1], taglen=taglen)
 
     img = img_tok
     for tcurr, tprev in zip(ts[:-1], ts[1:]):
         t_vec = torch.full((n_samples,), tcurr, dtype=torch.float32, device=device)
-        cond = dit_pipe.infer((img, txt, t_vec, pos, mask), n_microbatches=1).to(device)
-        uncond = dit_pipe.infer(
-            (img, untxt, t_vec, unpos, unmask), n_microbatches=1
-        ).to(device)
+        cond_in = (img, txt, t_vec, pos, mask)
+        uncond_in = (img, untxt, t_vec, unpos, unmask)
+        if taglen:
+            cond_in += (tag_ids, tag_mask)
+            uncond_in += (tag_ids, untag_mask)
+        cond = dit_pipe.infer(cond_in, n_microbatches=1).to(device)
+        uncond = dit_pipe.infer(uncond_in, n_microbatches=1).to(device)
         v = uncond + cfg_scale * (cond - uncond)
         img = img + (tprev - tcurr) * v.to(img.dtype)
 
@@ -316,6 +333,11 @@ def train(cfg: dict, config_path: str):
     enc_cfg = ENCODER_CONFIGS[cfg.get("encoder_config", "qwen3_vl_4b")]
     dit_cfg = MMDIT_CONFIGS[cfg.get("mmdit_config", "large_wide")]
 
+    # A tag table here is SHARED across every slot, unlike the adapters — it
+    # learns the tag vocabulary common to all concepts while each slot learns
+    # its own. Off unless the config carries a `tag_embed` block.
+    tags = TagTrainer(cfg, parallelism)
+
     # ------------------------------------------------------------------
     # Chunking / offload knobs
     # ------------------------------------------------------------------
@@ -341,7 +363,13 @@ def train(cfg: dict, config_path: str):
     act_slots = cfg.get("offload_act_slots", 2)
     enc_window = cfg.get("enc_offload_window", 2)
 
-    grad_ckpt = cfg.get("grad_ckpt", False)
+    # A bool or a fraction of each stage's chunks; validated here rather than
+    # at the call site so a bad value fails before the ~51 GB checkpoint load.
+    grad_ckpt = float(cfg.get("grad_ckpt", False))
+    if not 0.0 <= grad_ckpt <= 1.0:
+        raise ValueError(
+            f"grad_ckpt must be a bool or a fraction in [0, 1], got {grad_ckpt!r}"
+        )
     if grad_ckpt and offload:
         raise ValueError(
             "grad_ckpt (torch.utils.checkpoint inside a chunk) is incompatible "
@@ -399,6 +427,9 @@ def train(cfg: dict, config_path: str):
         offset=parquet_cfg.get("offset", 0),
         tokenizer=None,
         max_text_len=0,
+        tag_column=parquet_cfg.get("tag_column") if tags.enabled else None,
+        tag_vocab_path=tags.vocab_path if tags.enabled else None,
+        max_tags=tags.max_tags,
     )
     n_slots = dataset.n_slots
     slot_names = list(dataset.slot_names)
@@ -472,6 +503,10 @@ def train(cfg: dict, config_path: str):
     lora_alpha = cfg.get("lora_alpha", float(lora_rank))
     bank_exclude_prefixes = tuple(cfg.get("bank_exclude_prefixes", []))
     bank_exclude_patterns = tuple(cfg.get("bank_exclude_patterns", []))
+    if tags.enabled and "tagembed" not in bank_exclude_prefixes:
+        # The tag projection is shared, not per-slot: banking it would give
+        # every concept its own copy of a table they are all training together.
+        bank_exclude_prefixes += ("tagembed",)
     bank_dtype = _DTYPES[cfg.get("bank_dtype", "bf16")]
     state_dtype = _DTYPES[cfg.get("bank_state_dtype", "fp32")]
     # "cpu" parks the moments in host RAM and streams only the active slot rows
@@ -497,6 +532,7 @@ def train(cfg: dict, config_path: str):
         exclude_prefixes=bank_exclude_prefixes,
         exclude_patterns=bank_exclude_patterns,
     )
+    tags.attach(dit)
     dit = dit.to(dtype)
     if bank_dtype is not dtype:
         # fp32 bank masters next to a bf16 base: RamTorch relocates and streams
@@ -508,6 +544,11 @@ def train(cfg: dict, config_path: str):
     if bank_ckpt_cfg:
         print(f"  Loading bank from {bank_ckpt_cfg}...")
         sd = load_file(bank_ckpt_cfg, device="cpu")
+        # strict=False here already tolerates the tag keys, but routing them
+        # explicitly means a table saved without a configured embedder warns
+        # instead of vanishing into `unexpected`.
+        sd, tag_sd = tags.split_checkpoint(sd)
+        tags.load_tag_state(dit, tag_sd)
         missing, unexpected = dit.load_state_dict(sd, strict=False)
         bank_keys = set(bank_state_dict(dit))
         if unexpected:
@@ -535,9 +576,11 @@ def train(cfg: dict, config_path: str):
     dit_chunks = build_dit_chunks(dit, blocks_per_chunk=blocks_per_chunk)
     head_chunk = dit_chunks[-1]
     counts = cfg.get("chunks_per_stage") or balance_chunks_by_bytes(dit_chunks, n_stages)
+    ckpt_per_stage = [0] * len(counts)
     if grad_ckpt:
-        set_dit_grad_ckpt(dit_chunks, True)
-        print("  Gradient checkpointing ENABLED (DiT blocks + text fusion).")
+        ckpt_per_stage = set_dit_grad_ckpt(dit_chunks, grad_ckpt, counts)
+        print(f"  Gradient checkpointing at {grad_ckpt:.0%} of each stage's "
+              f"chunks (DiT blocks + text fusion): {ckpt_per_stage} per stage.")
 
     print(f"  Dicing DiT into {len(dit_chunks)} chunks "
           f"(blocks_per_chunk={blocks_per_chunk}) over {n_stages} stage(s)"
@@ -580,6 +623,7 @@ def train(cfg: dict, config_path: str):
     # Captured AFTER Pipeline construction: under offload the masters have been
     # relocated to CPU pinned memory, which is where the optimizer must run.
     bank_params = bank_parameters(dit)
+    tags.build_optimizer(dit, warmup=warmup_steps, own_dense=True)
     opt = BankAdamW(
         bank_params, n_slots=n_slots, lr=lr, betas=(0.9, 0.95),
         weight_decay=weight_decay, warmup=warmup_steps, state_dtype=state_dtype,
@@ -593,7 +637,13 @@ def train(cfg: dict, config_path: str):
     # Checkpoint save
     # ------------------------------------------------------------------
     def _save_checkpoint(path: str):
-        sd = {k: v.detach().cpu().contiguous() for k, v in bank_state_dict(dit).items()}
+        sd = dict(bank_state_dict(dit))
+        if tags.enabled and dit.tagembed is not None:
+            # bank_state_dict selects slot-shaped tensors only, so the shared
+            # tag table has to be added by hand or it is silently not saved.
+            sd.update({f"tagembed.{k}": v
+                       for k, v in dit.tagembed.state_dict().items()})
+        sd = {k: v.detach().cpu().contiguous() for k, v in sd.items()}
         save_file(sd, path)
         meta = {
             "slot_names": slot_names,
@@ -741,14 +791,16 @@ def train(cfg: dict, config_path: str):
             shape["S"], shape["b"] = S, per_slot_batch
 
             # ---------- Text conditioning (uncond dropout + chunked encode)
-            dropped = [
-                "" if torch.rand(1).item() < uncond_ratio else c for c in captions
-            ]
+            # One coin per sample, reused for the tags: a CFG negative pass
+            # drops both channels, so training has to match.
+            is_uncond = [torch.rand(1).item() < uncond_ratio for _ in captions]
+            dropped = ["" if u else c for u, c in zip(is_uncond, captions)]
             txt_mbs, txtmask_mbs = encode_captions(
                 enc_pipe, tokenizer, dropped, n_mb, driver
             )
             txtlen = txt_mbs[0].shape[1]
             txtmask = torch.cat(txtmask_mbs, dim=0)
+            tag_ids, tag_mask = tags.batch(batch, is_uncond, driver)
 
             # ---------- VAE encode -------------------------------------------
             x0_clean = parallel_vae_encode(aes, devices, images, driver)
@@ -764,7 +816,10 @@ def train(cfg: dict, config_path: str):
             # ---------- Flow-matching interpolation + patchify ---------------
             t4 = t[:, None, None, None].to(x0_clean.dtype)
             x_t = (1.0 - t4) * x0_clean + t4 * x0_noise
-            x_t_tok, pos, mask = prepare(x_t, txtlen, patch, txtmask)
+            taglen = tags.max_tags if tag_ids is not None else 0
+            x_t_tok, pos, mask = prepare(
+                x_t, txtlen, patch, txtmask, taglen=taglen, tagmask=tag_mask
+            )
             v_target = rearrange(
                 x0_noise - x0_clean,
                 "b c (h ph) (w pw) -> b (h w) (c ph pw)",
@@ -777,8 +832,12 @@ def train(cfg: dict, config_path: str):
             # the bank's active-slot state is per STEP and cannot race the
             # in-flight microbatches of the 1b1f schedule.
             set_active_slots(dit, slots)
+            if taglen:
+                tagid_mbs = tag_ids.chunk(n_mb)
+                tagmask_mbs = tag_mask.chunk(n_mb)
             nested = tuple(
                 (x_mb, txt_mbs[k], t_mb, pos_mb, m_mb)
+                + ((tagid_mbs[k], tagmask_mbs[k]) if taglen else ())
                 for k, (x_mb, t_mb, pos_mb, m_mb) in enumerate(
                     zip(
                         x_t_tok.chunk(n_mb),
@@ -788,7 +847,7 @@ def train(cfg: dict, config_path: str):
                     )
                 )
             )
-            head_chunk.set_seq(txtlen, imglen)
+            head_chunk.set_seq(txtlen, imglen, taglen=taglen)
             slot_loss["sum"], slot_loss["n"] = None, 0
             _t = time.perf_counter()
             phase_s["data"] += _t - _t_data
@@ -813,6 +872,7 @@ def train(cfg: dict, config_path: str):
             phase_s["clip"] += _t - _prev
 
             opt.step(slots)
+            tags.step(tag_ids, tag_mask)   # before zero_grads: reads .grad
             zero_grads(dit_pipe)
             _t, _prev = time.perf_counter(), _t
             phase_s["opt"] += _t - _prev
@@ -858,6 +918,9 @@ def train(cfg: dict, config_path: str):
                     for mb in range(n_mb) for j in range(per_slot_batch)
                 ][:preview_n]
                 set_active_slots(dit, [slot])
+                # Previews show the untouched captions, so they get the
+                # untouched tags rather than this step's dropped-out ones.
+                pv_ids, pv_mask = tags.undropped()
                 grid_rows = preview(
                     dit_pipe, head_chunk, enc_pipe, tokenizer, aes[driver],
                     patch, compression,
@@ -867,6 +930,8 @@ def train(cfg: dict, config_path: str):
                     n_samples=len(rows),
                     mu=cfg.get("preview_mu", None),
                     y1=mu_y1, y2=mu_y2, minres=minres, maxres=maxres,
+                    tag_ids=pv_ids[rows] if pv_ids is not None else None,
+                    tag_mask=pv_mask[rows] if pv_ids is not None else None,
                 )
                 grid = make_grid((grid_rows + 1) / 2, nrow=len(rows))
                 ext = "png" if preview_quality >= 100 else "jpg"

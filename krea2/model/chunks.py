@@ -54,8 +54,15 @@ from .mmdit import SingleStreamDiT, _mask, temb
 class DiTEmbedChunk(nn.Module):
     """Everything before the block stack.
 
-    Receives the per-microbatch tuple ``(img_tok, context, t, pos, mask)`` as
-    positional args and emits the block state relayed through the stack.
+    Receives the per-microbatch tuple ``(img_tok, context, t, pos, mask)`` --
+    or ``(..., tag_ids, tag_mask)`` when the model carries a tag embedder --
+    as positional args and emits the block state relayed through the stack.
+
+    The tag table lives HERE rather than outside the pipeline so RamTorch owns
+    it like any other chunk weight: gradients flow through the normal chunk
+    backward with no plumbing for input grads. The cost is that under
+    ``offload`` / ``pipeline-offload`` it streams once per microbatch, which is
+    why the trainers warn about that combination.
     """
 
     out_no_grad = (3,)  # freqs
@@ -68,9 +75,10 @@ class DiTEmbedChunk(nn.Module):
         self.tproj = dit.tproj
         self.txtfusion = dit.txtfusion
         self.txtmlp = dit.txtmlp
+        self.tagembed = dit.tagembed
         self.posemb = dit.posemb  # parameter-free
 
-    def forward(self, img, context, t, pos, mask):
+    def forward(self, img, context, t, pos, mask, tag_ids=None, tag_mask=None):
         img = self.first(img)
         t_emb = self.tmlp(
             temb(t[:, None], self.config.tdim, device=img.device, dtype=img.dtype)
@@ -81,7 +89,14 @@ class DiTEmbedChunk(nn.Module):
         context = self.txtfusion(context, mask=txtmask)
         context = self.txtmlp(context)
 
-        combined = torch.cat((context, img), dim=1)
+        if tag_ids is not None and self.tagembed is not None:
+            # RamTorch relays int tensors as-is; only the float tag_mask would
+            # arrive as a grad-requiring leaf, and it is boolean here.
+            combined = torch.cat(
+                (context, self.tagembed(tag_ids, tag_mask), img), dim=1
+            )
+        else:
+            combined = torch.cat((context, img), dim=1)
 
         # Pad to a multiple of 256 (mirrors SingleStreamDiT.forward).
         padlen = (-combined.shape[1]) % 256
@@ -132,19 +147,22 @@ class DiTHeadChunk(nn.Module):
     def __init__(self, dit: SingleStreamDiT):
         super().__init__()
         self.last = dit.last
-        self.txtlen: int | None = None
+        self.prefixlen: int | None = None
         self.imglen: int | None = None
 
-    def set_seq(self, txtlen: int, imglen: int):
-        self.txtlen = txtlen
+    def set_seq(self, txtlen: int, imglen: int, taglen: int = 0):
+        # Tag tokens sit between the text and the image, so they are part of
+        # the prefix the image slice skips. Taking taglen as its own argument
+        # keeps every call site from having to remember to add it.
+        self.prefixlen = txtlen + taglen
         self.imglen = imglen
 
     def forward(self, combined, tvec, t_emb, freqs, attn_mask):
-        assert self.txtlen is not None and self.imglen is not None, (
+        assert self.prefixlen is not None and self.imglen is not None, (
             "call head_chunk.set_seq(txtlen, imglen) before pipe.step/infer"
         )
         final = self.last(combined, t_emb)
-        return final[:, self.txtlen : self.txtlen + self.imglen, :]
+        return final[:, self.prefixlen : self.prefixlen + self.imglen, :]
 
 
 def build_dit_chunks(
@@ -166,19 +184,67 @@ def build_dit_chunks(
     return chunks
 
 
-def set_dit_grad_ckpt(chunks: list[nn.Module], enabled: bool = True):
+def _even_subset(n: int, k: int) -> list[bool]:
+    """``k`` of ``n`` slots, spread as evenly as the integers allow."""
+    out, prev = [], 0
+    for j in range(1, n + 1):
+        cur = (j * k) // n
+        out.append(cur > prev)
+        prev = cur
+    return out
+
+
+def set_dit_grad_ckpt(
+    chunks: list[nn.Module],
+    enabled: bool | float = True,
+    counts: list[int] | None = None,
+) -> list[int]:
     """Per-block torch.utils.checkpoint — RESIDENT execution only.
 
     Under RamTorch's offload engine a bare ``torch.utils.checkpoint`` inside a
     chunk recomputes with the CPU masters (``functional_call`` reverts the
     swapped-in GPU weights on exit); use ``keep_activations="checkpoint"``
     there instead, which checkpoints each chunk from the outside.
+
+    ``enabled`` is a FRACTION as well as a flag: ``True``/1.0 checkpoints every
+    chunk that can, ``False``/0.0 none, and 0.5 about half — trading recompute
+    back for memory when a stage has headroom to spare.
+
+    Pass ``counts`` (the chunks-per-stage split) to apply the fraction **per
+    stage**. That is the useful reading of it: peak VRAM is set by whichever
+    GPU holds the most, so every stage has to give up the same share of its own
+    chunks. Applying it to the flat list instead would let one stage keep all
+    its activations while another checkpointed everything, which costs the
+    recompute without lowering the peak.
+
+    Within a stage the chosen chunks are spread evenly rather than clustered at
+    one end, so the saving is uniform along the depth. The denominator is the
+    chunks that *can* checkpoint — a stage holding the head chunk has one fewer
+    than its chunk count.
+
+    Returns the number checkpointed per stage.
     """
-    for c in chunks:
-        if isinstance(c, DiTBlockChunk):
-            c.grad_ckpt = enabled
-        elif isinstance(c, DiTEmbedChunk):
-            c.txtfusion.grad_ckpt = enabled
+    ratio = float(enabled)
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError(
+            f"grad_ckpt must be a bool or a fraction in [0, 1], got {enabled!r}"
+        )
+    if counts is None:
+        counts = [len(chunks)]
+
+    per_stage, idx = [], 0
+    for cnt in counts:
+        able = [c for c in chunks[idx:idx + cnt]
+                if isinstance(c, (DiTBlockChunk, DiTEmbedChunk))]
+        idx += cnt
+        k = round(ratio * len(able))
+        for c, on in zip(able, _even_subset(len(able), k)):
+            if isinstance(c, DiTBlockChunk):
+                c.grad_ckpt = on
+            else:
+                c.txtfusion.grad_ckpt = on
+        per_stage.append(k)
+    return per_stage
 
 
 def chunk_bytes(chunk: nn.Module) -> int:

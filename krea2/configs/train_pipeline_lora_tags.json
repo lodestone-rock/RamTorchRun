@@ -1,0 +1,116 @@
+{
+    "_comment": "Krea-2 LoRA + TAG EMBEDDING over the 5-source tag_samples_clean mix. Adds a learnable per-tag table whose matched tags become extra DiT tokens between the text prefix and the image tokens, so a prompt can carry booru bag-of-words tags and natural language at once. Run: uv run python krea2/train.py krea2/configs/train_pipeline_lora_tags.json",
+
+    "seed": 42,
+    "initial_global_step": 0,
+
+    "parallelism": "pipeline",
+    "chunks_per_stage": null,
+    "n_microbatches": 4,
+    "schedule": "staggered_1b1f",
+
+    "blocks_per_chunk": 1,
+    "offload_window": 2,
+    "offload_pin": 0,
+    "offload_backward": "checkpoint",
+    "offload_grad_accum": "cpu",
+    "offload_acc_slots": null,
+    "offload_activations": false,
+    "offload_act_slots": 2,
+    "enc_layers_per_chunk": 1,
+    "enc_offload_window": 2,
+    "grad_ckpt": true,
+
+    "batch_size": 2,
+    "lr": 1e-4,
+    "weight_decay": 1e-4,
+    "warmup": 200,
+    "max_grad_norm": 1.0,
+    "max_steps": 0,
+
+    "mu_y1": 0.5,
+    "mu_y2": 1.15,
+    "mu_override": null,
+    "mu_sigma": 1.0,
+    "minres": 256,
+    "maxres": 1280,
+
+    "_comment_uncond": "COUPLED: the same per-sample coin blanks the caption and masks the tag block, because a CFG negative pass drops both channels at inference.",
+    "uncond_ratio": 0.1,
+
+    "eval_interval": 200,
+    "save_every_n_steps": 1000,
+    "log_every_n_steps": 10,
+
+    "preview_samples": 4,
+    "preview_cfg_scale": 4.5,
+    "preview_steps": 28,
+    "preview_mu": null,
+    "preview_quality": 95,
+
+    "ckpt_path": "runs/k2-tags/ckpts",
+    "preview_path": "runs/k2-tags/previews",
+
+    "mmdit_config": "large_wide",
+    "encoder_config": "qwen3_vl_4b",
+
+    "ae_model_id": "Qwen/Qwen-Image",
+    "encoder_model_id": "Qwen/Qwen3-VL-4B-Instruct",
+
+    "mmdit_checkpoint": "checkpoints/krea2/fullft_step_49600.safetensors",
+
+    "mode": "lora",
+    "full_checkpoint": null,
+    "lora_checkpoint": null,
+
+    "lora_rank": 32,
+    "lora_alpha": 32.0,
+    "_comment_lora_exclude": "'tagembed' is appended automatically: the tag projection is new weight trained directly, not a pretrained matrix to adapt.",
+    "lora_exclude_prefixes": [],
+
+    "_comment_tag_embed": "315,966 tags x 512 = 161.8M params (0.31 GB bf16) in the embed chunk, with 1.21 GB of RowAdamW moments parked in host RAM. vocab_path is VERSIONED: its row count is written into the checkpoint and asserted on load, because rebuilding the corpus renumbers the id space and would silently train against shifted meanings — bump to tags_v2.parquet rather than overwriting. max_tags is free anywhere in 1..256 (the DiT pads the combined sequence to a multiple of 256), and typical booru rows carry ~44 tags. tag_drop_prob drops the tag block ALONE, which is what teaches the model that a caption with no tags is still a valid prompt.",
+    "tag_embed": {
+        "enabled": true,
+        "vocab_path": "checkpoints/tag_vocab/tags_v1.parquet",
+        "tag_dim": 512,
+        "max_tags": 128,
+        "tag_drop_prob": 0.1,
+        "lr": 1e-4,
+        "weight_decay": 0.0,
+        "state_device": "cpu"
+    },
+
+    "_comment_data": "The same 5-source mix the teacher was fine-tuned on. 'tags' is exactly 100% present on the boorus and exactly 0% elsewhere, so the non-booru sources supply the untagged case with no synthetic handling — an untagged row is a bit-exact no-op.",
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "e621":       {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=e621",       "n_samples": 21702},
+            "danbooru":   {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=danbooru",   "n_samples": 19987},
+            "deviantart": {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=deviantart", "n_samples": 6717},
+            "midjourney": {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=midjourney", "n_samples": 10000},
+            "reddit":     {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=reddit",     "n_samples": 19260}
+        },
+        "_comment_captions": "Weights are CONDITIONAL, not global: a row is drawn from whichever of these columns it actually has, re-normalized. So 0.25 on brief_summary does not buy 25% natural-language captions overall, it buys 25% of the rows that have one. The case that makes the table earn its keep is a booru row drawing a natural-language caption while its full tag set rides along.",
+        "caption_columns": {
+            "tags":                     {"weight": 0.25, "is_tag_based": true},
+            "midjourney_style_summary": {"weight": 0.25, "is_tag_based": false},
+            "brief_summary":            {"weight": 0.25, "is_tag_based": false},
+            "10_word_summary":          {"weight": 0.25, "is_tag_based": false}
+        },
+        "_comment_tag_column": "DECOUPLED from caption_columns: tags are read from here whichever caption column was sampled.",
+        "tag_column": "tags",
+        "filename_column": "file_path",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [512],
+        "base_resolution_weights": [1.0],
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "ratio_cutoff": 2.0,
+        "resolution_step": 64,
+        "num_workers": 16,
+        "prefetch_factor": 4,
+        "offset": 0
+    }
+}

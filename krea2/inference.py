@@ -103,6 +103,92 @@ def _slugify(text: str, maxlen: int = 60) -> str:
     return slug[:maxlen] or "prompt"
 
 
+class TagPrompt:
+    """Resolves prompts to tag ids for inference.
+
+    Two sources, unioned: whatever ``--tags`` supplies verbatim, plus any known
+    tag found in the prompt text (unless ``--no-auto-tags``). Extraction is
+    what makes this useful without the user changing anything — a plain
+    `1girl, solo, long hair` prompt already reads as tags, and a natural
+    sentence still contributes the phrases it happens to contain.
+
+    Off entirely unless the config carries a `tag_embed` block, in which case
+    the model must also carry the matching table.
+    """
+
+    def __init__(self, cfg: dict, args):
+        tag_cfg = cfg.get("tag_embed") or {}
+        self.vocab_path = args.tag_vocab or tag_cfg.get("vocab_path")
+        self.enabled = bool(tag_cfg.get("enabled", bool(tag_cfg))) and bool(
+            self.vocab_path
+        )
+        if not self.enabled:
+            if args.tags:
+                print("[infer] [warn] --tags given but the config has no "
+                      "tag_embed block; ignoring it.")
+            self.max_tags = 0
+            return
+
+        from utils.tag_vocab import TagMatcher, TagVocab
+
+        self.max_tags = tag_cfg.get("max_tags", 128)
+        self.tag_dim = tag_cfg.get("tag_dim", 512)
+        self.vocab = TagVocab.load(self.vocab_path)
+        # Trie ON here, unlike training: an inference prompt is free text.
+        self.matcher = TagMatcher(self.vocab)
+        self.explicit = args.tags or ""
+        self.auto = not args.no_auto_tags
+        print(f"[infer] Tag conditioning: {len(self.vocab):,} tags from "
+              f"{self.vocab_path} (auto-extract={'on' if self.auto else 'off'}"
+              + (f", explicit={self.explicit!r}" if self.explicit else "") + ")")
+
+    def encode(self, prompts: list[str]):
+        """-> (tag_ids [B, T], tag_mask [B, T]) or (None, None)."""
+        if not self.enabled:
+            return None, None
+        ids = torch.zeros(len(prompts), self.max_tags, dtype=torch.long)
+        mask = torch.zeros(len(prompts), self.max_tags, dtype=torch.bool)
+        for i, p in enumerate(prompts):
+            hits = []
+            if self.explicit:
+                hits += self.matcher.match(self.explicit, free_text=False)
+            if self.auto:
+                hits += [t for t in self.matcher.match(p) if t not in hits]
+            hits = hits[: self.max_tags]
+            if hits:
+                ids[i, : len(hits)] = torch.tensor(hits)
+                mask[i, : len(hits)] = True
+        return ids, mask
+
+    def describe(self, prompt: str) -> list[str]:
+        """The tag names that would be injected for *prompt*, for logging."""
+        if not self.enabled:
+            return []
+        ids, mask = self.encode([prompt])
+        return [self.vocab.forms[int(i)] for i in ids[0][mask[0]]]
+
+
+def _attach_tag_embed(dit: SingleStreamDiT, tagger: "TagPrompt", dtype) -> None:
+    """Give *dit* an (empty) tag table for a checkpoint to fill.
+
+    Mirrors `TagTrainer.attach`: the base checkpoint has no tag keys, so the
+    module cannot be built into the config without breaking the strict load.
+    """
+    if not tagger.enabled:
+        return
+    import dataclasses
+
+    from krea2.model.tag_embed import TagEmbedder
+
+    dit.tagembed = TagEmbedder(
+        len(tagger.vocab), dit.config.features, tagger.tag_dim,
+        vocab_name=tagger.vocab.name,
+    ).to(dtype)
+    dit.config = dataclasses.replace(
+        dit.config, tag_vocab=len(tagger.vocab), tag_dim=tagger.tag_dim
+    )
+
+
 def _load_lora_any_format(dit: SingleStreamDiT, path: str, fmt: str = "auto") -> None:
     """Load a LoRA checkpoint in EITHER the native K2 format or the ComfyUI
     'friend' format, into a DiT that already had ``inject_lora`` applied.
@@ -267,6 +353,8 @@ def sample_pipeline(
     y1=0.5,
     y2=1.15,
     mu=None,
+    tag_ids=None,
+    tag_mask=None,
     trace: "TraceCapture | None" = None,
 ):
     """Pipeline-parallel mirror of krea2.model.sampling.sample (same seeds -> same noise)."""
@@ -293,31 +381,42 @@ def sample_pipeline(
         dim=0,
     )
 
+    taglen = 0
+    if tag_ids is not None:
+        tag_ids, tag_mask = tag_ids.to(device), tag_mask.to(device)
+        taglen = tag_ids.shape[1]
+        untag_mask = torch.zeros_like(tag_mask)   # negative drops tags too
+
     txt, txtmask = _encode_pipeline(enc_pipe, tokenizer, prompts, device)
-    x, pos, mask = prepare(noise, txt.shape[1], patch, txtmask)
+    x, pos, mask = prepare(noise, txt.shape[1], patch, txtmask,
+                           taglen=taglen, tagmask=tag_mask)
     if cfg:
         untxt, untxtmask = _encode_pipeline(enc_pipe, tokenizer, negative_prompts, device)
-        _, unpos, unmask = prepare(noise, untxt.shape[1], patch, untxtmask)
+        _, unpos, unmask = prepare(noise, untxt.shape[1], patch, untxtmask,
+                                   taglen=taglen,
+                                   tagmask=untag_mask if taglen else None)
 
     x1 = (minres // align) ** 2
     x2 = (maxres // align) ** 2
     ts = k2_timesteps(x.shape[1], steps, x1, x2, y1=y1, y2=y2, mu=mu)
 
-    head_chunk.set_seq(txt.shape[1], x.shape[1])
+    head_chunk.set_seq(txt.shape[1], x.shape[1], taglen=taglen)
 
     img = x
     for i, (tcurr, tprev) in enumerate(zip(ts[:-1], ts[1:])):
         with (trace.iteration(i) if trace else nullcontext()):
             t = torch.full((n,), tcurr, dtype=img.dtype, device=img.device)
+            cond_in = (img, txt, t, pos, mask)
+            if taglen:
+                cond_in += (tag_ids, tag_mask)
             with (trace.span("cond") if trace else nullcontext()):
-                cond = dit_pipe.infer(
-                    (img, txt, t, pos, mask), n_microbatches=n
-                ).to(device)
+                cond = dit_pipe.infer(cond_in, n_microbatches=n).to(device)
             if cfg:
+                uncond_in = (img, untxt, t, unpos, unmask)
+                if taglen:
+                    uncond_in += (tag_ids, untag_mask)
                 with (trace.span("uncond") if trace else nullcontext()):
-                    uncond = dit_pipe.infer(
-                        (img, untxt, t, unpos, unmask), n_microbatches=n
-                    ).to(device)
+                    uncond = dit_pipe.infer(uncond_in, n_microbatches=n).to(device)
                 v = cond + guidance * (cond - uncond)
             else:
                 v = cond
@@ -371,6 +470,8 @@ def sample_offload(
     y1=0.5,
     y2=1.15,
     mu=None,
+    tag_ids=None,
+    tag_mask=None,
     trace: "TraceCapture | None" = None,
 ):
     """Single-GPU mirror of sample_pipeline: same seeds -> same noise, but the
@@ -398,27 +499,42 @@ def sample_offload(
         dim=0,
     )
 
-    x, pos, mask = prepare(noise, txt.shape[1], patch, txtmask)
+    taglen = 0
+    if tag_ids is not None:
+        tag_ids, tag_mask = tag_ids.to(device), tag_mask.to(device)
+        taglen = tag_ids.shape[1]
+        untag_mask = torch.zeros_like(tag_mask)   # negative drops tags too
+
+    x, pos, mask = prepare(noise, txt.shape[1], patch, txtmask,
+                           taglen=taglen, tagmask=tag_mask)
     if cfg:
         untxt = untxt.expand(n, -1, -1, -1).contiguous()
         unmask_in = untxtmask.expand(n, -1).contiguous()
-        _, unpos, unmask = prepare(noise, untxt.shape[1], patch, unmask_in)
+        _, unpos, unmask = prepare(noise, untxt.shape[1], patch, unmask_in,
+                                   taglen=taglen,
+                                   tagmask=untag_mask if taglen else None)
 
     x1 = (minres // align) ** 2
     x2 = (maxres // align) ** 2
     ts = k2_timesteps(x.shape[1], steps, x1, x2, y1=y1, y2=y2, mu=mu)
 
-    head_chunk.set_seq(txt.shape[1], x.shape[1])
+    head_chunk.set_seq(txt.shape[1], x.shape[1], taglen=taglen)
 
     img = x
     for i, (tcurr, tprev) in enumerate(zip(ts[:-1], ts[1:])):
         with (trace.iteration(i) if trace else nullcontext()):
             t = torch.full((n,), tcurr, dtype=img.dtype, device=img.device)
+            cond_in = (img, txt, t, pos, mask)
+            if taglen:
+                cond_in += (tag_ids, tag_mask)
             with (trace.span("cond") if trace else nullcontext()):
-                cond = model((img, txt, t, pos, mask))
+                cond = model(cond_in)
             if cfg:
+                uncond_in = (img, untxt, t, unpos, unmask)
+                if taglen:
+                    uncond_in += (tag_ids, untag_mask)
                 with (trace.span("uncond") if trace else nullcontext()):
-                    uncond = model((img, untxt, t, unpos, unmask))
+                    uncond = model(uncond_in)
                 v = cond + guidance * (cond - uncond)
             else:
                 v = cond
@@ -492,6 +608,17 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--batch-size", type=int, default=4,
                     help="Prompts per sampling batch (default 4). Lower if OOM.")
+    ap.add_argument("--tags", default=None,
+                    help="Comma-separated tags injected as extra DiT tokens, "
+                         "e.g. --tags '1girl, solo, long hair'. Applied to "
+                         "every prompt. Requires a checkpoint trained with a "
+                         "tag table. Tag ORDER is irrelevant by construction.")
+    ap.add_argument("--no-auto-tags", action="store_true",
+                    help="Do not extract tags from the prompt text itself. By "
+                         "default any known tag appearing in the prompt is "
+                         "also injected, so tag-style prompts work unchanged.")
+    ap.add_argument("--tag-vocab", default=None,
+                    help="Override the config's tag_embed.vocab_path.")
     ap.add_argument("--lora-checkpoint", default=None,
                     help="Override config lora_checkpoint (handy for A/B without editing JSON).")
     ap.add_argument("--lora-rank", type=int, default=None,
@@ -649,6 +776,8 @@ def main() -> int:
     else:
         device = torch.device(args.device)
 
+    tagger = TagPrompt(cfg, args)
+
     dit_cfg_name = cfg.get("mmdit_config", "large_wide")
     enc_cfg_name = cfg.get("encoder_config", "qwen3_vl_4b")
     encoder_id = cfg.get("encoder_model_id", "Qwen/Qwen3-VL-4B-Instruct")
@@ -728,9 +857,14 @@ def main() -> int:
         lora_exclude = tuple(cfg.get("lora_exclude_prefixes", []))
         lora_ckpt = args.lora_checkpoint or cfg.get("lora_checkpoint")
 
+        if tagger.enabled and "tagembed" not in lora_exclude:
+            lora_exclude += ("tagembed",)
         print(f"[infer] Injecting LoRA (rank={lora_rank}, alpha={lora_alpha}, "
               f"exclude={lora_exclude}) ...")
         inject_lora(dit, rank=lora_rank, alpha=lora_alpha, exclude_prefixes=lora_exclude)
+        # Before the checkpoint load, so its tagembed.* keys have somewhere to
+        # land (load_lora_checkpoint is strict=False).
+        _attach_tag_embed(dit, tagger, dtype)
 
         if lora_ckpt:
             print(f"[infer] Loading LoRA checkpoint: {lora_ckpt} "
@@ -750,6 +884,7 @@ def main() -> int:
                   f"{n_scaled} LoRALinear layer(s).")
     else:
         print("[infer] --no-lora set: running the base model.")
+        _attach_tag_embed(dit, tagger, dtype)
 
     if args.pipeline:
         # Chunks are moved to their devices by Pipeline(); the encoder pipeline
@@ -848,6 +983,9 @@ def main() -> int:
         )
     for start in range(0, len(prompts), bs):
         chunk = prompts[start:start + bs]
+        tag_ids, tag_mask = tagger.encode(chunk)
+        if tag_ids is not None and start == 0:
+            print(f"[infer] tags for prompt 0: {tagger.describe(chunk[0])}")
         common = dict(
             device=device,
             dtype=dtype,
@@ -861,6 +999,8 @@ def main() -> int:
             y1=y1,
             y2=y2,
             mu=mu,
+            tag_ids=tag_ids,
+            tag_mask=tag_mask,
         )
         # The VAE keeps some buffers in fp32; autocast (as the trainer does in
         # vae_decode / preview) makes the decode path dtype-consistent.

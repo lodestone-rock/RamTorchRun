@@ -17,8 +17,21 @@ def roundup(value, multiple, name):
     return aligned
 
 
-def prepare(img, txtlen, patch, txtmask):
-    """Patchify the latent and build the combined text+image position / mask tensors.
+# RoPE axis 0 is unused by both text (txtpos is all zeros) and image (imgids
+# never writes index 0), so it is free to mark a token TYPE. Tag tokens take a
+# constant there: shared by all of them, so the tag-to-tag relative rotation
+# stays zero and the block remains exactly permutation invariant, while the
+# tag-to-text and tag-to-image relative rotation is a constant the model can
+# read as "this is a tag, not a word".
+TAG_POS_AXIS0 = 1.0
+
+
+def prepare(img, txtlen, patch, txtmask, taglen=0, tagmask=None):
+    """Patchify the latent and build the combined text+tag+image position / mask.
+
+    The sequence is laid out ``[text | tags | image]``; the head chunk slices
+    the output back to the image span, so ``taglen`` must be folded into the
+    ``txtlen`` it is given (see `set_seq`).
 
     Returns (img_tokens, pos, mask).
     """
@@ -32,8 +45,19 @@ def prepare(img, txtlen, patch, txtmask):
     img = rearrange(img, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=patch, pw=patch)
 
     txtpos = torch.zeros(b, txtlen, 3, device=img.device)
-    mask = torch.cat((txtmask, imgmask), dim=1)
-    pos = torch.cat((txtpos, imgpos), dim=1)
+    parts_pos, parts_mask = [txtpos], [txtmask]
+    if taglen:
+        tagpos = torch.zeros(b, taglen, 3, device=img.device)
+        tagpos[..., 0] = TAG_POS_AXIS0
+        if tagmask is None:
+            tagmask = torch.ones(b, taglen, device=img.device, dtype=torch.bool)
+        parts_pos.append(tagpos)
+        parts_mask.append(tagmask.to(device=img.device, dtype=torch.bool))
+    parts_pos.append(imgpos)
+    parts_mask.append(imgmask)
+
+    mask = torch.cat(parts_mask, dim=1)
+    pos = torch.cat(parts_pos, dim=1)
     return img, pos, mask
 
 
@@ -73,6 +97,8 @@ def sample(
     y1=0.5,
     y2=1.15,
     mu=None,
+    tag_ids=None,
+    tag_mask=None,
 ):
     """End-to-end text-to-image sampling: encode -> euler+CFG denoise -> decode."""
     patch = model.config.patch
@@ -104,15 +130,23 @@ def sample(
         dim=0,
     )
 
+    # Tag conditioning, if the model carries a table and the caller matched any.
+    taglen = 0
+    if tag_ids is not None:
+        taglen = tag_ids.shape[1]
+        untag_mask = torch.zeros_like(tag_mask)   # negative drops tags too
+
     # Positive (conditional) text conditioning.
     txt, txtmask = encoder(prompts)
-    x, pos, mask = prepare(noise, txt.shape[1], patch, txtmask)
+    x, pos, mask = prepare(noise, txt.shape[1], patch, txtmask,
+                           taglen=taglen, tagmask=tag_mask)
 
     # The unconditional branch is only used for CFG; skip encoding/prep entirely
     # when guidance is disabled.
     if cfg:
         untxt, untxtmask = encoder(negative_prompts)
-        _, unpos, unmask = prepare(noise, untxt.shape[1], patch, untxtmask)
+        _, unpos, unmask = prepare(noise, untxt.shape[1], patch, untxtmask,
+                                   taglen=taglen, tagmask=untag_mask)
 
     # min_res/max_res define the (x1,y1)-(x2,y2) interpolation endpoints for `mu`.
     x1 = (minres // (ae.compression * patch)) ** 2
@@ -123,9 +157,12 @@ def sample(
     img = x
     for tcurr, tprev in zip(ts[:-1], ts[1:]):
         t = torch.full((len(img),), tcurr, dtype=img.dtype, device=img.device)
-        cond = model(img=img, context=txt, t=t, pos=pos, mask=mask)
+        cond = model(img=img, context=txt, t=t, pos=pos, mask=mask,
+                     tag_ids=tag_ids, tag_mask=tag_mask)
         if cfg:
-            uncond = model(img=img, context=untxt, t=t, pos=unpos, mask=unmask)
+            uncond = model(img=img, context=untxt, t=t, pos=unpos, mask=unmask,
+                           tag_ids=tag_ids,
+                           tag_mask=None if tag_ids is None else untag_mask)
             v = cond + guidance * (cond - uncond)
         else:
             v = cond

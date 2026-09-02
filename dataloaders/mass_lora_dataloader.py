@@ -26,8 +26,13 @@ match). The planner therefore anchors on the least-scheduled SLOT and picks a
 bucket from that slot's own buckets, instead of picking a bucket first: bucket
 -> slots would quietly starve every slot with narrow aspect coverage.
 
-Everything about decoding, HDR handling, cropping and captions is inherited
-from `ParquetTextImageDataset` unchanged.
+Decoding, HDR handling and cropping are inherited from
+`ParquetTextImageDataset` unchanged. Captions are NOT: the parent picks one
+caption column per row when it builds its pools, which is a fair sample of the
+mix when there are a million rows, but here a slot holds ~5 images and revisits
+each ~250 times, so a load-time draw would pin every image to one band for the
+whole run. This dataset keeps every band a row has and draws one per VISIT
+(`_prepare_caption`).
 """
 from __future__ import annotations
 
@@ -164,6 +169,7 @@ class MassLoraParquetDataset(ParquetTextImageDataset):
             self.group_column,
             *self._caption_col_names,
             *([] if not self.loss_weight_column else [self.loss_weight_column]),
+            *([] if self.tag_column is None else [self.tag_column]),
         })
 
         n_io_threads = min(8, psutil.cpu_count(logical=False) or 4)
@@ -198,6 +204,7 @@ class MassLoraParquetDataset(ParquetTextImageDataset):
         heights = _col(self.height_column)
         groups = _col(self.group_column)
         loss_weights = _col(self.loss_weight_column) if self.loss_weight_column else None
+        tag_values = _col(self.tag_column) if self.tag_column else None
         caption_cols = {c: _col(c) for c in self._caption_col_names}
         del combined
 
@@ -268,21 +275,28 @@ class MassLoraParquetDataset(ParquetTextImageDataset):
                 skipped += 1
                 continue
 
-            available = [
-                idx for idx, c in enumerate(self._caption_col_names)
+            # EVERY band this row has is kept, and the draw happens per VISIT in
+            # `_prepare_caption`, not once here. A slot in a wide-and-shallow
+            # corpus has ~5 images and sees each of them ~250 times, so drawing
+            # the band at pool-build time would lock every image to one band for
+            # the whole run: an adapter could easily never see `tags` on more
+            # than one of its images, which silently defeats the point of
+            # weighting the columns. The parent keeps the draw at load time
+            # BECAUSE it holds a million rows and one band per row is already a
+            # fair sample of the mix; here the row count is bounded by the slot
+            # allowlist, so carrying all bands costs kilobytes.
+            bands = [
+                (str(caption_cols[c][i]).strip(),
+                 self._caption_col_is_tag[idx],
+                 self._caption_col_weights[idx])
+                for idx, c in enumerate(self._caption_col_names)
                 if caption_cols[c] is not None
                 and caption_cols[c][i] is not None
                 and str(caption_cols[c][i]).strip() != ""
             ]
-            if not available:
+            if not bands:
                 skipped_no_caption += 1
                 continue
-            col_idx = rng.choices(
-                available,
-                weights=[self._caption_col_weights[k] for k in available],
-                k=1,
-            )[0]
-            col_name = self._caption_col_names[col_idx]
 
             lw = 1.0
             if loss_weights is not None:
@@ -294,11 +308,11 @@ class MassLoraParquetDataset(ParquetTextImageDataset):
             filename = str(filenames[i])
             pools.setdefault((slot, bucket), []).append({
                 "filename": filename,
-                "caption_or_tags": str(caption_cols[col_name][i]).strip(),
+                "caption_bands": bands,
                 "bucket": bucket,
-                "is_tag_based": self._caption_col_is_tag[col_idx],
                 "is_url_based": self._is_url(filename),
                 "loss_weight": lw,
+                "tags": (tag_values[i] if tag_values and tag_values[i] else ""),
                 "reference_images": [],
                 "slot": slot,
             })
@@ -487,10 +501,25 @@ class MassLoraParquetDataset(ParquetTextImageDataset):
     # ------------------------------------------------------------------
 
     def _prepare_caption(self, sample: dict) -> str:
-        caption = sample["caption_or_tags"]
+        """Draw one caption band for THIS visit, then apply the tag policy.
+
+        The uncond check comes first and short-circuits, so a dropped caption
+        consumes no band draw — dropout stays exactly `uncond_percentage`
+        regardless of how many bands a row carries.
+        """
         if random.random() >= 1 - self.uncond_percentage:
             return ""
-        if self.shuffle_tags and sample["is_tag_based"] and caption:
+        bands = sample["caption_bands"]
+        if len(bands) == 1:
+            caption, is_tag, _ = bands[0]
+        else:
+            # Weights are the configured ones, restricted to the bands this row
+            # actually has; `choices` normalises, which is what renormalising on
+            # the fly used to do at pool-build time.
+            caption, is_tag, _ = random.choices(
+                bands, weights=[w for _, _, w in bands], k=1
+            )[0]
+        if self.shuffle_tags and is_tag and caption:
             tags = caption.split(",")
             random.shuffle(tags)
             tags = self._sample_elements_by_percentage(
@@ -561,7 +590,7 @@ class MassLoraParquetDataset(ParquetTextImageDataset):
             by_slot[s] = items[:per_step]
 
         # Microbatch-major packing: mb -> slot -> sample.
-        images, captions, weights = [], [], []
+        images, captions, weights, tag_strings = [], [], [], []
         for mb in range(self.n_microbatches):
             lo = mb * self.per_slot_batch
             for s in kept:
@@ -569,8 +598,9 @@ class MassLoraParquetDataset(ParquetTextImageDataset):
                     images.append(img)
                     captions.append(self._prepare_caption(sample))
                     weights.append(sample.get("loss_weight", 1.0))
+                    tag_strings.append(sample.get("tags", ""))
 
-        return {
+        out = {
             "images": torch.stack(images, dim=0),
             "captions": captions,
             "slots": kept,
@@ -578,3 +608,6 @@ class MassLoraParquetDataset(ParquetTextImageDataset):
             "bucket": (target_w, target_h),
             "plan_index": index,
         }
+        if self.tag_matcher is not None:
+            out.update(self._encode_tags(tag_strings))
+        return out

@@ -57,6 +57,18 @@ chunk list, so it needs `set_resident_out_no_grad_per_stage` rather than
 RamTorch's global `set_resident_out_no_grad`. If you add a model whose relay is
 not uniform, reuse that helper.
 
+`krea2/` can also inject **tag embeddings**: a learnable per-tag table
+(`model/tag_embed.py`) whose matched tags become extra tokens on the DiT
+sequence between the text prefix and the image tokens, so a prompt can mix
+booru bag-of-words tags with natural language. It is off unless a config
+carries a `tag_embed` block, and an untagged row is a bit-exact no-op. The
+policy lives in one place — `train_utils.TagTrainer`, shared by both trainers.
+Run `krea2/tools/check_tag_embed.py` after touching it. Two rules that are easy
+to break: the table is **attached after** the base checkpoint loads (the base
+has no tag keys, so it cannot go in the config), and `tag_ids`/`tag_mask` sit
+**immediately after `mask`** in `SingleStreamDiT.forward` so the monolithic
+model and `DiTEmbedChunk` take the same positional tuple.
+
 `krea2/` has a fourth way of using that same chunk list: **mass LoRA**
 (`train_mass_lora.py`), which trains L per-concept adapters at once by stacking
 each `nn.Linear`'s adapter into a bank and routing a slot-packed batch through
@@ -66,6 +78,16 @@ module state. Run `krea2/tools/check_lora_bank.py` after touching
 on CPU that the bank equals L separate LoRA models and that inactive slots move
 by exactly zero.
 
+Mass LoRA also inverts one of the shared dataloader's assumptions. The parent
+picks ONE caption column per row at load time, which is a fair sample of the mix
+across a million rows; a mass-LoRA slot holds ~5 images and revisits each ~250
+times, so that would pin every image to one band for a whole run.
+`mass_lora_dataloader.py` therefore keeps every band and draws one per VISIT —
+run `dataloaders/check_mass_lora_captions.py` after touching captions there. It
+also means the plan is only reproducible while RNG *consumption* in the row loop
+is unchanged: adding or removing a per-row `rng` call re-rolls the plan, which
+invalidates the `parquet_dataloader.offset` trick for resuming mid-plan.
+
 ## Repo map
 
 Three model folders, all the same shape:
@@ -74,13 +96,17 @@ Three model folders, all the same shape:
 krea2/                    # Krea-2 ~12B MMDiT + Qwen-Image VAE + Qwen3-VL encoder
   model/                  #   MMDiT, VAE, text encoder, LoRA, sampling
   model/chunks.py         #   flat dicing: build_dit_chunks / build_encoder_chunks
+  model/tag_embed.py      #   TagEmbedder: per-tag table -> extra DiT tokens
   train.py                #   THE trainer: offload / pipeline / pipeline-offload, LoRA or full
   train_tdm.py            #   TDM few-step distillation (role-based LoRA)
   train_mass_lora.py      #   L per-concept LoRAs at once (stacked banks + grouped bmm)
   train_utils.py          #   K2 helpers (VAE encode/decode, timesteps, SDPA pinning)
-  inference.py            #   single-GPU / --pipeline / --offload (combinable)
+                          #   + TagTrainer: the whole tag-embedding policy
+  inference.py            #   single-GPU / --pipeline / --offload (combinable), --tags
   tools/                  #   check_chunk_parity.py — chunked vs monolithic, CPU, seconds
+                          #   + check_tag_embed.py — parity, no-op, permutation, matcher
   configs/                #   train_{offload,pipeline,pipeline_offload}_{lora,full}.json + train_smoke.json
+                          #   + train_pipeline_lora_tags.json, train_tag_smoke.json
 chroma/                   # Chroma1-HD 8.9B flux-style DiT + T5-XXL + flux VAE
                           #   59 chunks; same file layout as krea2/
 radiance/                 # Radiance x0 patch-16, 9.5B: Chroma in PIXEL space, NO VAE
@@ -89,7 +115,10 @@ radiance/                 # Radiance x0 patch-16, 9.5B: Chroma in PIXEL space, N
   tools/                  #   + check_txt_pos_ids.py — scores a checkpoint's own
                           #     loss to settle the text-RoPE convention
 dataloaders/              # SHARED: parquet image+caption dataset, aspect-ratio bucketing
-                          #   + mass_lora_dataloader.py: slot-packed step plans
+                          #   + tag_column: tag ids DECOUPLED from the caption
+                          #   + mass_lora_dataloader.py: slot-packed step plans,
+                          #     caption band drawn PER VISIT, not per row
+                          #   + check_mass_lora_captions.py: guards that draw
                           #   + probe_mass_lora_plan.py: scores a step plan with
                           #     no model/GPU/decode; --fast streams 20M rows in ~1min
 utils/
@@ -97,6 +126,8 @@ utils/
   profiling.py            # SHARED: Perfetto trace capture over a sampling loop
   ramtorch_helpers.py     # SHARED: grad flush / accumulator plumbing for Pipeline
   bank_optimizer.py       # SHARED: BankAdamW — AdamW over a LoRA bank's ACTIVE slots only
+  row_optimizer.py        # SHARED: RowAdamW — AdamW over an embedding's TOUCHED rows only
+  tag_vocab.py            # SHARED: tag normalizer, versioned vocab builder, TagMatcher
 checkpoints/              # weights (gitignored, see its README)
 memory/                   # agent context files (tracked)
 runs/, profiles/          # training artifacts / profiler traces (gitignored)

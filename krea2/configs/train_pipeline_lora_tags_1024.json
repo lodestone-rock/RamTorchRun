@@ -1,0 +1,124 @@
+{
+    "_comment": "Krea-2 rank-128 LoRA + TAG EMBEDDING at 1024px on 4 GPUs, pipeline-parallel. Base is the latest full fine-tune (step 49600), the same teacher the TDM and mass-LoRA runs use. Boorus come from the REBUILT v2 corpus (artist_samples, 1.16M rows, 25-col schema); the other three sources are the TDM run's mix unchanged. Run: uv run python krea2/train.py krea2/configs/train_pipeline_lora_tags_1024.json",
+
+    "seed": 42,
+    "initial_global_step": 0,
+
+    "parallelism": "pipeline",
+    "devices": ["cuda:0", "cuda:1", "cuda:2", "cuda:3"],
+    "chunks_per_stage": null,
+
+    "_comment_bubble": "1b1f bubble = (P-1)/(M+P-1) with P=4 stages: M=8 -> 27%, 16 -> 16%, 24 -> 11%, 40 -> 7%. SWEPT at 1024px on 2026-08-26 (krea2/tools/sweep_bubble.py, peaks include a preview where one ran):  2x8 gbatch 16, 24/25/26/21 GB, 0.82 samp/s | 2x24 gbatch 48, 44/44/45/38 GB, 1.20 samp/s | 3x24 gbatch 72, 59/61/62/52 GB, 1.11 samp/s | 2x40 gbatch 80, 65/67/68/56 GB, 1.19 samp/s. Two results decided this config. First, VRAM tracks the GLOBAL batch (batch_size * M) at ~0.68 GB/sample + ~15 GB static, NOT batch_size alone - the driver materializes the whole global batch (VAE latents, v_target, pos/mask, all text embeddings) before chunking. The 2026-08-24 mass-LoRA note that 'VRAM does not scale with n_microbatches' does not hold here. Second, throughput PLATEAUS at M=24: going to M=40 buys the predicted 4% of bubble back but returns none of it, because the per-step data/VAE/text-encode work grows with the global batch too. Raising batch_size is strictly worse than raising M (3x24 is slower than 2x24 at more memory), so the microbatch stays at 2.",
+    "n_microbatches": 24,
+    "schedule": "staggered_1b1f",
+
+    "blocks_per_chunk": 1,
+    "_comment_offload_keys": "INERT under parallelism 'pipeline': every offload_* key below (plus enc_offload_window) is bundled into offload_kw and handed to Pipeline, but offload=False sends chunked stages down the _ChunkSequential/Stage branch that never reads them, so all 30 chunks are resident and offload_grad_accum 'cpu' moves no gradient to the host. They are kept only so switching to pipeline-offload is a one-word edit. The two that do have an effect here are guards: offload_activations must stay false (train.py raises otherwise) and grad_ckpt true would raise if offload were on.",
+    "offload_window": 2,
+    "offload_pin": 0,
+    "offload_backward": "checkpoint",
+    "offload_grad_accum": "cpu",
+    "offload_acc_slots": null,
+    "offload_activations": false,
+    "offload_act_slots": 2,
+    "enc_layers_per_chunk": 1,
+    "enc_offload_window": 2,
+    "_comment_grad_ckpt": "Bool OR a fraction in [0,1]. RamTorch stage workers run forwards on their own threads where the driver's thread-local no_grad does not apply, so even infer() builds graphs; per-block checkpointing is what keeps activations ~0.5 GB per in-flight sample at 512px, which is why this was unconditionally true. A fraction spends spare VRAM to buy that recompute back: 1.0/true checkpoints every eligible chunk, 0.0/false none, 0.5 about half. It is applied PER STAGE, not to the flat chunk list, because peak VRAM is set by whichever GPU holds the most - so every stage gives up the same share of its OWN chunks, and the selected ones are spread evenly through the stage rather than clustered at one end. The denominator is the chunks that CAN checkpoint (block chunks plus the embed chunk's text fusion), so the stage holding the head has one fewer. Verified bit-exact: output and all 196 gradients identical at 0.25/0.5/0.75/1.0 against 0.0. Startup prints the resulting N/M per stage. Raise the fraction if a step OOMs, lower it while VRAM has headroom.",
+    "grad_ckpt": 0.8,
+
+    "batch_size": 2,
+    "lr": 1e-4,
+    "weight_decay": 1e-4,
+    "warmup": 50,
+    "max_grad_norm": 1.0,
+    "_comment_max_steps": "0 = unbounded; stop it from tmux when the previews look right. One epoch over this mix is ~24,900 steps (~11 days at 40 s/step), so the run will not reach an epoch boundary - `resample()` never fires and each image keeps the caption column it was assigned at dataset build.",
+    "max_steps": 0,
+
+    "mu_y1": 0.5,
+    "mu_y2": 1.15,
+    "mu_override": null,
+    "mu_sigma": 1.0,
+    "minres": 256,
+    "maxres": 1280,
+
+    "_comment_uncond": "COUPLED: the same per-sample coin blanks the caption and masks the tag block, because a CFG negative pass drops both channels at inference.",
+    "uncond_ratio": 0.1,
+
+    "_comment_eval": "A preview costs ~273 s measured (28-step CFG sample + VAE decode at 1024) against a ~40 s step, so at eval_interval=50 it spends ~12% of wall clock - a deliberate trade for early feedback on a fresh recipe; raise it once the previews look right. The preview allocation is already inside the 45 GB peak above. save_every 200 writes a ~1.3 GB LoRA+table checkpoint roughly every 2.2 h, so run housekeep.py beside this.",
+    "eval_interval": 50,
+    "save_every_n_steps": 100,
+    "log_every_n_steps": 10,
+
+    "preview_samples": 4,
+    "preview_cfg_scale": 4.5,
+    "preview_steps": 28,
+    "preview_mu": null,
+    "preview_quality": 95,
+
+    "ckpt_path": "runs/k2-tags-1024-r128/ckpts",
+    "preview_path": "runs/k2-tags-1024-r128/previews",
+
+    "mmdit_config": "large_wide",
+    "encoder_config": "qwen3_vl_4b",
+
+    "ae_model_id": "Qwen/Qwen-Image",
+    "encoder_model_id": "Qwen/Qwen3-VL-4B-Instruct",
+
+    "_comment_base": "Latest full FT (x0-pred krea2-fullft, step 49600) - the same base the mass-LoRA and TDM runs sit on.",
+    "mmdit_checkpoint": "checkpoints/krea2/fullft_step_49600.safetensors",
+
+    "mode": "lora",
+    "full_checkpoint": null,
+    "lora_checkpoint": null,
+
+    "lora_rank": 256,
+    "lora_alpha": 256.0,
+    "_comment_lora_exclude": "'tagembed' is appended automatically: the tag projection is new weight trained directly, not a pretrained matrix to adapt.",
+    "lora_exclude_prefixes": [],
+
+    "_comment_tag_embed": "tag_dim 2560 (Qwen3-VL-4B's hidden width) gives 315,966 x 2560 = 808.9M params, 1.54 GB bf16 in the embed chunk plus a 15.7M proj. state_device is null ON PURPOSE: this run offloads NOTHING, so RowAdamW's 6.03 GB of fp32 moments stay on cuda:0 next to the table for 7.56 GB on stage 0, rather than the 1.54 GB the 512-wide sibling config gets by parking them in host RAM. There is VRAM to spare - stage 0 measures ~48 GB of 97.9 against the bubble sweep's 44, still ~50 GB clear - and host state would only buy memory this run does not need. RowAdamW still earns its place on arithmetic rather than memory: ~10,400 of the 316k rows get gradients per step, and untouched rows stay bit-identical instead of being decayed. tags_v1.parquet was built 2026-08-26 07:08 from artist_samples AFTER its 06:58 rebuild, so the id space matches the corpus below exactly (1,158,918 tagged rows, 315,966 distinct). vocab_path is VERSIONED and its row count is asserted against the checkpoint on load - bump to tags_v2.parquet rather than overwriting, because renumbering silently shifts every tag's meaning. max_tags is free anywhere in 1..256 (the DiT pads the combined sequence to a multiple of 256).",
+    "tag_embed": {
+        "enabled": true,
+        "vocab_path": "checkpoints/tag_vocab/tags_v1.parquet",
+        "tag_dim": 2560,
+        "max_tags": 128,
+        "tag_drop_prob": 0.1,
+        "lr": 1e-4,
+        "weight_decay": 0.0,
+        "state_device": null
+    },
+
+    "_comment_data": "BOORUS: the ENTIRE v2 rebuild (artist_samples, 811,326 danbooru + 347,592 e621 = 1,158,918 rows, tags 100%, brief_summary 64.7%/86.8%). n_samples is null rather than a literal count on purpose - the builder rewrites this corpus, and a literal larger than the file makes the loader warn and REPEAT rows to hit the target. The other three sources keep the TDM run's numbers exactly. That puts the mix at ~97% booru, which is the intent here: only booru rows carry tags, so they are the only rows that put gradients in the table. The untagged case still arrives from three directions - the 36k non-booru rows, tag_drop_prob 0.1, and the coupled uncond 0.1 - and an untagged row is a bit-exact no-op through the tag block. 'tags' is exactly 100% on the boorus and exactly 0% elsewhere, so no synthetic handling is needed. Note 10_word_summary is all-null on the boorus (it is typed int32 there, which _coerce_text_columns flattens to null), so a booru row draws its caption from tags / midjourney_style_summary / brief_summary re-normalized.",
+    "parquet_dataloader": {
+        "parquet_sources": {
+            "danbooru":   {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/artist_samples/source=danbooru",   "n_samples": 100000},
+            "e621":       {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/artist_samples/source=e621",       "n_samples": null},
+            "deviantart": {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=deviantart", "n_samples": 6717},
+            "midjourney": {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=midjourney", "n_samples": 10000},
+            "reddit":     {"path": "/mnt/datapool_u2/lodestone/caption_workspace/output/tag_samples_clean/source=reddit",     "n_samples": 19260}
+        },
+        "_comment_captions": "Weights are CONDITIONAL, not global: a row is drawn from whichever of these columns it actually has, re-normalized. So 0.25 on brief_summary does not buy 25% natural-language captions overall, it buys 25% of the rows that have one. The case that makes the table earn its keep is a booru row drawing a natural-language caption while its full tag set rides along - the v2 rebuild raised danbooru's brief_summary fill from 56.2% to 64.7%, which moves rows out of tags-only and into exactly that case.",
+        "caption_columns": {
+            "tags":                     {"weight": 0.25, "is_tag_based": true},
+            "midjourney_style_summary": {"weight": 0.25, "is_tag_based": false},
+            "brief_summary":            {"weight": 0.25, "is_tag_based": false},
+            "10_word_summary":          {"weight": 0.25, "is_tag_based": false}
+        },
+        "_comment_tag_column": "DECOUPLED from caption_columns: tags are read from here whichever caption column was sampled.",
+        "tag_column": "tags",
+        "filename_column": "file_path",
+        "width_column": "image_width",
+        "height_column": "image_height",
+        "loss_weight_column": null,
+        "image_folder_path": "",
+        "base_resolution": [1024],
+        "base_resolution_weights": [1.0],
+        "shuffle_tags": true,
+        "tag_drop_percentage": 0.0,
+        "ratio_cutoff": 2.0,
+        "resolution_step": 64,
+        "num_workers": 24,
+        "prefetch_factor": 4,
+        "offset": 0
+    }
+}

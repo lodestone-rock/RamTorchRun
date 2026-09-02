@@ -102,6 +102,228 @@ def sample_timesteps(
 
 
 # ---------------------------------------------------------------------------
+# Tag embedding: one policy shared by train.py and train_mass_lora.py
+# ---------------------------------------------------------------------------
+
+class TagTrainer:
+    """Everything the trainers need to know about the tag block.
+
+    Holds the config, the per-step dropout policy and the `RowAdamW` over the
+    table. ``enabled`` is False when no ``tag_embed`` block is configured, and
+    every method is then a no-op returning ``(None, None)``, so the call sites
+    need no branching.
+    """
+
+    def __init__(self, cfg: dict, parallelism: str = "pipeline"):
+        tag_cfg = cfg.get("tag_embed") or {}
+        self.enabled = bool(tag_cfg.get("enabled", bool(tag_cfg)))
+        self.opt = None
+        self.dense_opt = None
+        self.dense_params: list = []
+        if not self.enabled:
+            self.vocab_size, self.max_tags = 0, 0
+            return
+
+        from utils.tag_vocab import TagVocab
+
+        self.vocab_path = tag_cfg["vocab_path"]
+        self.vocab = TagVocab.load(self.vocab_path)
+        self.vocab_size = len(self.vocab)
+        self.vocab_name = self.vocab.name
+        self.tag_dim = tag_cfg.get("tag_dim", 512)
+        # The DiT pads its combined sequence to a multiple of 256, so any
+        # max_tags in 1..256 costs exactly the same attention. 128 is free.
+        self.max_tags = tag_cfg.get("max_tags", 128)
+        self.tag_drop_prob = tag_cfg.get("tag_drop_prob", 0.1)
+        self.lr = tag_cfg.get("lr", cfg.get("lr", 1e-4))
+        self.weight_decay = tag_cfg.get("weight_decay", 0.0)
+        self.state_device = tag_cfg.get("state_device", "cpu")
+        self.max_grad_norm = tag_cfg.get(
+            "max_grad_norm", cfg.get("max_grad_norm", 1.0)
+        )
+
+        if "offload" in parallelism:
+            print(
+                f"  [warn] parallelism={parallelism!r} streams every chunk "
+                f"weight per microbatch, and the tag table lives in the embed "
+                f"chunk — that is an extra "
+                f"{self.vocab_size * self.tag_dim * 2 / 2**30:.2f} GB of "
+                f"host-to-device traffic per microbatch. Prefer 'pipeline'."
+            )
+
+    def attach(self, dit):
+        """Give *dit* its tag table, in place.
+
+        Deliberately NOT done by building the DiT with ``tag_vocab`` set: the
+        pretrained checkpoint has no tag keys, so a strict load would fail, and
+        under ``assign=True`` from meta the un-loaded table would stay on the
+        meta device. Attaching afterwards also satisfies the ordering the LoRA
+        paths need — call this after ``inject_lora``/``inject_lora_bank`` (so
+        the projection is not adapted) and before any adapter checkpoint load
+        (so its ``tagembed.*`` keys land).
+        """
+        if not self.enabled:
+            return dit
+
+        import dataclasses
+
+        from krea2.model.tag_embed import TagEmbedder
+
+        dit.tagembed = TagEmbedder(
+            self.vocab_size, dit.config.features, self.tag_dim,
+            vocab_name=self.vocab_name,
+        ).to(next(dit.parameters()).dtype)
+        dit.config = dataclasses.replace(
+            dit.config, tag_vocab=self.vocab_size, tag_dim=self.tag_dim
+        )
+        return dit
+
+    @staticmethod
+    def split_checkpoint(sd: dict) -> tuple[dict, dict]:
+        """-> (weights without the tag table, the tag table's own state dict).
+
+        The table is attached after the base load, so its keys have to come out
+        of a strict load and go back in afterwards via `load_tag_state`.
+        """
+        pre = "tagembed."
+        return (
+            {k: v for k, v in sd.items() if not k.startswith(pre)},
+            {k[len(pre):]: v for k, v in sd.items() if k.startswith(pre)},
+        )
+
+    def load_tag_state(self, dit, tag_sd: dict):
+        if not tag_sd:
+            return
+        if not self.enabled or dit.tagembed is None:
+            print(f"  [warn] checkpoint carries a tag table ({len(tag_sd)} "
+                  f"tensors) but tag_embed is not configured — ignoring it.")
+            return
+        dit.tagembed.load_state_dict(tag_sd)
+        print(f"  Loaded tag table from checkpoint ({len(tag_sd)} tensors).")
+
+    def build_optimizer(self, dit, warmup: int = 0, own_dense: bool = False):
+        """Split the tag table out of *dit*'s trainable set into a RowAdamW.
+
+        Returns the parameters the MAIN optimizer should own. The table needs
+        its own optimizer because a step touches a few hundred of ~316k rows:
+        plain AdamW would decay and drift the other 99.9% every step.
+
+        ``own_dense=True`` also puts the projection and norm in a private
+        AdamW. The mass-LoRA trainer needs that: its optimizer is slot-shaped
+        and cannot hold a shared dense tensor, and it "freezes" by exclusion
+        rather than by ``requires_grad``, so there is no trainable set to
+        return into.
+        """
+        trainable = [p for p in dit.parameters() if p.requires_grad]
+        if not self.enabled or dit.tagembed is None:
+            return trainable
+
+        from torch.optim import AdamW
+
+        from krea2.model.tag_embed import check_vocab, tag_embed_bytes_report
+        from utils.row_optimizer import RowAdamW
+
+        # If a checkpoint was loaded it overwrote the fingerprint buffer, so
+        # this compares the TRAINED id space against the configured one.
+        check_vocab(dit.tagembed, self.vocab_size, self.vocab_name)
+
+        table = dit.tagembed.embed.weight
+        self.opt = RowAdamW(
+            [table], self.vocab_size, lr=self.lr, betas=(0.9, 0.95),
+            weight_decay=self.weight_decay, warmup=warmup,
+            state_device=self.state_device,
+        )
+        self.dense_params = [
+            p for p in dit.tagembed.parameters() if p is not table
+        ]
+        print("  Tag embedding: " + tag_embed_bytes_report(
+            self.vocab_size, self.tag_dim, dit.tagembed.proj.out_features,
+            table.dtype, torch.float32,
+            state_on_host=(self.state_device == "cpu"),
+        ))
+        print(f"    vocab={self.vocab_path} max_tags={self.max_tags} "
+              f"lr={self.lr:g} tag_drop_prob={self.tag_drop_prob:g}")
+
+        if own_dense:
+            self.dense_opt = AdamW(
+                self.dense_params, lr=self.lr, betas=(0.9, 0.95),
+                weight_decay=self.weight_decay,
+            )
+            # By id(): `p in list_of_tensors` would run elementwise __eq__ and
+            # raise on the first shape mismatch.
+            owned = {id(table)} | {id(p) for p in self.dense_params}
+            return [p for p in trainable if id(p) not in owned]
+        # The projection and norm are dense — every step touches all of them —
+        # so they belong in the caller's main optimizer.
+        return [p for p in trainable if p is not table]
+
+    def batch(self, batch_data, uncond_flags, device):
+        """-> (tag_ids, tag_mask) for this batch, or (None, None).
+
+        *uncond_flags* is the per-sample list the caller already computed for
+        caption blanking. Unconditional samples lose their tags TOO — a CFG
+        negative pass drops both channels, so training has to match. A separate
+        ``tag_drop_prob`` coin drops the tags alone, which is what teaches the
+        model that a caption without tags is still a valid prompt.
+        """
+        if not self.enabled:
+            return None, None
+        # Two batch shapes: parquet_dataloader appends a trailing extras dict
+        # to its tuple, mass_lora_dataloader merges the same keys into the dict
+        # it already returns.
+        extras = batch_data if isinstance(batch_data, dict) else (
+            batch_data[-1] if isinstance(batch_data[-1], dict) else None
+        )
+        if extras is None or "tag_ids" not in extras:
+            raise RuntimeError(
+                "tag_embed is configured but the dataloader returned no tag "
+                "block — set parquet_dataloader.tag_column."
+            )
+        tag_ids = extras["tag_ids"].to(device, non_blocking=True)
+        tag_mask = extras["tag_mask"].to(device, non_blocking=True)
+        # Previews render the ORIGINAL captions, so they want the tags this row
+        # actually has, before dropout.
+        self.last_undropped = (tag_ids, tag_mask)
+
+        drop = torch.tensor(
+            [u or (torch.rand(1).item() < self.tag_drop_prob)
+             for u in uncond_flags],
+            device=device, dtype=torch.bool,
+        )
+        tag_mask = tag_mask & ~drop[:, None]
+        return tag_ids, tag_mask
+
+    def undropped(self):
+        """The batch's tags with no dropout applied, for previews."""
+        return getattr(self, "last_undropped", (None, None))
+
+    @staticmethod
+    def active_rows(tag_ids, tag_mask):
+        """The vocabulary rows this step actually used."""
+        return tag_ids[tag_mask] if tag_ids is not None else None
+
+    def step(self, tag_ids, tag_mask):
+        """Update the table's active rows. Call next to the main opt.step()."""
+        if self.opt is None or tag_ids is None:
+            return
+        from utils.row_optimizer import clip_row_grads
+
+        rows = self.active_rows(tag_ids, tag_mask)
+        if rows.numel():
+            # Clipped separately from the main model: a global norm over 162M
+            # mostly-zero rows would be dominated by the table's size rather
+            # than by what this step actually learned.
+            clip_row_grads(self.opt.params, self.max_grad_norm, rows)
+            self.opt.step(rows)
+        self.opt.zero_grad()
+
+        if self.dense_opt is not None:
+            torch.nn.utils.clip_grad_norm_(self.dense_params, self.max_grad_norm)
+            self.dense_opt.step()
+            self.dense_opt.zero_grad(set_to_none=True)
+
+
+# ---------------------------------------------------------------------------
 # SDPA backend pinning
 # ---------------------------------------------------------------------------
 

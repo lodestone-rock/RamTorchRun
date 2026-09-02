@@ -144,6 +144,52 @@ round-trip) and `tools/export_lora_bank.py` (slice slots into standard
 `lora_A`/`lora_B` files that `inference.py --lora-checkpoint` consumes
 unchanged) complete the folder.
 
+### Tag embedding: booru tags as extra DiT tokens (2026-08-26)
+
+`krea2/` can inject a learnable per-tag embedding. Matched tags become one
+token each, projected to DiT width and concatenated onto the sequence in
+`DiTEmbedChunk` between the text prefix and the image tokens. The point is to
+combine SDXL-style bag-of-words tag prompting with natural language in one
+model, so a user can write either or both.
+
+It is **off unless a config carries a `tag_embed` block**, and everything is
+routed through one class, `train_utils.TagTrainer`, which both `train.py` and
+`train_mass_lora.py` use. Four properties the design rests on:
+
+- **Permutation invariance is exact, not learned.** Every tag token gets the
+  same RoPE position, and attention is permutation-equivariant, so tag order
+  cannot change the output. Tag tokens are marked on RoPE **axis 0**, which
+  text and image both leave at zero — a constant shared by all tag tokens, so
+  the tag-to-tag relative rotation stays zero while tag-to-text and
+  tag-to-image gets a usable "this is a tag" signal for free.
+- **An untagged row is a no-op.** Masked slots are zeroed in the embedder and
+  drop out of the attention mask, and torch's SDPA returns zeros (not NaN) for
+  a fully-masked query row. `tags` is 100% present on the boorus and 0%
+  everywhere else, so the non-booru sources supply the untagged case naturally.
+- **Conditioning is decoupled.** Tags come from the parquet `tag_column`
+  whichever caption column was sampled, so a natural-language caption arrives
+  with the full tag set attached. That is the case that forces the table to
+  carry information the text does not. `uncond_ratio` drops caption AND tags
+  together (matching the CFG negative pass); `tag_drop_prob` drops tags alone.
+- **`utils/row_optimizer.py::RowAdamW` is required, not an optimization.** A
+  step touches ~500 of 315,966 rows; vanilla AdamW would apply weight decay and
+  stale-momentum drift to the other 99.8% every step — the same bug
+  `BankAdamW` solves for rotating slots. Moments (1.21 GB) park on the host.
+
+`utils/tag_vocab.py` owns the vocabulary and matching. Matching runs two
+passes over one normalizer (NFKC, casefold, `_`→space, unescape), so
+`Long_Hair` / `LONG HAIR` / `long hair` are one id: an exact comma-segment
+lookup (all the training column needs), then a word-level longest-match trie
+for prose. The trie gates SINGLE-WORD tags on frequency, because the corpus
+contains rare tags literally named `a` and `best` that would otherwise fire in
+every sentence. Vocabularies are **versioned** — ids are positions in a file,
+so a rebuild renumbers them; the row count is stored in the checkpoint and
+asserted at load.
+
+`tools/check_tag_embed.py` (28 CPU checks) covers chunked-vs-monolithic parity
+with a live tag block, the bitwise no-op, permutation invariance, and the
+matcher.
+
 ## Current state: chroma/ (2026-08-20)
 
 Same shape as `krea2/`, targeting `lodestones/Chroma1-HD` (8.9B flux-style

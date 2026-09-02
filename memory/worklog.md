@@ -1325,3 +1325,401 @@ pairs, not suffix n-grams.
 Runtime gotcha: the exact order-2 ceiling needs all C(len,2) pairs per doc
 (1.1B pair instances). Dedupe per batch before concatenating or it will not
 fit; peak was ~14 GB doing it that way.
+
+## 2026-08-26 (cont.) — tag embedding injection for K2
+
+Shipped the plan the Engram exploration was really pointing at: a plain
+`nn.Embedding` over the booru tag vocabulary, whose matched tags become extra
+DiT tokens between the text prefix and the image tokens. Order-1 is
+permutation-invariant and 315,966 rows is small, so **no hashing** — index the
+vocabulary directly and skip Engram's collision machinery entirely.
+
+New: `utils/tag_vocab.py` (normalizer + versioned vocab builder + `TagMatcher`),
+`utils/row_optimizer.py` (`RowAdamW`), `krea2/model/tag_embed.py`
+(`TagEmbedder`), `krea2/tools/check_tag_embed.py`,
+`krea2/configs/train_{tag_smoke,pipeline_lora_tags}.json`.
+Changed: `mmdit.py`, `chunks.py`, `sampling.py`, both parquet dataloaders,
+`train.py`, `train_mass_lora.py`, `train_utils.py` (shared `TagTrainer`),
+`inference.py`.
+
+Built `checkpoints/tag_vocab/tags_v1.parquet`: 315,966 tags / 51.0M
+occurrences over 1.16M `artist_samples` rows — exactly reproducing the
+`tag_orderings.py` order-1 count, which is a good cross-check on the
+normalizer. Only **34.2%** of those ids appear in `tag_samples_clean` (41,689
+booru rows, 121,817 distinct tags), so two thirds of the table will never take
+a gradient until the corpus grows. Kept `min_count=1` anyway so the id space is
+complete and stable across the ongoing booru rebuild; `RowAdamW` leaves
+untouched rows bit-identical, so the cost is 200 MB of dead weight, not drift.
+
+Things worth knowing next time:
+
+- **The base checkpoint has no tag keys**, so the table cannot be built into
+  `SingleMMDiTConfig` before the load — `strict=True` fails, and under
+  `assign=True` from meta an un-loaded param stays on the meta device. Hence
+  `TagTrainer.attach(dit)` after the load (and after `inject_lora`, before the
+  adapter checkpoint load so its `tagembed.*` keys land).
+- **`forward`'s signature order matters.** `tag_ids`/`tag_mask` went in right
+  after `mask`, ahead of `txt_t`/`return_hidden_at`, so the monolithic model
+  and `DiTEmbedChunk` take the same positional tuple. The first version put
+  them last and the parity harness silently passed tags into `txt_t`, showing
+  up as a 260-vs-256 RoPE shape error four frames deep.
+- **`RowAdamW` is required, not an optimization.** ~500 of 316k rows move per
+  step; plain AdamW would decay and stale-momentum-drift the other 99.8% every
+  step. Verified it matches `torch.optim.AdamW` to 1.2e-7 when all rows are
+  active, leaves untouched rows bit-identical, and that the CPU-parked state
+  path is exact. State is 1.21 GB, parked on the host.
+- **The free-text matcher needed a frequency gate.** The corpus contains tags
+  literally named `a` (6 uses), `best` (2) and `quality` (13), so scanning
+  prose injected junk into every natural-language prompt. `SCAN_MIN_COUNT=100`
+  now gates SINGLE-WORD tags in the trie pass only; multi-word tags are exempt
+  (`wooden table` is unambiguous however rare), and an explicit comma segment
+  still matches anything, so rare artist/character tags are never blocked.
+- **`_mask`'s fully-masked rows are safe**: torch 2.10 SDPA returns zeros, not
+  NaN, for a query row with no visible keys. That is what makes an untagged row
+  a true no-op rather than a NaN factory.
+- `set_seq` grew a third arg `taglen` rather than making callers add it to
+  `txtlen`; all existing two-arg call sites are unaffected.
+- Adding 0.31 GB to the embed chunk shifts `balance_chunks_by_bytes`: stage 0
+  went 6.93 GB vs 6.13 GB on stage 1. Fine here, worth watching at 8 stages.
+- Under `offload` / `pipeline-offload` the table streams **per microbatch**;
+  `TagTrainer` warns at startup. Use `pipeline`.
+
+Verified: `check_tag_embed.py` 28/28 (chunked-vs-monolithic parity over 10
+execution modes with exact 0.0 output AND gradient deltas; masked ids ignored
+bitwise; permutation invariance at 3.6e-7 with a live axis-0 marker, plus the
+converse that different ids DO move the output; 14 matcher cases).
+`check_chunk_parity.py` still 18/18. End-to-end 6-step run on 4 GPUs at 256px:
+554 distinct rows trained, optimizer 1% of step time, previews and checkpoint
+save fine. Inference verified through `--pipeline`, extracting
+`['1girl', 'solo', 'long hair', 'looking at viewer']` from a tag-style prompt.
+
+Not done: no long training run yet, so whether the table actually earns its
+keep is unmeasured. Rebuild the vocabulary as `tags_v2.parquet` when the wider
+booru schema lands — that shifts rows from "tags sampled as the caption" into
+"natural-language caption WITH tags attached", which is the case that forces
+the table to carry information the text does not.
+
+## 2026-08-27 — first real tag-embedding run: 1024px rank-128 LoRA, and a 1b1f bubble sweep
+
+Launched `runs/k2-tags-1024-r128` from `krea2/configs/train_pipeline_lora_tags_1024.json`
+in tmux session `k2tags`: rank-128 LoRA + the tag table, 1024px, 4-GPU
+`pipeline`, on the latest full FT (`fullft_step_49600`, the same base the TDM and
+mass-LoRA runs use). `batch_size` 2 x `n_microbatches` 24 = global 48,
+`max_steps` 0 (unbounded), `eval_interval` 50, `save_every` 200.
+
+**Data: the whole v2 booru rebuild.** `artist_samples` was regenerated
+2026-08-26 06:58 with a 25-column schema — 811,326 danbooru + 347,592 e621, and
+`brief_summary` fill rose from 56.2% to **64.7%** on danbooru (86.8% on e621).
+That is exactly the shift the tag plan wanted: rows move out of "tags sampled as
+the caption" into "natural-language caption with the full tag set attached".
+`tags_v1.parquet` was built at 07:08, i.e. **after** the rebuild, so its 315,966
+ids match this corpus with no renumbering needed. `n_samples` is `null` for both
+booru sources rather than a literal count, because a literal larger than the
+file makes the loader warn and *repeat* rows to reach it. The other three
+sources keep the TDM numbers exactly (6,717 / 10,000 / 19,260), putting the mix
+at ~97% booru — deliberate, since only booru rows put gradients in the table,
+and the untagged case still arrives from the 36k non-booru rows plus
+`tag_drop_prob` 0.1 plus the coupled uncond 0.1.
+
+### The bubble formula, and where it stops paying
+
+`bubble = (P-1)/(M+P-1)` for P stages and M microbatches, which reproduces the
+2026-08-24 mass-LoRA readings (M=4 -> ~43%, M=16 -> ~16%). New tool
+`krea2/tools/sweep_bubble.py` runs short real jobs off a production config with
+the corpus subsampled, and parses peak VRAM, steady s/step and OOM. Measured at
+1024px, rank 128, tags live (peaks include a preview where one ran):
+
+| point | global | bubble | peak VRAM per stage (GB) | s/step | samp/s |
+|---|---|---|---|---|---|
+| 2x8  | 16 | 27.3% | 24 / 25 / 26 / 21 | 20 | 0.82 |
+| 2x24 | 48 | 11.1% | 44 / 44 / 45 / 38 | 40 | **1.20** |
+| 3x24 | 72 | 11.1% | 59 / 61 / 62 / 52 | 65 | 1.11 |
+| 2x40 | 80 |  7.0% | 65 / 67 / 68 / 56 | 68 | 1.19 |
+
+**Two findings overturn the previous note.** First, **VRAM tracks the GLOBAL
+batch, not `batch_size`**: ~0.68 GB per sample of `batch_size * M` plus ~15 GB
+static, fitting all four rows. The 2026-08-24 claim that "VRAM does not scale
+with `n_microbatches`" is false for `train.py` — the driver materializes the
+entire global batch (VAE latents, `v_target`, `pos`/`mask`, every microbatch's
+text embedding) before chunking, so M costs memory just as `batch_size` does.
+Second, **throughput plateaus at M=24**: M=40 recovers the 4% of bubble the
+formula promises and returns none of it, because the per-step data/VAE/text
+encode grows with the global batch in step. And raising `batch_size` is
+strictly worse than raising M — 3x24 is *slower* than 2x24 at 17 GB more.
+
+So the bubble is worth closing only until something else becomes the limit, and
+here that happens right at the 11% mark. 2x24 wins on every axis and leaves
+~53 GB headroom on the busiest stage.
+
+Gotchas found on the way:
+- **`batch_size` 4 without `expandable_segments` reserved ~95 GB of 97.9** while
+  allocating ~79. Aspect bucketing gives 11 sequence lengths, so the caching
+  allocator hoards per-shape blocks. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+  is set for the run **and** was set for every sweep point — measuring one
+  allocator and deploying another would invalidate the whole table.
+- **`data` in the time split is not just I/O.** It brackets the dataloader wait
+  *plus* the Qwen3-VL text encode and the VAE encode, so its 25-33% is mostly
+  GPU work. Raising `num_workers` will not move it; images already load through
+  a per-batch thread pool inside `__getitem__`.
+- **tqdm's `s/it` is useless here.** The first step costs ~10x (cold CIFS reads
+  + kernel autotune) and the eval step ~8x (+273 s for a 28-step CFG sample and
+  a VAE decode), so the sweep tool medians the deltas with the first dropped.
+  It also keys on the `step=` postfix, because tqdm's own counter lags it.
+
+### Dataloader fix: text columns must be coerced, not just cast
+
+Mixing corpora broke immediately: `pa.concat_tables` refused
+`10_word_summary` as `int32` vs `large_string`. The v2 booru build has no data
+for that column and typed it from the nulls it wrote. `_cast_strings_to_large`
+could not help — it dispatches on the type it *finds*, and int32 is not a
+string. Added `_coerce_text_columns(table, cols)`, driven by the caption/tag
+column *names* instead: anything not string-like becomes an all-null
+`large_string`, and a missing column is appended as null so the projection stays
+rectangular. Applied per source in `_load_batches`, so it fixes any cross-build
+mix, not just this one. A booru row therefore draws its caption from
+`tags` / `midjourney_style_summary` / `brief_summary` re-normalized.
+
+Open: whether the table earns its keep is still unmeasured — that is what this
+run is for. One epoch is 24,255 steps (~11 days), so `resample()` never fires
+and each image keeps its build-time caption column for the life of the run.
+
+**Correction to the sweep table's premise:** the run was launched with
+`tag_dim` **2560**, not the 512 the sweep measured — 315,966 x 2560 = 808.9M
+params, 1.54 GB bf16 on stage 0 and 6.03 GB of RowAdamW moments in host RAM,
+against 161.8M / 0.31 GB / 1.21 GB at 512. Stage 0 therefore runs ~1.2 GB above
+the swept peak (~42 GB observed vs 44 swept), which changes nothing about the
+choice of 2x24. Steady state on the full corpus is **51 s/step (0.94 samp/s)**
+rather than the sweep's 40 s / 1.20 — the sweep's 35k-row subsample re-read a
+warm CIFS working set, while the real run streams 1.16M distinct files cold.
+`tagrows` runs ~10,400/step against ~2,000 in the sweep, since the full booru
+corpus exposes far more distinct tags per batch; over an epoch that is ~800
+updates per row.
+
+## 2026-08-26 — audit: the 1024 tag run offloads nothing (config comments only)
+
+Traced what `train_pipeline_lora_tags_1024.json` actually offloads. Answer:
+nothing. `parallelism: "pipeline"` resolves to `offload=False`, and RamTorch's
+`Pipeline` then takes the `_ChunkSequential` + plain `Stage` branch, so **all
+nine `offload_*` keys (plus `enc_offload_window`) are dead config** — including
+`offload_grad_accum: "cpu"`, which moves no gradient to the host here. Only two
+matter: `offload_activations` must stay false or `train.py` raises, and
+`grad_ckpt: true` would raise if offload were on. Per-block
+`torch.utils.checkpoint` on the 28 block chunks + text fusion is the only
+activation strategy in play.
+
+The one live offload knob was `tag_embed.state_device`, and this config sets it
+`null` **deliberately** — the box has VRAM to spare, so RowAdamW's 6.03 GB of
+moments stay on cuda:0 (7.56 GB on stage 0, printed without the `(HOST)` tag)
+instead of host RAM. Stage 0 measures ~48 GB of 97.9. That supersedes the
+correction directly above, which was written from the 17:31 launch that still
+had `"cpu"`; the 18:18 relaunch is the GPU-resident one.
+
+Only comments changed: rewrote `_comment_tag_embed` (it still claimed host RAM
+and a ~42 GB peak) and added `_comment_offload_keys` recording why the inert
+keys are kept — switching to `pipeline-offload` should stay a one-word edit.
+
+## 2026-08-27 (cont.) — grad_ckpt becomes a per-stage fraction
+
+`grad_ckpt` now accepts a **float in [0, 1]** as well as a bool, in all three
+krea2 trainers (`train.py`, `train_mass_lora.py`, `train_tdm.py`). 1.0/true is
+the old behaviour, 0.0/false none, and e.g. 0.5 checkpoints about half the
+chunks — spending spare VRAM to buy recompute back, which is worth doing at
+512px where activations are a quarter of the 1024px cost.
+
+Two decisions in `set_dit_grad_ckpt(chunks, enabled, counts)`:
+
+- **Per stage, not per flat chunk list.** Peak VRAM is set by whichever GPU
+  holds the most, so a global fraction could checkpoint one stage entirely and
+  leave another untouched — paying the recompute without moving the peak. With
+  `counts` (the chunks-per-stage split, already computed one line earlier for
+  `balance_chunks_by_bytes`) every stage gives up the same share of its own
+  chunks. `counts=None` falls back to treating the list as one stage.
+- **Spread, not clustered.** `_even_subset(n, k)` picks k of n Bresenham-style,
+  so the checkpointed chunks interleave (`1.1.1.1.11...`) and the saving is
+  uniform along the depth.
+
+The denominator is the chunks that *can* checkpoint — `DiTBlockChunk` and the
+`DiTEmbedChunk`'s text fusion — so the stage holding the head chunk has one
+fewer than its chunk count. Rounding is Python's `round`, so 50% of 5 is 2.
+
+Verified bit-exact: on a 10-layer double-precision model over 4 stages, output
+and **all 196 gradient tensors** are identical at 0.25 / 0.5 / 0.75 / 1.0
+against 0.0 (checkpointing is mathematically transparent, so anything else
+would be a bug). `check_chunk_parity.py` still 18/18 and `check_tag_embed.py`
+28/28. Startup prints the resulting `N/M ckpt` per stage next to the existing
+weight-bytes line.
+
+Not changed: `chroma/` and `radiance/` keep their bool-only
+`set_dit_grad_ckpt`, per the one-folder-per-model rule — copy this across if
+they need it.
+
+## 2026-08-30 — mass LoRA v2: the mass_caption_v2 corpus, 256 slots at rank 8
+
+New corpus: `/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples`,
+hive-partitioned the same way as `artist_samples` (danbooru 45,088 rows / e621
+68,596) with five caption bands per row, all 100% populated — `tags`,
+`midjourney_style_summary`, `brief_summary`, `10_word_summary`, `long_caption`.
+Two new configs, `train_mass_lora_v2_{danbooru,e621}.json`, on the same
+`full_step_49600` base. No code changes: multi-column caption sampling already
+existed in `ParquetTextImageDataset` and `MassLoraParquetDataset` inherits it.
+
+**It is WIDE and SHALLOW, which drives every other choice.** ~22.8k artists but
+only 4-8 images each (danbooru median 5, e621 8) where `artist_samples` had
+~25. Consequences, measured with `probe_mass_lora_plan.py`:
+
+- **256 slots at rank 8 instead of 64 at rank 32.** Cost per slot is linear in
+  rank, so this is the same 27.97 GB on GPU and 55.94 GB of host AdamW state,
+  down to the decimal (29.3M params/slot x 256 = 7.51B, vs 109M x 64). Four
+  times the artists for free is the right trade when a slot has five images to
+  fit — rank 32 was never the binding constraint on a set that small. Measured
+  peak is 67.6/73.3/73.1/66.6 GB of 97.9 with both runs up, ~6 GB per GPU
+  roomier than the rank-32 pair, because the activation and preview peaks are
+  unchanged and only the bank moved.
+- **`resolution_step` 192, not 128.** 4 live buckets instead of 6. With five
+  images per artist the `(slot, bucket)` pools are 1-3 deep, so bucket
+  granularity directly sets how much of a step's 4-sample draw is duplicated:
+  2.8x at 128, 2.4x at 192 (danbooru) and 2.0x (e621). 256 buys almost nothing
+  more (2.3x) and crops harder — its usable grid collapses to 0.60/1.00/1.67.
+- **`slot_allowlist` = top 256 by AGGREGATE `fav_count` with >= 4 images.**
+  Note `artist_rank` is NOT popularity — it is the image's index within its
+  artist, 1..8. Requiring 4 images costs nothing in popularity (danbooru's fav
+  floor moves 1841 -> 1694), and it keeps 2-image slots out of the bank.
+- **6000 steps = ~94 updates/slot** (was 250 at 4000 over 64 slots). User's
+  call was to let it overbake and downweight the adapters later.
+
+Caption weights are `tags` 2 / `midjourney_style_summary` 2 / the three prose
+bands 1 each, i.e. the two prompt styles the model will actually be driven with
+come up 28.6% each and the prose bands 14.3%. Verified over a planned epoch:
+872/3200 draws tag-based. Only `tags` is `is_tag_based` — the midjourney band
+is comma-separated too, but its order is the convention it exists to teach
+(medium and artist first), so shuffling it would destroy the thing being
+trained. `brief_summary` and `10_word_summary` never name the artist, which is
+left as-is deliberately: the adapter carries the style, so those two bands
+teach it to fire without a trigger phrase.
+
+Gotcha for the next corpus: artist keys here are **space-separated**
+(`hu dako`, `paloma piquet`), not underscored like `artist_samples`
+(`hu_dako`). `build_trainer_parquet.py` derives `artist` by stripping `^by `
+off `trigger_tag`, so the slot vocabulary follows whatever the captioner wrote.
+An allowlist copied from an older config silently matches nothing.
+
+## 2026-08-31 — v2 e621 died to GPU contention at step ~160; resumed from 100
+
+Not a config bug. The traceback is an OOM in `LoRABankLinear.forward` on
+`cuda:3` asking for 576 MiB, and the message names **three** consumers of that
+GPU's 95 GiB: the two trainers at 37.05 and 29.02 GiB plus ~28 GiB of the
+user's own work. `cuda:3` is e621's *first* stage (its device list is reversed
+to balance against danbooru) and danbooru's last, so it is the one GPU where
+both runs' heaviest and lightest stages meet. Headroom for outside work on this
+pair is ~20 GB per GPU, not more.
+
+Resumed rather than restarted: `bank_checkpoint` +
+`initial_global_step: 100` + `parquet_dataloader.offset: 100`. **All three move
+together.** `max_steps` is absolute so it stays 6000 (the bar correctly reads
+`5900`), and `offset` is what stops the plan replaying its first 100 steps —
+the plan is deterministic in `seed`, so offset 100 lands exactly on the step
+after the checkpoint. Confirmed: the resumed run re-rendered
+`step_104_slot121_nikkibunn.jpg`, the same slot the original run previewed at
+104, so the plan is identical across the restart.
+
+AdamW moments are NOT in the bank checkpoint and restart at zero. Harmless
+here — `slots.json` restores the per-slot step counts (max 6 at step 100), so
+every slot is still inside its 20-step warmup and resumed at lr 1.5-2e-5.
+Worth remembering for a resume late in a run, where the moment reset would
+actually cost something.
+
+Also: danbooru alone runs at ~21.5 s/step against ~31.6 s/step with both up, so
+the second process costs ~47% throughput on the first. That is the price of the
+43% bubble being filled by a neighbour rather than by more microbatches.
+
+## 2026-08-31 — v2: captions now resample PER VISIT, 16k steps, lr 2e-4
+
+Three changes landed together and both v2 runs were stopped and resumed from
+their newest banks (danbooru 2700, e621 1500).
+
+### The caption bug: one band per image for the whole run
+
+`MassLoraParquetDataset` inherited the parent's habit of drawing **one** caption
+column per row when it builds its pools. That is fine in `parquet_dataloader.py`
+— with a million rows, one band per row *is* a fair sample of the configured
+mix. It is wrong here. A v2 slot holds ~5 images (min/median/max 2/5/7) and
+revisits each ~250 times, so the load-time draw pinned every image to a single
+band for the entire run: an adapter could easily never see `tags` on more than
+one of its five images, and the 2x weighting on `tags` /
+`midjourney_style_summary` was a per-image lottery rather than the per-step mix
+it was meant to be.
+
+Fix: keep every band a row carries (`caption_bands`, a list of
+`(text, is_tag_based, weight)`) and draw one in `_prepare_caption`, i.e. per
+`__getitem__`. Weights are the configured ones restricted to the bands a row
+has, and `random.choices` renormalises — so a row missing `sparse` keeps
+`tags:brief` at 2:1 instead of distorting it. The uncond check stays FIRST and
+short-circuits, so dropout is exactly `uncond_percentage` no matter how many
+bands a row has. Carrying all bands costs kilobytes because the row count is
+bounded by the slot allowlist; do not port this to the parent, which is not.
+
+New guard: `dataloaders/check_mass_lora_captions.py`. Synthetic parquet,
+`dummy_image=True`, no GPU, ~9 s. It pins the four properties that fail silently
+(the loss just gets slightly worse, nothing raises): per-visit variety, weight
+fidelity including renormalisation over a missing band, comma-shuffling scoped
+to `is_tag_based` bands only, and uncond staying exact.
+
+**Gotcha this creates for resumes.** Removing that per-row `rng.choices()` call
+shifts the shared RNG stream that `_assign_bucket` and `_plan_steps` consume, so
+the plan for a given seed is *no longer the old plan*. `offset` is therefore 0
+on this resume, not the step number — an offset would skip a fair prefix of a
+*different* schedule, which buys nothing. The previous resume note (offset 100
+lands on the step after the checkpoint) only holds when the dicing of RNG
+consumption is untouched.
+
+### 16k steps: the real target is updates per ADAPTER, not steps
+
+updates/slot = `max_steps * slots_per_step / n_slots` = `max_steps / 64` at 256
+slots and 4 seats. The user's read of the v1 previews was that ~150 updates
+"barely picked up the styles", and that 200+ is the floor. So 6000 steps (94
+updates) was well short; `max_steps` is now **16000 = 250 updates/slot**
+(observed plan: 92-113 per slot per 6000-step pass).
+
+`steps_per_epoch` stays 6000 on purpose. The epoch loop is `while True` over the
+same DataLoader with no `resample()` call, so a 16k run is 2.67 passes over one
+6000-step plan. Leaving the plan length alone keeps a resume's arithmetic
+simple. At ~41 s/step with both runs up, 16k is ~6.5 days from here.
+
+### lr 1e-4 -> 2e-4, and why NOT 1e-3
+
+Surveyed the public trainers before touching it, because a LoRA lr quoted
+without its alpha is meaningless (QLoRA says outright that alpha is
+proportional to lr). We run **alpha == rank == 8, so scale alpha/r is exactly
+1.0**, which puts us in the *aggressive* camp already:
+
+- scale 1.0, lr 1e-4: diffusers `train_dreambooth_lora_{flux,sd3}.py` defaults,
+  ai-toolkit's Flux/SD3.5/Qwen-Image configs, and HF's official Flux LoRA post
+  — which is scale 1.0, 1e-4, constant lr, 12B rectified-flow DiT, effective
+  batch 4. That is this run, feature for feature.
+- scale 0.0625 (alpha 1 / rank 16), lr 1e-4 and 3e-4: kohya's Flux+SD3 docs and
+  OneTrainer's presets. Same nominal number, ~16x weaker effective update.
+
+1e-3 was considered and rejected: at scale 1.0 that is ~10x the Flux recipe, and
+SimpleTuner names it as the failure case at this model size ("LoRA at 1e-3 might
+totally roast the thing"); its own 1e-3 ceiling assumes an EMA network and a
+long warmup, and we have neither. rsLoRA's alpha/sqrt(r) argument gives rank 8
+only ~1.4x headroom over the rank-16 recipes, not 10x — and LoRA+ turns out to
+scale with model *width*, arguing a 12B model wants *less*. Settled on **2e-4**,
+the practical ceiling; above ~5e-4 expect burned previews before the loss moves.
+If it still underfits, drop alpha rather than raise lr (diffusers' own advice).
+
+`warmup` stays 20 despite public trainers using 100-500, because theirs count
+GLOBAL steps and ours is **per slot** — a slot only ever sees ~250 updates, and
+betas (0.9, 0.95) put the second-moment timescale at 1/(1-b2) = 20 steps. So 20
+is proportionate, and it also covers the moment respool after a resume.
+
+## 2026-09-01 — utils/probe_gpu_usage.py: 1 Hz GPU/host probe for headroom checks
+
+Standalone (stdlib + psutil, shells out to nvidia-smi — no pynvml in the env).
+One CSV row per second: per-GPU mem/util/mem-bw/power + host RAM + CPU, default
+3600 s so a forgotten run cannot fill the disk (~3600 rows). On exit (or Ctrl-C)
+prints the summary that actually answers "can I cram another job on": per-GPU mem
+min/mean/max, util mean/p50/p95, and % of time under 10%/50% util — the pipeline
+bubble shows up in those last two columns. Output defaults to
+`runs/gpu_usage_<ts>.csv` (gitignored). First minutes with both v2 mass-LoRA runs
+up: ~69 Gi on GPU0/3, ~77 Gi on GPU1/2 of 96, host RAM ~480 Gi used.

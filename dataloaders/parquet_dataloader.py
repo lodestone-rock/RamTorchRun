@@ -243,6 +243,33 @@ def _cast_strings_to_large(table: pa.Table) -> pa.Table:
     return pa.table({f.name: c for f, c in zip(new_fields, new_cols)})
 
 
+def _coerce_text_columns(table: pa.Table, columns: list[str]) -> pa.Table:
+    """Force *columns* to large_string so sources with different builds concat.
+
+    `_cast_strings_to_large` is driven by the type it finds, so it cannot help
+    when a source stores a text column as something else entirely. A build that
+    has no data for a caption column may type it from the nulls it wrote — the
+    v2 booru corpus writes `10_word_summary` as an all-null int32, which
+    `concat_tables` refuses to merge against another source's large_string.
+
+    A non-string text column carries no caption by definition, so it becomes
+    all-null. Missing columns are added as null too, which keeps the projection
+    rectangular when only some sources have a column at all.
+    """
+    for name in columns:
+        idx = table.schema.get_field_index(name)
+        if idx >= 0 and pa.types.is_large_string(table.schema.field(idx).type):
+            continue
+        if idx >= 0 and pa.types.is_string(table.schema.field(idx).type):
+            col = table.column(idx).cast(pa.large_utf8())
+        else:
+            col = pa.nulls(len(table), type=pa.large_utf8())
+        field = pa.field(name, pa.large_utf8())
+        table = (table.set_column(idx, field, col) if idx >= 0
+                 else table.append_column(field, col))
+    return table
+
+
 def _load_parquet_source(
     path: str,
     n_samples: int | None,
@@ -395,6 +422,20 @@ class ParquetTextImageDataset(Dataset):
     num_reference_images : int | None
         If set, load this many reference images per sample from the
         ``reference_images`` column (list of filenames/URLs).
+    tag_column : str | None
+        Column holding a comma-separated tag list. When set, ``__getitem__``
+        appends ONE extra element to its return tuple: a dict with
+        ``tag_ids`` ``[B, max_tags]`` int64 and ``tag_mask`` ``[B, max_tags]``
+        bool. The ids are looked up in ``tag_vocab_path`` and are **decoupled
+        from the caption** — a row whose caption came from a natural-language
+        column still reports its full tag set, which is what lets a model learn
+        to use both channels at once. A null/empty tag column gives an
+        all-False mask. No dropout is applied here; that belongs to the trainer.
+    tag_vocab_path : str | None
+        Parquet written by ``utils/tag_vocab.py``. Required with ``tag_column``.
+    max_tags : int
+        Width of the tag block. Overflowing rows are randomly subsampled rather
+        than truncated, since the corpus is mostly alphabetically sorted.
     raw_hdr : bool
         If ``False`` (default), HDR / high-bit-depth images are tonemapped
         (Reinhard global + sRGB gamma) and returned as normalised ``[-1, 1]``
@@ -432,6 +473,9 @@ class ParquetTextImageDataset(Dataset):
         raw_hdr: bool = False,
         tokenizer=None,
         max_text_len: int = 128,
+        tag_column: str | None = None,
+        tag_vocab_path: str | None = None,
+        max_tags: int = 128,
     ):
         if base_res is None:
             base_res = [1024]
@@ -478,6 +522,26 @@ class ParquetTextImageDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_text_len = max_text_len
 
+        # Tag ids are DECOUPLED from the caption: they come from `tag_column`
+        # whichever caption column was sampled, so a natural-language caption
+        # still carries the row's full tag set. Rows whose tag column is null
+        # (non-booru sources) yield an all-False mask, which the model treats
+        # as an exact no-op. No dropout is applied here — the trainers own that
+        # policy, next to their existing uncond handling.
+        self.tag_column = tag_column
+        self.max_tags = max_tags
+        self.tag_matcher = None
+        if tag_column is not None:
+            if not tag_vocab_path:
+                raise ValueError("tag_column requires tag_vocab_path")
+            from utils.tag_vocab import TagMatcher, TagVocab
+
+            # build_trie=False: the training tag column is already a clean
+            # comma list, so only the exact-segment pass is needed. The trie is
+            # ~300 MB and would be copied into every dataloader worker.
+            self.tag_vocab = TagVocab.load(tag_vocab_path)
+            self.tag_matcher = TagMatcher(self.tag_vocab, build_trie=False)
+
         # Normalise caption column weights
         self.caption_columns = caption_columns
         total_w = sum(v["weight"] for v in caption_columns.values())
@@ -520,10 +584,16 @@ class ParquetTextImageDataset(Dataset):
             *self._caption_col_names,
             *([] if not self.loss_weight_column else [self.loss_weight_column]),
             *([] if self.num_reference_images is None else ["reference_images"]),
+            *([] if self.tag_column is None else [self.tag_column]),
         })
 
         # ---- 1. Load & subsample each source in parallel ----
         n_io_threads = min(8, psutil.cpu_count(logical=False) or 4)
+
+        text_cols = list({
+            *self._caption_col_names,
+            *([] if self.tag_column is None else [self.tag_column]),
+        })
 
         def _load_source(item):
             source_name, src_cfg = item
@@ -533,6 +603,7 @@ class ParquetTextImageDataset(Dataset):
             # calls don't share RNG state
             source_seed = rng.randint(0, 2**31)
             table = _load_parquet_source(path, n_samples, source_seed, needed_cols, n_io_threads)
+            table = _coerce_text_columns(table, text_cols)
             print(f"  [{source_name}] loaded {len(table):,} rows")
             return table
 
@@ -563,6 +634,7 @@ class ParquetTextImageDataset(Dataset):
         heights      = _col(self.height_column)
         loss_weights = _col(self.loss_weight_column) if self.loss_weight_column else None
         ref_images   = _col("reference_images") if self.num_reference_images is not None else None
+        tag_values   = _col(self.tag_column) if self.tag_column else None
         caption_cols = {c: _col(c) for c in self._caption_col_names}
 
         # Free the Arrow table — all data is now in plain Python lists
@@ -623,6 +695,10 @@ class ParquetTextImageDataset(Dataset):
                 "is_url_based":   self._is_url(filename),
                 "loss_weight":    lw,
                 "reference_images": (ref_images[i] if ref_images and isinstance(ref_images[i], list) else []),
+                # Raw string, resolved to ids per batch in the worker: keeping
+                # 1.16M x ~44 int arrays resident would cost ~200 MB per rank
+                # for a lookup that costs microseconds.
+                "tags": (tag_values[i] if tag_values and tag_values[i] else ""),
             }
 
             if bucket in buckets:
@@ -971,6 +1047,7 @@ class ParquetTextImageDataset(Dataset):
         training_prompts = []
         loss_weighting = []
         reference_images_batch = []
+        tag_strings = []
 
         for i, sample in enumerate(batch):
             try:
@@ -1025,6 +1102,7 @@ class ParquetTextImageDataset(Dataset):
 
                 training_prompts.append(caption)
                 loss_weighting.append(sample.get("loss_weight", 1.0))
+                tag_strings.append(sample.get("tags", ""))
 
             except Exception as e:
                 log.error(f"Error processing sample '{sample['filename']}' on rank {self.rank}: {e}")
@@ -1043,6 +1121,7 @@ class ParquetTextImageDataset(Dataset):
                 images.append(images[idx])
                 training_prompts.append(training_prompts[idx])
                 loss_weighting.append(loss_weighting[idx])
+                tag_strings.append(tag_strings[idx])
                 if self.num_reference_images is not None and reference_images_batch:
                     reference_images_batch.append(reference_images_batch[idx])
 
@@ -1055,9 +1134,34 @@ class ParquetTextImageDataset(Dataset):
         # (in which case we fall back to returning the raw string list).
         captions_out = text_out if text_out is not None else training_prompts
 
+        out = [images, captions_out, index, loss_weighting]
         if self.num_reference_images is not None and reference_images_batch:
-            reference_images_batch = torch.stack(reference_images_batch, dim=0)
-            return images, captions_out, index, loss_weighting, reference_images_batch
+            out.append(torch.stack(reference_images_batch, dim=0))
+        if self.tag_matcher is not None:
+            # ONE trailing slot regardless of whether reference images are also
+            # enabled, so consumers can read batch[-1] and everything that
+            # unpacks batch[:4] keeps working.
+            out.append(self._encode_tags(tag_strings))
+        return tuple(out)
 
-        return images, captions_out, index, loss_weighting
+    def _encode_tags(self, tag_strings: list[str]) -> dict:
+        """-> {"tag_ids": [B, max_tags] int64, "tag_mask": [B, max_tags] bool}."""
+        b = len(tag_strings)
+        ids = np.zeros((b, self.max_tags), dtype=np.int64)
+        mask = np.zeros((b, self.max_tags), dtype=bool)
+        for i, s in enumerate(tag_strings):
+            if not s:
+                continue                       # untagged row: exact no-op
+            hits = self.tag_matcher.match(s, free_text=False)
+            if len(hits) > self.max_tags:
+                # Which tags survive an overflow should not depend on the
+                # annotator's sort order (this corpus is ~88% alphabetical).
+                hits = random.sample(hits, self.max_tags)
+            if hits:
+                ids[i, : len(hits)] = hits
+                mask[i, : len(hits)] = True
+        return {
+            "tag_ids": torch.from_numpy(ids),
+            "tag_mask": torch.from_numpy(mask),
+        }
 

@@ -106,6 +106,10 @@ class SingleMMDiTConfig:
     txtlayers: int = 1
     txtheads: int = 20
     txtkvheads: int = 20
+    # Optional per-tag embedding injected as extra sequence tokens. tag_vocab=0
+    # (the default) leaves the model bit-identical to a build without it.
+    tag_vocab: int = 0
+    tag_dim: int = 512
 
 
 class SimpleModulation(torch.nn.Module):
@@ -405,6 +409,15 @@ class SingleStreamDiT(nn.Module):
             nn.GELU(approximate="tanh"),
             nn.Linear(config.features, config.features),
         )
+        self.tagembed = None
+        if config.tag_vocab:
+            # Imported here, not at module scope: tag_embed imports RMSNorm from
+            # this module, and a top-level import would be circular.
+            from .tag_embed import TagEmbedder
+
+            self.tagembed = TagEmbedder(
+                config.tag_vocab, config.features, config.tag_dim
+            )
         self.last = LastLayer(config.features, config.patch, config.channels)
 
         self.tproj = nn.Sequential(
@@ -418,6 +431,10 @@ class SingleStreamDiT(nn.Module):
         t: Tensor,
         pos: Tensor,
         mask: Tensor | None = None,
+        # Positionally identical to DiTEmbedChunk.forward, so the same tuple
+        # feeds the monolithic model and the chunk chain. Keep it that way.
+        tag_ids: Tensor | None = None,
+        tag_mask: Tensor | None = None,
         txt_t: float | None = None,
         return_hidden_at: tuple[int, ...] | None = None,
     ) -> Tensor:
@@ -430,6 +447,9 @@ class SingleStreamDiT(nn.Module):
         return_hidden_at: optional block indices; if given, returns
         (output, {idx: hidden}) where hidden is the block output sliced to
         image tokens, [B, N_img, D].
+        tag_ids/tag_mask: optional [B, T] tag lookup, inserted between the text
+        prefix and the image tokens. `pos`/`mask` must already carry the tag
+        rows (see `prepare(..., taglen=T)`).
         """
         img = self.first(img)
         per_token_t = t.dim() == 2
@@ -448,8 +468,15 @@ class SingleStreamDiT(nn.Module):
         context = self.txtfusion(context, mask=txtmask)
         context = self.txtmlp(context)
 
+        # The head slices off everything before the image span, so the tag
+        # block counts as part of the prefix length.
         txtlen, imglen = context.shape[1], img.shape[1]
-        combined = torch.cat((context, img), dim=1)
+        if tag_ids is not None and self.tagembed is not None:
+            tagtok = self.tagembed(tag_ids, tag_mask)
+            txtlen += tagtok.shape[1]
+            combined = torch.cat((context, tagtok, img), dim=1)
+        else:
+            combined = torch.cat((context, img), dim=1)
 
         # Pad combined sequence to a multiple of 256 to stabilize compiled kernel shapes.
         fulllen = combined.shape[1]

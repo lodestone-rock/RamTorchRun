@@ -118,6 +118,7 @@ from utils.ramtorch_helpers import (
 from dataloaders.parquet_dataloader import ParquetTextImageDataset
 
 from krea2.train_utils import (
+    TagTrainer,
     _mu_from_seq_len,
     _pin_sdpa_backends,
     sample_timesteps,
@@ -244,6 +245,8 @@ def preview(
     y2: float = 1.15,
     minres: int = 256,
     maxres: int = 1280,
+    tag_ids: torch.Tensor | None = None,
+    tag_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Euler+CFG sampling through the chunked DiT. Returns a float32 CPU tensor
     [2*n, 3, H, W] in [-1, 1]: generated samples followed by decoded GT."""
@@ -263,25 +266,39 @@ def preview(
     txt, txtmask = txt_mbs[0], txtmask_mbs[0]
     untxt, untxtmask = untxt_mbs[0], untxtmask_mbs[0]
 
+    taglen = 0
+    if tag_ids is not None:
+        tag_ids, tag_mask = tag_ids[:n_samples], tag_mask[:n_samples]
+        taglen = tag_ids.shape[1]
+        # The negative pass drops tags along with the caption, mirroring the
+        # coupled uncond used in training.
+        untag_mask = torch.zeros_like(tag_mask)
+
     noise = torch.randn_like(x0_ref)
-    img_tok, pos, mask = prepare(noise, txt.shape[1], patch, txtmask)
-    _, unpos, unmask = prepare(noise, untxt.shape[1], patch, untxtmask)
+    img_tok, pos, mask = prepare(noise, txt.shape[1], patch, txtmask,
+                                 taglen=taglen, tagmask=tag_mask)
+    if taglen:
+        _, unpos, unmask = prepare(noise, untxt.shape[1], patch, untxtmask,
+                                   taglen=taglen, tagmask=untag_mask)
+    else:
+        _, unpos, unmask = prepare(noise, untxt.shape[1], patch, untxtmask)
 
     x1_res = (minres // (compression * patch)) ** 2
     x2_res = (maxres // (compression * patch)) ** 2
     ts = k2_timesteps(img_tok.shape[1], steps, x1_res, x2_res, y1=y1, y2=y2, mu=mu)
 
-    head_chunk.set_seq(txt.shape[1], img_tok.shape[1])
+    head_chunk.set_seq(txt.shape[1], img_tok.shape[1], taglen=taglen)
 
     img = img_tok
     for tcurr, tprev in zip(ts[:-1], ts[1:]):
         t_vec = torch.full((n_samples,), tcurr, dtype=torch.float32, device=device)
-        cond = dit_pipe.infer(
-            (img, txt, t_vec, pos, mask), n_microbatches=1
-        ).to(device)
-        uncond = dit_pipe.infer(
-            (img, untxt, t_vec, unpos, unmask), n_microbatches=1
-        ).to(device)
+        cond_in = (img, txt, t_vec, pos, mask)
+        uncond_in = (img, untxt, t_vec, unpos, unmask)
+        if taglen:
+            cond_in += (tag_ids, tag_mask)
+            uncond_in += (tag_ids, untag_mask)
+        cond = dit_pipe.infer(cond_in, n_microbatches=1).to(device)
+        uncond = dit_pipe.infer(uncond_in, n_microbatches=1).to(device)
         v = uncond + cfg_scale * (cond - uncond)
         img = img + (tprev - tcurr) * v.to(img.dtype)
 
@@ -319,6 +336,12 @@ def train(cfg: dict, config_path: str):
     enc_cfg      = ENCODER_CONFIGS[cfg.get("encoder_config", "qwen3_vl_4b")]
     dit_cfg      = MMDIT_CONFIGS[cfg.get("mmdit_config", "large_wide")]
 
+    # Tag conditioning is off unless the config carries a `tag_embed` block, in
+    # which case the DiT gains a tag table and the sequence gains a tag span.
+    # The table is attached after the base weights load, not built into the
+    # config — see TagTrainer.attach.
+    tags = TagTrainer(cfg, parallelism)
+
     # ------------------------------------------------------------------
     # Chunking / offload knobs
     # ------------------------------------------------------------------
@@ -339,7 +362,13 @@ def train(cfg: dict, config_path: str):
     act_slots       = cfg.get("offload_act_slots", 2)
     enc_window      = cfg.get("enc_offload_window", 2)
 
-    grad_ckpt = cfg.get("grad_ckpt", False)
+    # A bool or a fraction of each stage's chunks; validated here rather than
+    # at the call site so a bad value fails before the ~51 GB checkpoint load.
+    grad_ckpt = float(cfg.get("grad_ckpt", False))
+    if not 0.0 <= grad_ckpt <= 1.0:
+        raise ValueError(
+            f"grad_ckpt must be a bool or a fraction in [0, 1], got {grad_ckpt!r}"
+        )
     if grad_ckpt and offload:
         raise ValueError(
             "grad_ckpt (torch.utils.checkpoint inside a chunk) is incompatible "
@@ -445,6 +474,11 @@ def train(cfg: dict, config_path: str):
     lora_rank     = cfg.get("lora_rank", 32)
     lora_alpha    = cfg.get("lora_alpha", float(lora_rank))
     lora_exclude  = tuple(cfg.get("lora_exclude_prefixes", []))
+    if tags.enabled and "tagembed" not in lora_exclude:
+        # inject_lora replaces EVERY nn.Linear. The tag projection is trained
+        # directly (it is new weight, not a pretrained one to adapt), so
+        # low-ranking it would only throttle it.
+        lora_exclude += ("tagembed",)
 
     def _random_init(model: nn.Module) -> nn.Module:
         print("  [warn] No checkpoint specified — training from random init.")
@@ -461,14 +495,17 @@ def train(cfg: dict, config_path: str):
             dit = _random_init(dit)
         inject_lora(dit, rank=lora_rank, alpha=lora_alpha,
                     exclude_prefixes=lora_exclude)
+        tags.attach(dit)
         if lora_ckpt_cfg:
             load_lora_checkpoint(dit, lora_ckpt_cfg)
         dit = dit.to(dtype)   # bf16 masters; LoRA grads accumulate in bf16
     else:
         # full FT: full_checkpoint > lora merged into base > base as-is
+        tag_sd: dict = {}
         if full_ckpt_cfg:
             print(f"  Loading full checkpoint from {full_ckpt_cfg}...")
-            dit.load_state_dict(load_file(full_ckpt_cfg), strict=True, assign=True)
+            base_sd, tag_sd = tags.split_checkpoint(load_file(full_ckpt_cfg))
+            dit.load_state_dict(base_sd, strict=True, assign=True)
         elif lora_ckpt_cfg:
             if not mmdit_ckpt:
                 raise RuntimeError(
@@ -485,6 +522,8 @@ def train(cfg: dict, config_path: str):
             dit.load_state_dict(load_file(mmdit_ckpt), strict=True, assign=True)
         else:
             dit = _random_init(dit)
+        tags.attach(dit)
+        tags.load_tag_state(dit, tag_sd)
         dit = dit.to(torch.float32)  # fp32 masters; bf16 compute via autocast
 
     trainable_n, total_n = trainable_param_count(dit)
@@ -497,9 +536,11 @@ def train(cfg: dict, config_path: str):
     dit_chunks = build_dit_chunks(dit, blocks_per_chunk=blocks_per_chunk)
     head_chunk = dit_chunks[-1]
     counts = cfg.get("chunks_per_stage") or balance_chunks_by_bytes(dit_chunks, n_stages)
+    ckpt_per_stage = [0] * len(counts)
     if grad_ckpt:
-        set_dit_grad_ckpt(dit_chunks, True)
-        print("  Gradient checkpointing ENABLED (DiT blocks + text fusion).")
+        ckpt_per_stage = set_dit_grad_ckpt(dit_chunks, grad_ckpt, counts)
+        print(f"  Gradient checkpointing at {grad_ckpt:.0%} of each stage's "
+              f"chunks (DiT blocks + text fusion).")
 
     print(f"  Dicing DiT into {len(dit_chunks)} chunks "
           f"(blocks_per_chunk={blocks_per_chunk}) over {n_stages} stage(s)"
@@ -520,7 +561,9 @@ def train(cfg: dict, config_path: str):
                                  if cnt > n_pinned else 0)
         note = (f", {n_pinned}/{cnt} pinned, ~{n_resident * biggest:.1f} GB "
                 f"resident" if offload else "")
-        print(f"    stage {i} [{devices[i]}]: {cnt} chunks, {gb:.2f} GB weights{note}")
+        ck = f", {ckpt_per_stage[i]}/{cnt} ckpt" if grad_ckpt else ""
+        print(f"    stage {i} [{devices[i]}]: {cnt} chunks, "
+              f"{gb:.2f} GB weights{ck}{note}")
 
     dit_pipe = Pipeline(
         chunk_modules=dit_chunks,
@@ -543,13 +586,21 @@ def train(cfg: dict, config_path: str):
 
     # Capture AFTER Pipeline construction: under offload the masters have been
     # relocated to CPU pinned memory, which is where the optimizer must run.
-    trainable = [p for p in dit.parameters() if p.requires_grad]
+    # build_optimizer hands the tag table to its own RowAdamW and returns the
+    # rest, so `trainable` below is what the main optimizer and the grad clip
+    # should see.
+    trainable = tags.build_optimizer(dit, warmup=cfg.get("warmup", 200))
     if optimizer_impl == "offload-adamw":
         opt = build_offload_adamw(
             dit_chunks, counts, devices,
             lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95),
             bucket_mb=opt_bucket_mb, window=opt_window,
             state_dtype=opt_state_dtype, stochastic_rounding=opt_stochastic,
+            # This walks the chunks rather than `trainable`, so the tag table
+            # has to be excluded by identity or it would be updated twice.
+            exclude_ids=(
+                {id(dit.tagembed.embed.weight)} if tags.opt is not None else None
+            ),
         )
         print(f"  Optimizer: OffloadAdamW x{len(opt.optimizers)} "
               f"(one per stage, window={opt_window}, "
@@ -574,6 +625,12 @@ def train(cfg: dict, config_path: str):
 
     def _save_checkpoint(path: str):
         sd = lora_state_dict(dit) if mode == "lora" else dit.state_dict()
+        if tags.enabled and dit.tagembed is not None:
+            # lora_state_dict selects on requires_grad, so it picks up the
+            # table and projection but not this buffer — and without it a
+            # reload cannot tell which vocabulary the table was trained on.
+            sd = dict(sd)
+            sd["tagembed.vocab_fingerprint"] = dit.tagembed.vocab_fingerprint
         sd = {k: v.detach().cpu().contiguous() for k, v in sd.items()}
         sd = _strip_compiled_keys(sd)
         if path.endswith((".safetensors", ".sft")):
@@ -615,6 +672,9 @@ def train(cfg: dict, config_path: str):
         offset=parquet_cfg.get("offset", 0),
         tokenizer=None,          # K2 tokenization happens in K2CaptionTokenizer
         max_text_len=0,
+        tag_column=parquet_cfg.get("tag_column") if tags.enabled else None,
+        tag_vocab_path=tags.vocab_path if tags.enabled else None,
+        max_tags=tags.max_tags,
     )
     train_loader = DataLoader(
         dataset,
@@ -716,14 +776,16 @@ def train(cfg: dict, config_path: str):
                 continue                        # partial tail batch — skip
 
             # ---------- Text conditioning (uncond dropout + chunked encode)
-            dropped = [
-                "" if torch.rand(1).item() < uncond_ratio else c for c in captions
-            ]
+            # The uncond coin is drawn per sample and reused for the tags: a
+            # CFG negative pass drops both channels, so training must too.
+            is_uncond = [torch.rand(1).item() < uncond_ratio for _ in captions]
+            dropped = ["" if u else c for u, c in zip(is_uncond, captions)]
             txt_mbs, txtmask_mbs = encode_captions(
                 enc_pipe, tokenizer, dropped, n_mb, driver
             )
             txtlen = txt_mbs[0].shape[1]
             txtmask = torch.cat(txtmask_mbs, dim=0)
+            tag_ids, tag_mask = tags.batch(batch_data, is_uncond, driver)
 
             # ---------- VAE encode -------------------------------------------
             x0_clean = parallel_vae_encode(aes, devices, images, driver)
@@ -739,7 +801,10 @@ def train(cfg: dict, config_path: str):
             # ---------- Flow-matching interpolation + patchify ---------------
             t4 = t[:, None, None, None].to(x0_clean.dtype)
             x_t = (1.0 - t4) * x0_clean + t4 * x0_noise
-            x_t_tok, pos, mask = prepare(x_t, txtlen, patch, txtmask)
+            taglen = tags.max_tags if tag_ids is not None else 0
+            x_t_tok, pos, mask = prepare(
+                x_t, txtlen, patch, txtmask, taglen=taglen, tagmask=tag_mask
+            )
             v_target = rearrange(
                 x0_noise - x0_clean,
                 "b c (h ph) (w pw) -> b (h w) (c ph pw)",
@@ -748,8 +813,12 @@ def train(cfg: dict, config_path: str):
             imglen = x_t_tok.shape[1]
 
             # ---------- Step --------------------------------------------------
+            if taglen:
+                tagid_mbs = tag_ids.chunk(n_mb)
+                tagmask_mbs = tag_mask.chunk(n_mb)
             nested = tuple(
                 (x_mb, txt_mbs[k], t_mb, pos_mb, m_mb)
+                + ((tagid_mbs[k], tagmask_mbs[k]) if taglen else ())
                 for k, (x_mb, t_mb, pos_mb, m_mb) in enumerate(
                     zip(
                         x_t_tok.chunk(n_mb),
@@ -759,7 +828,7 @@ def train(cfg: dict, config_path: str):
                     )
                 )
             )
-            head_chunk.set_seq(txtlen, imglen)
+            head_chunk.set_seq(txtlen, imglen, taglen=taglen)
             _t = time.perf_counter()
             phase_s["data"] += _t - _t_data
 
@@ -784,13 +853,23 @@ def train(cfg: dict, config_path: str):
 
             opt.step()
             sched.step()
+            # Before zero_grads: RowAdamW reads the table's .grad, which the
+            # pipeline flush has just populated.
+            tags.step(tag_ids, tag_mask)
             zero_grads(dit_pipe)
             _t, _prev = time.perf_counter(), _t
             phase_s["opt"] += _t - _prev
 
             loss_val = result.loss.item()
             lr_now = sched.get_last_lr()[0]
-            pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{lr_now:.2e}", step=global_step)
+            post = {"loss": f"{loss_val:.4f}", "lr": f"{lr_now:.2e}",
+                    "step": global_step}
+            if tags.opt is not None:
+                # How much of the table has ever been written. Flat-lining well
+                # below the vocabulary size means the corpus never uses those
+                # ids and min_count could be raised.
+                post["tagrows"] = tags.opt.rows_trained()
+            pbar.set_postfix(**post)
 
             csv_writer.writerow([
                 global_step, f"{loss_val:.6f}", f"{lr_now:.2e}",
@@ -808,6 +887,7 @@ def train(cfg: dict, config_path: str):
             # ---------- Preview ----------------------------------------------
             if eval_interval > 0 and global_step % eval_interval == 0:
                 dit.eval()
+                pv_ids, pv_mask = tags.undropped()
                 rows = preview(
                     dit_pipe, head_chunk, enc_pipe, tokenizer, aes[driver],
                     patch, compression,
@@ -817,6 +897,7 @@ def train(cfg: dict, config_path: str):
                     n_samples=min(preview_n, B),
                     mu=cfg.get("preview_mu", None),
                     y1=mu_y1, y2=mu_y2, minres=minres, maxres=maxres,
+                    tag_ids=pv_ids, tag_mask=pv_mask,
                 )
                 grid = make_grid((rows + 1) / 2, nrow=min(preview_n, B))
                 ext = "png" if preview_quality >= 100 else "jpg"

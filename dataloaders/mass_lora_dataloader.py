@@ -109,6 +109,8 @@ class MassLoraParquetDataset(ParquetTextImageDataset):
         keep_pools: bool = False,
         **kwargs,
     ):
+        if kwargs.get("resolution_batching") is not None:
+            raise ValueError("resolution_batching is not supported by MassLoraParquetDataset")
         if slots_per_step < 1 or per_slot_batch < 1 or n_microbatches < 1:
             raise ValueError(
                 "n_microbatches, slots_per_step and per_slot_batch must all be >= 1"

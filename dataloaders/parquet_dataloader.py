@@ -36,6 +36,7 @@ import random
 import logging
 import warnings
 from io import BytesIO
+from array import array
 
 import concurrent.futures as _cf
 
@@ -276,20 +277,25 @@ def _load_parquet_source(
     seed: int,
     columns: list[str],
     num_threads: int = 8,
+    stable_order: bool = False,
 ) -> pa.Table:
     """Load parquet files under *path* in parallel, project *columns*, subsample.
 
     Returns a PyArrow Table — no pandas involved.
     Uses its own seeded RNG so callers can run this in parallel safely.
+    ``stable_order=True`` sorts file paths and concatenates in submission order;
+    the default preserves legacy completion ordering and RNG consumption.
     """
     rng = random.Random(seed)
     parquet_files = _collect_parquet_files(path)
+    if stable_order:
+        parquet_files = sorted(parquet_files)
 
-    # Parallel reads — each worker reads one file
+    # Legacy completion ordering is deliberately preserved for existing callers.
     with _cf.ThreadPoolExecutor(max_workers=min(num_threads, len(parquet_files))) as ex:
         futures = {ex.submit(_read_parquet_columns, f, columns): f for f in parquet_files}
         tables = []
-        for fut in _cf.as_completed(futures):
+        for fut in (futures if stable_order else _cf.as_completed(futures)):
             tables.append(fut.result())
 
     # Cast strings to large_string before concat to avoid 32-bit offset overflow
@@ -443,6 +449,16 @@ class ParquetTextImageDataset(Dataset):
         If ``True``, HDR images are returned as raw linear float32 tensors
         with shape ``[C, H, W]`` and **no** normalisation applied; the
         ``image_transforms`` pipeline is skipped for those samples.
+    resolution_batching : dict | None
+        Opt-in step-level resolution probabilities and microbatch sizes. Its
+        effective_batch_size overrides batch_size, and its resolutions override
+        base_res/base_res_weights. Each item contains exactly one effective batch
+        and a trailing extras dict with ``step_plan`` (merged with tag tensors).
+        Dataset sharding is unsupported: use rank=0 and num_gpus=1.
+    data_epoch : int
+        Initial opt-in plan epoch. ``set_epoch`` rebuilds from canonical records
+        without rereading parquet; offset applies only to this initial epoch.
+        Recreate workers each epoch (persistent workers hold stale plan copies).
     """
 
     def __init__(
@@ -476,7 +492,27 @@ class ParquetTextImageDataset(Dataset):
         tag_column: str | None = None,
         tag_vocab_path: str | None = None,
         max_tags: int = 128,
+        resolution_batching: dict | None = None,
+        data_epoch: int = 0,
     ):
+        from .resolution_batching import normalize_resolution_batching, validate_resolution_geometry
+
+        self.resolution_batching = normalize_resolution_batching(resolution_batching)
+        self.data_epoch = data_epoch
+        self._initial_data_epoch = data_epoch
+        self._plan_seed = seed
+        if self.resolution_batching is not None:
+            validate_resolution_geometry(self.resolution_batching, ratio_cutoff, resolution_step)
+            if num_gpus != 1 or rank != 0:
+                raise ValueError("resolution_batching requires num_gpus=1 and rank=0 (no dataset sharding)")
+            if isinstance(data_epoch, bool) or not isinstance(data_epoch, int) or data_epoch < 0:
+                raise ValueError("data_epoch must be a non-negative integer")
+            if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+                raise ValueError("offset must be a non-negative integer")
+            batch_size = self.resolution_batching["effective_batch_size"]
+            base_res = list(self.resolution_batching["resolutions"])
+            # The opt-in block is authoritative, including over stale legacy weights.
+            base_res_weights = None
         if base_res is None:
             base_res = [1024]
 
@@ -565,9 +601,150 @@ class ParquetTextImageDataset(Dataset):
         else:
             self.session = None
 
-        self.batches = self._load_batches()
-        self._round_robin()
-        self.batches = self.batches[offset:]
+        if self.resolution_batching is not None:
+            self._load_resolution_pools()
+            self.set_epoch(data_epoch)
+        else:
+            self.batches = self._load_batches()
+            self._round_robin()
+            self.batches = self.batches[offset:]
+
+    # ------------------------------------------------------------------
+    # Opt-in effective-batch planning (legacy row RNG stays untouched)
+    # ------------------------------------------------------------------
+
+    def _load_resolution_pools(self):
+        """Read once; store captions/metadata once and compact row ids per resolution."""
+        rng = random.Random(self._plan_seed)
+        needed_cols = sorted({
+            self.filename_column, self.width_column, self.height_column,
+            *self._caption_col_names,
+            *([] if not self.loss_weight_column else [self.loss_weight_column]),
+            *([] if self.num_reference_images is None else ["reference_images"]),
+            *([] if self.tag_column is None else [self.tag_column]),
+        })
+        text_cols = sorted({*self._caption_col_names,
+                            *([] if self.tag_column is None else [self.tag_column])})
+        n_threads = min(8, psutil.cpu_count(logical=False) or 4)
+        # Assign seeds BEFORE scheduling IO; completion order cannot change the data.
+        sources = [(name, cfg, rng.randint(0, 2**31))
+                   for name, cfg in sorted(self.parquet_sources.items())]
+        if not sources:
+            raise ValueError("resolution_batching requires at least one parquet source")
+
+        def load_source(item):
+            name, cfg, source_seed = item
+            table = _load_parquet_source(
+                cfg["path"], cfg.get("n_samples"), source_seed, needed_cols,
+                n_threads, stable_order=True,
+            )
+            table = _coerce_text_columns(table, text_cols)
+            print(f"  [{name}] loaded {len(table):,} rows")
+            return table
+
+        with _cf.ThreadPoolExecutor(max_workers=len(sources)) as executor:
+            tables = list(executor.map(load_source, sources))
+        combined = pa.concat_tables(tables, promote_options="default")
+        del tables
+        cols = {name: combined.column(name).to_pylist() for name in combined.schema.names}
+        total_rows = len(combined)
+        del combined
+        for required in (self.filename_column, self.width_column, self.height_column):
+            if required not in cols:
+                raise ValueError(f"Missing required parquet column: {required}")
+        standardized = _build_standardized_buckets(
+            self.base_res, self.ratio_cutoff, self.resolution_step,
+        )
+        self.records = []
+        self.resolution_pools = {res: {} for res in self.base_res}
+        for i in range(total_rows):
+            try:
+                w, h = int(cols[self.width_column][i]), int(cols[self.height_column][i])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if w <= 0 or h <= 0 or not 1 / self.ratio_cutoff < w / h < self.ratio_cutoff:
+                continue
+            available = [j for j, col in enumerate(self._caption_col_names)
+                         if cols[col][i] is not None and str(cols[col][i]).strip()
+                         and self._caption_col_weights[j] > 0]
+            if not available:
+                continue
+            chosen = rng.choices(available, weights=[self._caption_col_weights[j]
+                                                    for j in available], k=1)[0]
+            filename = str(cols[self.filename_column][i])
+            loss_weight = 1.0
+            if self.loss_weight_column in cols:
+                try:
+                    loss_weight = float(cols[self.loss_weight_column][i])
+                except (TypeError, ValueError):
+                    pass
+            refs = cols["reference_images"][i] if "reference_images" in cols else []
+            tags = cols[self.tag_column][i] if self.tag_column in cols else ""
+            row_id = len(self.records)
+            self.records.append({
+                "filename": filename,
+                "caption_or_tags": str(cols[self._caption_col_names[chosen]][i]).strip(),
+                "is_tag_based": self._caption_col_is_tag[chosen],
+                "is_url_based": self._is_url(filename), "loss_weight": loss_weight,
+                "reference_images": refs if isinstance(refs, list) else [], "tags": tags or "",
+            })
+            norm_w, norm_h = _normalize_width_height(w, h)
+            for res, lookup in standardized.items():
+                bucket = _closest_bucket(norm_w, norm_h, lookup)
+                self.resolution_pools[res].setdefault(bucket, array("Q")).append(row_id)
+        if not self.records:
+            raise RuntimeError("resolution_batching: no valid image-caption rows after filtering")
+        print(f"There are {len(self.records):,} canonical text-image pairs for resolution batching.")
+
+    def set_epoch(self, epoch: int):
+        """Regenerate an opt-in plan without IO; the same epoch gives the same plan.
+
+        Legacy callers retain their existing resample behavior; set_epoch is a
+        no-op there. Recreate DataLoader workers after calling this method.
+        """
+        if self.resolution_batching is None:
+            return
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+            raise ValueError("epoch must be a non-negative integer")
+        self.data_epoch = epoch
+        rng = random.Random(f"resolution_batching:{self._plan_seed}:{epoch}")
+        specs = self.resolution_batching["resolutions"]
+        resolutions = list(specs)
+        resolution_weights = [specs[res]["probability"] for res in resolutions]
+        # A cursor traverses a shuffled pool once before reshuffling and cycling.
+        cycling = {}
+        for res, pools in self.resolution_pools.items():
+            for bucket, row_ids in pools.items():
+                shuffled = array("Q", row_ids)
+                rng.shuffle(shuffled)
+                cycling[res, bucket] = [shuffled, 0]
+        n_steps = self.resolution_batching.get("steps_per_epoch")
+        if n_steps is None:
+            n_steps = math.ceil(len(self.records) / self.batch_size)
+        if epoch == self._initial_data_epoch and self.offset > n_steps:
+            raise ValueError(f"offset {self.offset} exceeds epoch plan length {n_steps}")
+        batches = []
+        for plan_index in range(n_steps):
+            res = rng.choices(resolutions, weights=resolution_weights, k=1)[0]
+            pools = self.resolution_pools[res]
+            bucket = rng.choices(list(pools), weights=[len(ids) for ids in pools.values()], k=1)[0]
+            pool, cursor = cycling[res, bucket]
+            rows = array("Q")
+            for _ in range(self.batch_size):
+                if cursor == len(pool):
+                    rng.shuffle(pool)
+                    cursor = 0
+                rows.append(pool[cursor])
+                cursor += 1
+            cycling[res, bucket][1] = cursor
+            microbatch_size = specs[res]["microbatch_size"]
+            batches.append({"row_ids": rows, "step_plan": {
+                "resolution": res, "bucket": bucket,
+                "effective_batch_size": self.batch_size, "microbatch_size": microbatch_size,
+                "n_microbatches": self.batch_size // microbatch_size,
+                "epoch": epoch, "plan_index": plan_index,
+            }})
+        self.batches = batches[self.offset:] if epoch == self._initial_data_epoch else batches
 
     # ------------------------------------------------------------------
     # Batch preparation
@@ -784,6 +961,9 @@ class ParquetTextImageDataset(Dataset):
                     ...
                 dataset.resample()   # refresh before next epoch
         """
+        if self.resolution_batching is not None:
+            self.set_epoch(self.data_epoch + 1)
+            return
         print(f"[ParquetTextImageDataset] resampling (rank {self.rank})...")
         self.batches = self._load_batches()
         self._round_robin()
@@ -1018,7 +1198,112 @@ class ParquetTextImageDataset(Dataset):
     # __getitem__
     # ------------------------------------------------------------------
 
+    def _prepare_resolution_sample(self, row_id, bucket, seed):
+        """Prepare a whole row atomically; never append a partial payload on failure."""
+        sample = self.records[row_id]
+        rng = random.Random(seed)
+        width, height = bucket
+
+        def transform(image):
+            if isinstance(image, torch.Tensor):
+                return self._scale_and_crop_tensor(image, height, width)
+            return self.image_transforms(self.scale_and_crop_long_axis(image, height, width))
+
+        try:
+            if self.dummy_image:
+                image = torch.zeros(3, height, width)
+            else:
+                raw = self._load_image(sample)
+                if raw is None:
+                    return None
+                image = transform(raw)
+            references = None
+            if self.num_reference_images is not None:
+                refs = []
+                if not self.dummy_image:
+                    for name in sample["reference_images"][:self.num_reference_images]:
+                        raw_ref = self._load_reference_image(name)
+                        if raw_ref is not None:
+                            refs.append(transform(raw_ref))
+                while len(refs) < self.num_reference_images:
+                    refs.append(torch.zeros(3, height, width))
+                references = (torch.stack(refs) if refs else torch.zeros(0, 3, height, width))
+            caption = sample["caption_or_tags"]
+            if rng.random() >= 1 - self.uncond_percentage:
+                caption = ""
+            if self.shuffle_tags and sample["is_tag_based"] and caption:
+                tags = caption.split(",")
+                rng.shuffle(tags)
+                percentage = rng.uniform(1 - self.tag_drop_percentage, 1)
+                if not 0 <= percentage <= 1:
+                    raise ValueError("Percentage must be between 0 and 1")
+                tags = rng.sample(tags, math.ceil(len(tags) * percentage))
+                caption = ",".join(tags).lstrip()
+            return image, caption, sample["loss_weight"], references, sample["tags"]
+        except Exception as exc:
+            log.error("Error processing sample %r in resolution bucket %s: %s",
+                      sample["filename"], bucket, exc)
+            return None
+
+    def _getitem_resolution_batch(self, index):
+        entry = self.batches[index]
+        metadata = entry["step_plan"]
+        bucket = metadata["bucket"]
+        seed = f"resolution_payload:{self._plan_seed}:{metadata['epoch']}:{metadata['plan_index']}"
+        rng = random.Random(seed)
+
+        def prepare(item):
+            visit, row_id = item
+            return self._prepare_resolution_sample(row_id, bucket, f"{seed}:{visit}:{row_id}")
+
+        with _cf.ThreadPoolExecutor(max_workers=max(1, self.thread_per_worker)) as executor:
+            payloads = list(executor.map(prepare, enumerate(entry["row_ids"])))
+            valid = [payload for payload in payloads if payload is not None]
+            if len(valid) < self.batch_size:
+                pool = self.resolution_pools[metadata["resolution"]][bucket]
+                # Bounded retries, only from this exact resolution/bucket. Never
+                # recurse into another randomly chosen (possibly huge) resolution.
+                attempted = set(entry["row_ids"])
+                start = rng.randrange(len(pool))
+                retry_ids = []
+                budget = max(32, self.batch_size * 4)
+                for offset in range(min(len(pool), budget + len(attempted))):
+                    row_id = pool[(start + offset) % len(pool)]
+                    if row_id not in attempted:
+                        retry_ids.append(row_id)
+                    if len(retry_ids) >= budget:
+                        break
+                cursor = 0
+                while cursor < len(retry_ids) and len(valid) < self.batch_size:
+                    # Do not eagerly decode the entire retry budget at high
+                    # resolution: retain at most one effective batch of tensors.
+                    stop = cursor + self.batch_size - len(valid)
+                    retries = enumerate(retry_ids[cursor:stop], start=self.batch_size + cursor)
+                    valid.extend(payload for payload in executor.map(prepare, retries)
+                                 if payload is not None)
+                    cursor = stop
+        if not valid:
+            raise RuntimeError(
+                f"resolution_batching: no decodable samples in bounded same-bucket retries "
+                f"(epoch={metadata['epoch']}, plan_index={metadata['plan_index']}, "
+                f"resolution={metadata['resolution']}, bucket={bucket})"
+            )
+        while len(valid) < self.batch_size:
+            valid.append(valid[rng.randrange(len(valid))])
+        images, captions, weights, references, tags = zip(*valid)
+        captions = list(captions)
+        tokens = self.tokenize(captions)
+        out = [torch.stack(images), tokens if tokens is not None else captions, index, list(weights)]
+        if self.num_reference_images is not None:
+            out.append(torch.stack(references))
+        extras = self._encode_tags(list(tags), rng=rng) if self.tag_matcher is not None else {}
+        extras["step_plan"] = dict(metadata)
+        out.append(extras)
+        return tuple(out)
+
     def __getitem__(self, index: int):
+        if self.resolution_batching is not None:
+            return self._getitem_resolution_batch(index)
         batch = self.batches[index]
 
         if not self.dummy_image:
@@ -1144,8 +1429,10 @@ class ParquetTextImageDataset(Dataset):
             out.append(self._encode_tags(tag_strings))
         return tuple(out)
 
-    def _encode_tags(self, tag_strings: list[str]) -> dict:
+    def _encode_tags(self, tag_strings: list[str], rng=None) -> dict:
         """-> {"tag_ids": [B, max_tags] int64, "tag_mask": [B, max_tags] bool}."""
+        if rng is None:
+            rng = random
         b = len(tag_strings)
         ids = np.zeros((b, self.max_tags), dtype=np.int64)
         mask = np.zeros((b, self.max_tags), dtype=bool)
@@ -1156,7 +1443,7 @@ class ParquetTextImageDataset(Dataset):
             if len(hits) > self.max_tags:
                 # Which tags survive an overflow should not depend on the
                 # annotator's sort order (this corpus is ~88% alphabetical).
-                hits = random.sample(hits, self.max_tags)
+                hits = rng.sample(hits, self.max_tags)
             if hits:
                 ids[i, : len(hits)] = hits
                 mask[i, : len(hits)] = True

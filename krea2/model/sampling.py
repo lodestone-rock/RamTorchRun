@@ -132,6 +132,7 @@ def sample(
 
     # Tag conditioning, if the model carries a table and the caller matched any.
     taglen = 0
+    untag_mask = None
     if tag_ids is not None:
         taglen = tag_ids.shape[1]
         untag_mask = torch.zeros_like(tag_mask)   # negative drops tags too

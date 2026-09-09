@@ -633,6 +633,7 @@ def main() -> int:
                     help="Strength multiplier applied to the LoRA after loading its "
                          "checkpoint (scales every LoRALinear's alpha/rank factor). "
                          "Negative values subtract the LoRA delta. Default 1.0.")
+    ap.add_argument("--sparse-checkpoint", help="Fixed-coordinate PEFT delta, applied to the bf16 base before LoRA")
     ap.add_argument("--no-lora", action="store_true",
                     help="Skip LoRA injection entirely (base model control).")
     ap.add_argument("--mmdit-checkpoint", default=None,
@@ -643,6 +644,18 @@ def main() -> int:
     ap.add_argument("--out-dir", default="previews/inference",
                     help="Directory to write PNGs into (created if missing).")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--local-attention", action="store_true",
+                    help="Experimental inference-only DiT prefix + 2D local attention; "
+                         "uncalibrated, single GPU (resident or --offload).")
+    ap.add_argument("--local-full-heads", type=int, default=2,
+                    help="First N QUERY heads kept full in every DiT block (of 48; default 2).")
+    ap.add_argument("--local-full-head-ids", type=int, nargs="+", default=None,
+                    help="Explicit full query-head indices; count must match --local-full-heads.")
+    ap.add_argument("--local-layer-heads", default=None,
+                    help="JSON list of full query-head lists, one per joint DiT layer; "
+                         "mutually exclusive with --local-full-head-ids.")
+    ap.add_argument("--local-window", type=int, default=11,
+                    help="Odd square image-token window for local DiT heads (default 11).")
     ap.add_argument("--pipeline", action="store_true",
                     help="Split the DiT + text encoder into pipeline stages across "
                          "--devices (RamTorch) instead of loading everything on one "
@@ -711,6 +724,13 @@ def main() -> int:
         ap.error("--offload-nvme requires --offload-nvme-path")
     if not (0 <= args.shard < args.num_shards):
         ap.error(f"--shard {args.shard} out of range for --num-shards {args.num_shards}")
+    if args.local_attention:
+        if args.pipeline or not args.device.startswith("cuda"):
+            ap.error("--local-attention currently requires single-GPU CUDA (optionally --offload)")
+        if args.local_window < 1 or args.local_window % 2 != 1:
+            ap.error("--local-window must be positive and odd")
+        if args.local_full_heads < 1:
+            ap.error("--local-full-heads must be positive")
 
     # ------------------------------------------------------------------
     # Prompts
@@ -782,6 +802,34 @@ def main() -> int:
     enc_cfg_name = cfg.get("encoder_config", "qwen3_vl_4b")
     encoder_id = cfg.get("encoder_model_id", "Qwen/Qwen3-VL-4B-Instruct")
     mmdit_ckpt = args.mmdit_checkpoint or cfg.get("mmdit_checkpoint")
+    if args.local_attention and args.local_full_heads > MMDIT_CONFIGS[dit_cfg_name].heads:
+        ap.error("--local-full-heads exceeds the model's query head count")
+    if args.local_full_head_ids is not None:
+        ids = args.local_full_head_ids
+        if (not args.local_attention or len(ids) != args.local_full_heads or
+                len(set(ids)) != len(ids) or
+                any(h < 0 or h >= MMDIT_CONFIGS[dit_cfg_name].heads for h in ids)):
+            ap.error("--local-full-head-ids requires local attention and N unique valid indices")
+    layer_head_ids = None
+    if args.local_layer_heads:
+        if not args.local_attention or args.local_full_head_ids is not None:
+            ap.error("--local-layer-heads needs local attention and no global head list")
+        from krea2.model.local_attention import validate_layer_head_ids
+
+        try:
+            with open(args.local_layer_heads) as f:
+                layer_head_ids = validate_layer_head_ids(
+                    json.load(f), MMDIT_CONFIGS[dit_cfg_name].layers,
+                    MMDIT_CONFIGS[dit_cfg_name].heads, args.local_full_heads)
+        except (OSError, ValueError) as exc:
+            ap.error(str(exc))
+    manifest_seeds = any(m is not None and "seed" in m for m in prompt_meta)
+    if manifest_seeds and args.batch_size != 1:
+        ap.error("Manifest seeds currently require --batch-size 1 to preserve per-image RNG")
+    if manifest_seeds:
+        for m in prompt_meta:
+            if m is not None and "seed" in m and type(m["seed"]) is not int:
+                ap.error("Manifest seeds must be integers")
 
     steps = args.steps if args.steps is not None else int(cfg.get("preview_steps", 28))
     guidance = args.guidance if args.guidance is not None else float(cfg.get("preview_cfg_scale", 4.5))
@@ -849,6 +897,18 @@ def main() -> int:
     else:
         dit.load_state_dict(load_file(mmdit_ckpt), strict=True, assign=True)
 
+    if args.sparse_checkpoint:
+        from krea2.model.sparse_peft import apply_adapter
+        metadata_path = args.sparse_checkpoint + ".json"
+        if os.path.exists(metadata_path):
+            with open(metadata_path) as f:
+                sparse_meta = json.load(f)
+            if os.path.realpath(sparse_meta["base_checkpoint"]) != os.path.realpath(mmdit_ckpt):
+                raise ValueError("Sparse delta was trained against a different base checkpoint")
+        # Sparse deltas are relative to the training-time bf16 base.
+        dit = dit.to(dtype)
+        apply_adapter(dit, args.sparse_checkpoint)
+
     if not args.no_lora:
         lora_rank = args.lora_rank or int(cfg.get("lora_rank", 32))
         lora_alpha = (args.lora_alpha if args.lora_alpha is not None
@@ -885,6 +945,15 @@ def main() -> int:
     else:
         print("[infer] --no-lora set: running the base model.")
         _attach_tag_embed(dit, tagger, dtype)
+
+    if args.local_attention:
+        from krea2.model.local_attention import enable_local_attention
+
+        enable_local_attention(dit, args.local_full_heads, args.local_window,
+                               args.local_full_head_ids, layer_head_ids)
+        print(f"[infer] UNCALIBRATED local attention: {args.local_full_heads}/"
+              f"{dit.config.heads} query heads full; remaining heads "
+              f"{args.local_window}x{args.local_window}; all joint DiT blocks")
 
     if args.pipeline:
         # Chunks are moved to their devices by Pipeline(); the encoder pipeline
@@ -983,6 +1052,9 @@ def main() -> int:
         )
     for start in range(0, len(prompts), bs):
         chunk = prompts[start:start + bs]
+        batch_seed = args.seed + shard_base + start
+        if manifest_seeds and prompt_meta[start] is not None:
+            batch_seed = prompt_meta[start].get("seed", batch_seed)
         tag_ids, tag_mask = tagger.encode(chunk)
         if tag_ids is not None and start == 0:
             print(f"[infer] tags for prompt 0: {tagger.describe(chunk[0])}")
@@ -993,7 +1065,7 @@ def main() -> int:
             height=args.height,
             steps=steps,
             guidance=guidance,
-            seed=args.seed + shard_base + start,
+            seed=batch_seed,
             minres=minres,
             maxres=maxres,
             y1=y1,
@@ -1034,18 +1106,33 @@ def main() -> int:
             break   # profiling run: sampling stopped mid-schedule, no images
         for i, (prompt, img) in enumerate(zip(chunk, images)):
             gi = shard_base + start + i
-            fname = f"{gi:04d}_seed{args.seed + gi}_{_slugify(prompt, 40)}.png"
+            actual_seed = batch_seed + i
+            fname = f"{gi:04d}_seed{actual_seed}_{_slugify(prompt, 40)}.png"
             path = os.path.join(args.out_dir, fname)
             img.save(path)
             meta = prompt_meta[start + i] if start + i < len(prompt_meta) else None
             entry = {
                 "index": gi,
-                "seed": args.seed + gi,
+                "seed": actual_seed,
                 "image": fname,
                 "prompt": prompt,
+                "attention": (dict(mode="local", full_query_heads=args.local_full_heads,
+                                   full_head_ids=(None if layer_head_ids is not None else
+                                                  (args.local_full_head_ids or
+                                                   list(range(args.local_full_heads)))),
+                                   layer_head_ids=layer_head_ids,
+                                   window=args.local_window)
+                              if args.local_attention else dict(mode="dense")),
+                "mmdit_checkpoint": mmdit_ckpt,
+                "sparse_checkpoint": args.sparse_checkpoint,
+                "steps": steps,
+                "guidance": guidance,
+                "mu": mu,
+                "lora_checkpoint": None if args.no_lora else lora_ckpt,
+                "lora_scale": None if args.no_lora else args.lora_scale,
             }
             if meta:
-                entry.update({k: v for k, v in meta.items() if k != "prompt"})
+                entry["source_metadata"] = meta
             manifest.append(entry)
         print(f"[infer]   batch {start // bs + 1}: saved {len(images)} image(s) "
               f"({start + len(images)}/{len(prompts)})")

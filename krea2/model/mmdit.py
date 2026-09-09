@@ -231,7 +231,8 @@ class Attention(torch.nn.Module):
         q, k, v = self.qknorm(q, k, v)
         if freqs is not None:
             q, k = ropeapply(q, k, freqs)
-        out = self.wo(attention(q, k, v, mask=mask, gqa=self.gqa) * F.sigmoid(gate))
+        impl = getattr(self, "attention_impl", attention)
+        out = self.wo(impl(q, k, v, mask=mask, gqa=self.gqa) * F.sigmoid(gate))
 
         return out
 
@@ -502,6 +503,9 @@ class SingleStreamDiT(nn.Module):
             )  # [B, L, D]
             tvec = self.tproj(t_emb)  # [B, L, 6D]
 
+        local_attention = getattr(self, "local_attention", None)
+        if local_attention is not None:
+            local_attention.prepare(mask, pos, txtlen, imglen)
         mask = _mask(mask)
 
         freqs = self.posemb(pos)

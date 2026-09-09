@@ -77,6 +77,7 @@ class DiTEmbedChunk(nn.Module):
         self.txtmlp = dit.txtmlp
         self.tagembed = dit.tagembed
         self.posemb = dit.posemb  # parameter-free
+        self.local_attention = getattr(dit, "local_attention", None)
 
     def forward(self, img, context, t, pos, mask, tag_ids=None, tag_mask=None):
         img = self.first(img)
@@ -98,6 +99,7 @@ class DiTEmbedChunk(nn.Module):
         else:
             combined = torch.cat((context, img), dim=1)
 
+        prefixlen = combined.shape[1] - img.shape[1]
         # Pad to a multiple of 256 (mirrors SingleStreamDiT.forward).
         padlen = (-combined.shape[1]) % 256
         if padlen > 0:
@@ -106,6 +108,8 @@ class DiTEmbedChunk(nn.Module):
             pos = F.pad(pos, (0, 0, 0, padlen))
 
         freqs = self.posemb(pos)
+        if self.local_attention is not None:
+            self.local_attention.prepare(mask, pos, prefixlen, img.shape[1])
         attn_mask = _mask(mask)
         return combined, tvec, t_emb, freqs, attn_mask
 

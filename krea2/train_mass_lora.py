@@ -22,8 +22,10 @@ samples in the step's bucket (the artist who never draws landscapes) is simply
 absent, keeps a zero gradient, and its optimizer state is left untouched.
 
 Everything about the hardware strategy is inherited from `train.py`:
-``parallelism`` is still ``offload`` / ``pipeline`` / ``pipeline-offload``, and
-``mode`` does not exist here — a bank is always LoRA.
+``parallelism`` is ``resident`` (one GPU), ``offload``, ``pipeline`` or
+``pipeline-offload``, and
+``peft_method`` defaults to ``lora``; ``sparse`` is a fixed-coordinate,
+single-slot pilot using the same chunks and training loop (see SPARSE_PEFT.md).
 
 Effective batch per slot = ``n_microbatches * per_slot_batch`` per step, so
 single-LoRA learning rates transfer directly (the loss sums slot means rather
@@ -111,6 +113,7 @@ torch.manual_seed(0)
 
 # parallelism -> (wants every GPU, streams weights)
 PARALLELISM = {
+    "resident":         (False, False),
     "offload":          (False, True),
     "pipeline":         (True,  False),
     "pipeline-offload": (True,  True),
@@ -302,6 +305,30 @@ def preview(
 # ---------------------------------------------------------------------------
 
 def train(cfg: dict, config_path: str):
+    if "resolution_batching" in cfg:
+        raise ValueError(
+            "resolution_batching is not supported by train_mass_lora.py; "
+            "mass LoRA uses its own slot-packed step plans"
+        )
+    # Dispatch only adapter policy; data, chunking and objective stay shared.
+    sparse = cfg.get("peft_method", "lora") == "sparse"
+    if cfg.get("peft_method", "lora") not in ("lora", "sparse"):
+        raise ValueError("peft_method must be lora or sparse")
+    inject_adapter, adapter_budget = inject_lora_bank, bank_budget
+    activate, adapter_parameters = set_active_slots, bank_parameters
+    if sparse:
+        from krea2.model import sparse_peft
+        if cfg.get("tag_embed") or cfg.get("bank_checkpoint") or cfg.get("weight_decay", 0):
+            raise ValueError("Sparse pilot requires no tags/resume and zero weight decay")
+        inject_adapter = lambda *a, **kw: sparse_peft.inject(
+            *a, **kw, mask_path=cfg.get("sparse_mask"),
+            calibration_mode=cfg.get("sparse_calibration", "dense"),
+            candidate_multiplier=cfg.get("sparse_candidate_multiplier", 2))
+        adapter_budget, activate = sparse_peft.budget, sparse_peft.set_active
+        adapter_parameters = lambda model: []
+    # Initialization is separately seeded from the per-step training stream.
+    if cfg.get("paired_step_rng"):
+        torch.manual_seed(cfg.get("seed", 42))
     # `kill -USR1 <pid>` dumps every thread's stack to stderr — see the
     # 2026-08-21 worklog entry (a TDM run wedged with ptrace unavailable).
     import faulthandler
@@ -433,6 +460,43 @@ def train(cfg: dict, config_path: str):
     )
     n_slots = dataset.n_slots
     slot_names = list(dataset.slot_names)
+    if cfg.get("strict_bank_resume"):
+        resume_path = cfg.get("bank_checkpoint")
+        if not resume_path:
+            raise ValueError("strict_bank_resume requires bank_checkpoint")
+        with open(resume_path + ".json") as f:
+            resume_meta = json.load(f)
+        if (resume_meta["slot_names"] != slot_names
+                or resume_meta["bank_checkpoint"] != os.path.basename(resume_path)
+                or resume_meta["rank"] != cfg["lora_rank"]
+                or resume_meta["alpha"] != cfg["lora_alpha"]):
+            raise ValueError("Resume checkpoint metadata does not match config/dataset")
+        if resume_meta["slot_steps"] != cfg.get("continuation_initial_slot_steps"):
+            raise ValueError("Resume artist counters do not match continuation manifest")
+    min_slot_steps = int(cfg.get("min_slot_steps", 0))
+    if min_slot_steps < 0:
+        raise ValueError("min_slot_steps must be nonnegative")
+    if min_slot_steps and cfg.get("slot_allowlist") != slot_names:
+        if cfg.get("slot_allowlist") is not None:
+            raise ValueError("Requested artist vocabulary was not fully loaded")
+    if min_slot_steps and any(n == 0 for n in dataset.slot_counts):
+        raise ValueError("Cannot meet min_slot_steps: an artist has no usable images")
+    if cfg.get("smoke_all_buckets", False):
+        # Exercise every shape with full packing, largest area first. This is
+        # a disposable memory test, never the production training order.
+        buckets = sorted({p["bucket"] for p in dataset.batches},
+                         key=lambda b: b[0] * b[1], reverse=True)
+        dataset.batches = [max((p for p in dataset.batches if p["bucket"] == b),
+                              key=lambda p: len(p["slots"])) for b in buckets]
+        cfg["max_steps"] = len(dataset.batches)
+        print(f"Memory smoke buckets: {buckets}")
+    plan_counts = [0] * n_slots
+    for plan in dataset.batches:
+        for slot in plan["slots"]:
+            plan_counts[slot] += 1
+    if min_slot_steps and min(plan_counts) == 0:
+        raise ValueError("Step plan starves an artist; increase steps_per_epoch")
+    print(f"Plan updates per artist: {min(plan_counts)}..{max(plan_counts)}")
     train_loader = DataLoader(
         dataset,
         batch_size=1,
@@ -446,6 +510,15 @@ def train(cfg: dict, config_path: str):
     # ------------------------------------------------------------------
     # VAE — one resident replica per GPU (small)
     # ------------------------------------------------------------------
+    # Concurrent 51 GB fp32 base loads + bank injection can trigger host
+    # reclaim/swap storms even when the steady-state banks fit comfortably.
+    # Serialize initialization only; release before the training loop.
+    init_lock = None
+    if cfg.get("initialization_lock"):
+        import fcntl
+        init_lock = open(cfg["initialization_lock"], "a")
+        print("Waiting for shared model-initialization lock...", flush=True)
+        fcntl.flock(init_lock, fcntl.LOCK_EX)
     print("Loading VAE...")
     base_ae = QwenAutoencoder()
     base_ae.ae = base_ae.ae.to(dtype).eval().requires_grad_(False)
@@ -527,7 +600,10 @@ def train(cfg: dict, config_path: str):
         for p in dit.parameters():
             nn.init.normal_(p.data, std=0.02)
 
-    inject_lora_bank(
+    if sparse and cfg.get("sparse_checkpoint"):
+        dit = dit.to(dtype)
+        sparse_peft.apply_adapter(dit, cfg["sparse_checkpoint"])
+    inject_adapter(
         dit, n_slots=n_slots, rank=lora_rank, alpha=lora_alpha,
         exclude_prefixes=bank_exclude_prefixes,
         exclude_patterns=bank_exclude_patterns,
@@ -538,7 +614,7 @@ def train(cfg: dict, config_path: str):
         # fp32 bank masters next to a bf16 base: RamTorch relocates and streams
         # parameters one at a time, so mixed dtypes inside a chunk are fine,
         # and autocast casts the bank down for the bmm anyway.
-        for p in bank_parameters(dit):
+        for p in adapter_parameters(dit):
             p.data = p.data.to(bank_dtype)
 
     if bank_ckpt_cfg:
@@ -554,21 +630,29 @@ def train(cfg: dict, config_path: str):
         if unexpected:
             print(f"  [warn] {len(unexpected)} unexpected keys: {unexpected[:3]} ...")
         still_missing = [k for k in bank_keys if k not in sd]
+        if cfg.get("strict_bank_resume") and (still_missing or unexpected):
+            raise ValueError(f"Incomplete bank resume: missing={still_missing}, unexpected={unexpected}")
         print(f"  Loaded {len(sd)} tensors ({len(still_missing)} bank tensors "
               f"left at init).")
 
-    budget = bank_budget(dit)
+    budget = adapter_budget(dit)
     print(f"  Bank: {budget['modules']} adapted Linears, rank {lora_rank}, "
           f"alpha {lora_alpha}")
-    print("  " + bank_bytes_report(
-        n_slots, budget["params_per_slot"], bank_dtype, state_dtype,
-        state_on_host=(bank_state_device == "cpu"),
-    ))
+    if sparse:
+        print("  Sparse: compact FP32 masters/moments on CPU; dense transient weight gradients.")
+        print(f"  Calibration mode: {cfg.get('sparse_calibration', 'dense')} "
+              "(inflight retains sparse GPU candidates; dense retains full CPU scores).")
+    else:
+        print("  " + bank_bytes_report(
+            n_slots, budget["params_per_slot"], bank_dtype, state_dtype,
+            state_on_host=(bank_state_device == "cpu"),
+        ))
     frozen = sum(
         p.numel() for p in dit.parameters()
     ) - budget["params_total"]
-    print(f"  Frozen by exclusion: {frozen/1e6:.1f}M params (shared norms / "
-          f"modulation — training them would mix the slots).")
+    if not sparse:
+        print(f"  Frozen by exclusion: {frozen/1e6:.1f}M params (shared norms / "
+              f"modulation — training them would mix the slots).")
 
     # ------------------------------------------------------------------
     # DiT chunks -> Pipeline
@@ -611,6 +695,8 @@ def train(cfg: dict, config_path: str):
     )
     set_resident_out_no_grad(dit_pipe, (3,))   # the relayed RoPE table
     allow_tuple_infer(dit_pipe)                # preview() goes through infer()
+    if sparse:
+        sparse_peft.release_accumulators(dit_pipe)
 
     # ------------------------------------------------------------------
     # Optimizer — bank rows only, per-slot step counts
@@ -622,30 +708,88 @@ def train(cfg: dict, config_path: str):
 
     # Captured AFTER Pipeline construction: under offload the masters have been
     # relocated to CPU pinned memory, which is where the optimizer must run.
-    bank_params = bank_parameters(dit)
+    bank_params = adapter_parameters(dit)
     tags.build_optimizer(dit, warmup=warmup_steps, own_dense=True)
-    opt = BankAdamW(
-        bank_params, n_slots=n_slots, lr=lr, betas=(0.9, 0.95),
+    optimizer_cls = BankAdamW
+    optimizer_args = {}
+    if sparse:
+        optimizer_cls = sparse_peft.SparseAdam
+        optimizer_args = dict(n_microbatches=n_mb, max_grad_norm=max_grad_norm)
+    opt = optimizer_cls(
+        dit if sparse else bank_params, n_slots=n_slots, lr=lr, betas=(0.9, 0.95),
         weight_decay=weight_decay, warmup=warmup_steps, state_dtype=state_dtype,
-        state_device=bank_state_device,
+        state_device=bank_state_device, **optimizer_args,
     )
-    print(f"  Optimizer: BankAdamW over {len(bank_params)} bank tensors "
+    print(f"  Optimizer: {optimizer_cls.__name__} over {budget['params_per_slot']:,} scalars/slot "
           f"(warmup {warmup_steps} per-slot steps, wd={weight_decay}"
           f"{', state on HOST' if opt.offloaded else ''}).")
+    resume_state = None
+    if cfg.get("peft_training_state"):
+        if not cfg.get("paired_step_rng") or cfg.get("evaluation_only"):
+            raise ValueError("PEFT state resume requires paired_step_rng training")
+        resume_state = torch.load(cfg["peft_training_state"], map_location="cpu", weights_only=True)
+        if (resume_state["method"] != cfg.get("peft_method", "lora") or
+                resume_state["seed"] != cfg.get("seed", 42) or resume_state["slots"] != slot_names):
+            raise ValueError("Resume method/seed/slots mismatch")
+        if sparse:
+            if opt.calibration:
+                raise ValueError("Calibration is restarted, not resumed")
+            if len(resume_state["masters"]) != len(opt.params):
+                raise ValueError("Resume compact master coverage mismatch")
+            opt.opt.load_state_dict(resume_state["optimizer"])
+            for (_, m), p, value in zip(sparse_peft.modules(dit), opt.params, resume_state["masters"]):
+                p.data.copy_(value)
+                with torch.no_grad():
+                    m.weight.flatten().index_copy_(0, m.store.indices.to(m.weight.device), p.to(m.weight))
+            opt.slot_steps = resume_state["slot_steps"]
+        else:
+            if not bank_ckpt_cfg:
+                raise ValueError("LoRA state resume also requires bank_checkpoint")
+            if len(resume_state["optimizer"]) != len(bank_params):
+                raise ValueError("Resume optimizer coverage mismatch")
+            for p, state in zip(bank_params, resume_state["optimizer"]):
+                for key, value in state.items():
+                    opt.state[p][key].copy_(value)
+            opt.load_slot_step_counts(resume_state["slot_steps"])
+    frozen_hashes = None
+    if cfg.get("paired_step_rng") and not sparse:
+        import hashlib
+        def hash_frozen():
+            result = {}
+            for name, tensor in dit.state_dict().items():
+                if name.endswith((".lora_A_bank", ".lora_B_bank")):
+                    continue
+                raw = tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy()
+                result[name] = hashlib.sha256(memoryview(raw)).hexdigest()
+            return result
+        frozen_hashes = hash_frozen()
+    if init_lock is not None:
+        init_lock.close()
+        print("Model initialization complete; released shared lock.", flush=True)
 
     # ------------------------------------------------------------------
     # Checkpoint save
     # ------------------------------------------------------------------
     def _save_checkpoint(path: str):
-        sd = dict(bank_state_dict(dit))
+        if frozen_hashes is not None and hash_frozen() != frozen_hashes:
+            raise AssertionError("LoRA base weights changed")
+        sd = opt.state_dict() if sparse else dict(bank_state_dict(dit))
         if tags.enabled and dit.tagembed is not None:
             # bank_state_dict selects slot-shaped tensors only, so the shared
             # tag table has to be added by hand or it is silently not saved.
             sd.update({f"tagembed.{k}": v
                        for k, v in dit.tagembed.state_dict().items()})
         sd = {k: v.detach().cpu().contiguous() for k, v in sd.items()}
-        save_file(sd, path)
+        save_file(sd, path + ".tmp")
+        os.replace(path + ".tmp", path)
         meta = {
+            "peft_method": "sparse" if sparse else "lora",
+            "base_checkpoint": mmdit_ckpt,
+            "seed": cfg.get("seed", 42),
+            "trainable_scalars": budget["params_per_slot"],
+            "sparse_calibration": cfg.get("sparse_calibration", "dense") if sparse else None,
+            "sparse_candidate_multiplier": cfg.get("sparse_candidate_multiplier", 2) if sparse else None,
+            "frozen_weights_verified": bool(sparse or frozen_hashes is not None),
             "slot_names": slot_names,
             "slot_steps": opt.slot_step_counts(),
             "slot_samples": list(dataset.slot_counts),
@@ -654,13 +798,41 @@ def train(cfg: dict, config_path: str):
             "alpha": lora_alpha,
             "group_column": cfg["group_column"],
             "bank_checkpoint": os.path.basename(path),
+            "min_slot_steps": min_slot_steps,
         }
-        with open(os.path.join(cfg["ckpt_path"], "slots.json"), "w") as f:
+        # Keep checkpoint-specific metadata: slots.json alone describes only
+        # the newest checkpoint and is unsafe for resuming an older one.
+        with open(path + ".json.tmp", "w") as f:
             json.dump(meta, f, indent=2)
+        os.replace(path + ".json.tmp", path + ".json")
+        slots_path = os.path.join(cfg["ckpt_path"], "slots.json")
+        with open(slots_path + ".tmp", "w") as f:
+            json.dump(meta, f, indent=2)
+        os.replace(slots_path + ".tmp", slots_path)
+        if cfg.get("paired_step_rng") and not cfg.get("evaluation_only") and not (sparse and opt.calibration):
+            state = dict(method=cfg.get("peft_method", "lora"), seed=cfg.get("seed", 42),
+                         slots=slot_names, slot_steps=opt.slot_step_counts(),
+                         completed_updates=opt.slot_step_counts()[0],
+                         optimizer=(opt.opt.state_dict() if sparse else
+                                    [{k:v.cpu() for k,v in opt.state[p].items()} for p in bank_params]),
+                         masters=([p.detach().cpu() for p in opt.params] if sparse else []),
+                         torch_rng=torch.get_rng_state(), cuda_rng=torch.cuda.get_rng_state_all())
+            torch.save(state, path + ".state.pt.tmp")
+            os.replace(path + ".state.pt.tmp", path + ".state.pt")
+        keep = int(cfg.get("keep_last_checkpoints", 0))
+        if keep > 0:
+            from pathlib import Path
+            checkpoints = sorted(Path(cfg["ckpt_path"]).glob("bank_step_*.safetensors"),
+                                 key=lambda p: p.stat().st_mtime_ns)
+            for old in checkpoints[:-keep]:
+                old.unlink()
+                Path(str(old) + ".json").unlink(missing_ok=True)
         print(f"[ckpt] Saved {len(sd)} bank tensors -> {path}")
 
-    if bank_ckpt_cfg:
-        slots_json = os.path.join(os.path.dirname(bank_ckpt_cfg), "slots.json")
+    if bank_ckpt_cfg and resume_state is None:
+        slots_json = bank_ckpt_cfg + ".json"
+        if not os.path.exists(slots_json):
+            slots_json = os.path.join(os.path.dirname(bank_ckpt_cfg), "slots.json")
         if os.path.exists(slots_json):
             with open(slots_json) as f:
                 meta = json.load(f)
@@ -675,7 +847,8 @@ def train(cfg: dict, config_path: str):
     # ------------------------------------------------------------------
     # Training config
     # ------------------------------------------------------------------
-    global_step = cfg.get("initial_global_step", 0)
+    global_step = resume_state["completed_updates"] if resume_state else cfg.get("initial_global_step", 0)
+    replay_remaining = global_step if resume_state else 0
     eval_interval = cfg.get("eval_interval", 200)
     save_every = cfg.get("save_every_n_steps", 1000)
     save_final = cfg.get("save_final", True)
@@ -731,6 +904,7 @@ def train(cfg: dict, config_path: str):
     t0 = time.time()
 
     phase_s = dict(data=0.0, fwdbwd=0.0, flush=0.0, clip=0.0, opt=0.0)
+    evaluation_losses = []
 
     def _finish(tag: str):
         tot = sum(phase_s.values()) or 1.0
@@ -753,6 +927,23 @@ def train(cfg: dict, config_path: str):
             _save_checkpoint(os.path.join(
                 cfg["ckpt_path"], f"bank_step_{global_step}_{tag}.safetensors",
             ))
+        report = {
+            "evaluation_loss": (sum(evaluation_losses) / len(evaluation_losses)
+                                if evaluation_losses else None),
+            "evaluation_batches": len(evaluation_losses),
+            "reason": tag, "global_step": global_step,
+            "slot_steps_min": min(steps_done), "slot_steps_max": max(steps_done),
+            "target_met": bool(min_slot_steps and min(steps_done) >= min_slot_steps),
+            "peak_allocated_gib": {d: torch.cuda.max_memory_allocated(d) / 2**30
+                                   for d in devices},
+            "peak_reserved_gib": {d: torch.cuda.max_memory_reserved(d) / 2**30
+                                  for d in devices},
+            "total_gib": {d: torch.cuda.get_device_properties(d).total_memory / 2**30
+                          for d in devices},
+            "phase_seconds": phase_s,
+        }
+        with open(os.path.join(cfg["ckpt_path"], "result.json"), "w") as f:
+            json.dump(report, f, indent=2)
         csv_file.close()
         slot_csv_file.close()
         dit_pipe.close()
@@ -775,7 +966,15 @@ def train(cfg: dict, config_path: str):
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         _t_data = time.perf_counter()
         for batch_data in pbar:
+            if replay_remaining:
+                # Replay the identical seeded dataloader visits, including the
+                # caption draws; per-step torch RNG is independently keyed.
+                replay_remaining -= 1
+                continue
             batch = batch_data[0]          # dummy_collate_fn wraps in a list
+            if cfg.get("paired_step_rng"):
+                # Preview/model initialization must not shift subsequent noise.
+                torch.manual_seed(master_seed * 1000003 + global_step)
             images = batch["images"]
             captions = batch["captions"]
             slots = batch["slots"]
@@ -812,6 +1011,13 @@ def train(cfg: dict, config_path: str):
                 img_seq_len, x1_res, x2_res, mu_y1, mu_y2
             )
             t = sample_timesteps(B, device=driver, mu=mu, sigma=mu_sigma)  # [B]
+            if cfg.get("paired_step_rng"):
+                import hashlib
+                digest = hashlib.sha256(json.dumps(dropped).encode())
+                for tensor in (images, x0_clean, x0_noise, t, *txt_mbs):
+                    digest.update(tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes())
+                with open(os.path.join(cfg["ckpt_path"], "input_hashes.jsonl"), "a") as f:
+                    f.write(json.dumps(dict(step=global_step, sha256=digest.hexdigest())) + "\n")
 
             # ---------- Flow-matching interpolation + patchify ---------------
             t4 = t[:, None, None, None].to(x0_clean.dtype)
@@ -831,7 +1037,7 @@ def train(cfg: dict, config_path: str):
             # Every microbatch carries the same S slots in the same order, so
             # the bank's active-slot state is per STEP and cannot race the
             # in-flight microbatches of the 1b1f schedule.
-            set_active_slots(dit, slots)
+            activate(dit, slots)
             if taglen:
                 tagid_mbs = tag_ids.chunk(n_mb)
                 tagmask_mbs = tag_mask.chunk(n_mb)
@@ -852,26 +1058,46 @@ def train(cfg: dict, config_path: str):
             _t = time.perf_counter()
             phase_s["data"] += _t - _t_data
 
-            result = dit_pipe.step(
-                nested,
-                targets=v_target,
-                schedule=schedule,
-                n_microbatches=n_mb,
-                loss_fn=loss_fn,
-            )
+            if cfg.get("evaluation_only"):
+                from types import SimpleNamespace
+                with torch.no_grad():
+                    outs = dit_pipe.infer(nested, n_microbatches=n_mb)
+                    losses = [loss_fn(out, target) for out, target in zip(outs, v_target.chunk(n_mb))]
+                    result = SimpleNamespace(loss=torch.stack(losses).mean())
+                evaluation_losses.append(float(result.loss))
+            else:
+                result = dit_pipe.step(
+                    nested,
+                    targets=v_target,
+                    schedule=schedule,
+                    n_microbatches=n_mb,
+                    loss_fn=loss_fn,
+                )
+            if not torch.isfinite(result.loss).all():
+                raise FloatingPointError(f"Non-finite loss at step {global_step}")
             _t, _prev = time.perf_counter(), _t
             phase_s["fwdbwd"] += _t - _prev
 
             # ---------- Optimizer ---------------------------------------------
-            flush_grads(dit_pipe, n_mb)
+            if not sparse and not cfg.get("evaluation_only"):
+                flush_grads(dit_pipe, n_mb)
             _t, _prev = time.perf_counter(), _t
             phase_s["flush"] += _t - _prev
 
-            grad_norms = clip_bank_grads_per_slot(bank_params, max_grad_norm, slots)
+            grad_norms = (torch.zeros(S) if cfg.get("evaluation_only") else opt.collect() if sparse else
+                          clip_bank_grads_per_slot(bank_params, max_grad_norm, slots))
+            if sparse and opt.calibration and cfg.get("sparse_calibration") == "inflight":
+                nnz = sum(m.store.score._nnz() for _, m in sparse_peft.modules(dit))
+                print(f"[Inflight] step {global_step + 1}: {nnz:,} historical candidates, "
+                      f"~{nnz * 12 / 2**30:.3f} GiB index/value storage", flush=True)
             _t, _prev = time.perf_counter(), _t
             phase_s["clip"] += _t - _prev
 
-            opt.step(slots)
+            if not cfg.get("evaluation_only"):
+                opt.step(slots)
+            if sparse and offload and not cfg.get("evaluation_only"):
+                # Flush invalidates streamed GPU weights even with empty grads.
+                flush_grads(dit_pipe, n_mb)
             tags.step(tag_ids, tag_mask)   # before zero_grads: reads .grad
             zero_grads(dit_pipe)
             _t, _prev = time.perf_counter(), _t
@@ -900,6 +1126,17 @@ def train(cfg: dict, config_path: str):
             if global_step % log_every == 0:
                 csv_file.flush()
                 slot_csv_file.flush()
+                if min_slot_steps:
+                    counts = opt.slot_step_counts()
+                    progress = {"completed_updates": global_step + 1,
+                                "slot_steps_min": min(counts), "slot_steps_max": max(counts),
+                                "artists_at_target": sum(n >= min_slot_steps for n in counts),
+                                "artists": n_slots, "target": min_slot_steps,
+                                "loss": loss_val, "elapsed_seconds": time.time() - t0}
+                    progress_path = os.path.join(cfg["ckpt_path"], "progress.json")
+                    with open(progress_path + ".tmp", "w") as f:
+                        json.dump(progress, f, indent=2)
+                    os.replace(progress_path + ".tmp", progress_path)
 
             # ---------- Step checkpoint --------------------------------------
             if save_every > 0 and global_step > 0 and global_step % save_every == 0:
@@ -917,7 +1154,7 @@ def train(cfg: dict, config_path: str):
                     mb * S * per_slot_batch + pos_in_step * per_slot_batch + j
                     for mb in range(n_mb) for j in range(per_slot_batch)
                 ][:preview_n]
-                set_active_slots(dit, [slot])
+                activate(dit, [slot])
                 # Previews show the untouched captions, so they get the
                 # untouched tags rather than this step's dropped-out ones.
                 pv_ids, pv_mask = tags.undropped()
@@ -955,9 +1192,15 @@ def train(cfg: dict, config_path: str):
                 torch.cuda.empty_cache()
 
             global_step += 1
+            if min_slot_steps and min(opt.slot_step_counts()) >= min_slot_steps:
+                print(f"Every artist reached at least {min_slot_steps} updates.")
+                _finish("complete")
+                return
             if max_steps > 0 and global_step >= max_steps:
                 print(f"Reached max_steps={max_steps}. Saving final bank.")
                 _finish("final")
+                if min_slot_steps:
+                    raise RuntimeError("Safety max_steps reached before every artist met min_slot_steps")
                 return
 
             _t_data = time.perf_counter()

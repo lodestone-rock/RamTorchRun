@@ -1,7 +1,7 @@
 {
   "_comment": "Krea-2 (K2) MASS-LoRA: train many per-concept adapters at once off ONE frozen base. See krea2/train_mass_lora.py. Every nn.Linear carries a BANK of n_slots adapters ([L, rank, in]); each step packs S slots' samples contiguously on dim 0 and a grouped bmm routes them, so slot i's gradient only touches adapter i. Slots ROTATE: only slots_per_step of them train per step, so cost is independent of how many adapters you are training. 'parallelism' works exactly as in train.py; there is no 'mode' (a bank is always LoRA).",
-  "seed": 42,
-  "initial_global_step": 2700,
+  "seed": 44,
+  "initial_global_step": 6100,
   "_comment_topology": "parallelism 'pipeline' = N GPUs, resident weights. Switch to 'pipeline-offload' if the bank pushes a stage over its GPU, or 'offload' for a single GPU. chunks_per_stage overrides the automatic split (balanced by WEIGHT BYTES; the bank makes block chunks heavier, which the balancer already accounts for).",
   "parallelism": "pipeline",
   "devices": [
@@ -320,7 +320,7 @@
   "encoder_model_id": "Qwen/Qwen3-VL-4B-Instruct",
   "_comment_ckpt": "Path to the K2 DiT base weights (safetensors). See checkpoints/README.md. bank_checkpoint resumes a mass run; its sibling slots.json restores the per-slot step counts.",
   "mmdit_checkpoint": "/mnt/datapool_u2/lodestone/RamTorchRun/x0-pred/runs/krea2-fullft/ckpts/full_step_49600.safetensors",
-  "bank_checkpoint": "runs/k2-mass-lora-v2-danbooru/ckpts/bank_step_2700.safetensors",
+  "bank_checkpoint": "runs/k2-mass-lora-v2-danbooru/ckpts/bank_step_6100.safetensors",
   "parquet_dataloader": {
     "parquet_sources": {
       "danbooru": {

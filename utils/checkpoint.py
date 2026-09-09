@@ -126,11 +126,14 @@ def merge_lora_into_base_sd(
 
     overridden = 0
     for k in other_keys:
-        if k in base_sd and base_sd[k].shape != lora_sd[k].shape:
+        # LoRALinear stores the frozen bias as a `base_bias` buffer; in a
+        # plain DiT state dict that tensor lives under `.bias`.
+        k_dst = (k[: -len(".base_bias")] + ".bias") if k.endswith(".base_bias") else k
+        if k_dst in base_sd and base_sd[k_dst].shape != lora_sd[k].shape:
             print(f"[merge] [warn] shape mismatch on override {k}: "
-                  f"base {base_sd[k].shape} vs lora {lora_sd[k].shape}; skipping")
+                  f"base {base_sd[k_dst].shape} vs lora {lora_sd[k].shape}; skipping")
             continue
-        base_sd[k] = lora_sd[k].clone()
+        base_sd[k_dst] = lora_sd[k].clone()
         overridden += 1
 
     if missing_base:

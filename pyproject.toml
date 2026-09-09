@@ -5,6 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
     "diffusers>=0.39.0",
     "einops>=0.8.2",
+    "imageio-ffmpeg>=0.6.0",
     "numpy>=2.5.2",
     "opencv-python>=5.0.0.93",
     "pandas>=3.0.5",

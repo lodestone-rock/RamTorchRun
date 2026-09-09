@@ -25,6 +25,35 @@ NOTE the two independent axes: ``mode`` is the fine-tuning target
     ``optimizer: "offload-adamw"`` instead shards RamTorch's `OffloadAdamW`
     one-per-stage, so each GPU streams and updates the chunks it owns over its
     own PCIe link rather than the host doing a single pass over all the state.
+    ``optimizer: "lion"`` opts into standalone, unfused Lion for full or LoRA
+    training, resident or streamed CPU masters, with no matrix restriction.
+    Optional ``lion: {"betas": [0.9, 0.99]}``; top-level lr is used literally
+    (default 1e-5 for Lion only), as is weight_decay (default 1e-4). Neither is
+    automatically rescaled. Existing warmup applies; tag tables keep RowAdamW.
+    One momentum buffer plus one per-parameter temporary; no fused speed claim.
+    ``optimizer: "muon"`` is opt-in, native PyTorch, and requires resident
+    ``parallelism: "pipeline"`` + ``mode: "full"`` (not LoRA or streaming).
+    Hidden attention/MLP Linear weights in ``blocks`` and
+    ``txtfusion.{layerwise_blocks,refiner_blocks}`` use Muon; inputs/outputs,
+    text/time/tag conditioning, the text-fusion layer projector, biases, norms
+    and other parameters use AdamW with betas (0.9, 0.95). TagTrainer keeps its
+    table on RowAdamW. Optimizers are sharded by actual resident device.
+    Optional ``muon`` object: ``momentum`` in [0,1) (0.95), ``nesterov`` bool
+    (true), ``ns_steps`` integer 1–99 (5), ``adjust_lr_fn`` ("match_rms_adamw"
+    by default, or "original" / null), ``adamw_lr`` (defaults to top-level lr),
+    ``exclude_prefixes`` (default []: dotted module/parameter names routed to
+    AdamW; exact or dot-descendant match, no wildcards). Both use top-level
+    weight_decay and the same warmup multiplier, preserving their LR ratio.
+    Muon uses top-level lr, RMS-matched to AdamW by default; no new dependencies.
+    Options are checked before device setup/weights; checkpoint saves remain
+    weight-only, so optimizer moments and scheduler state do not resume.
+
+Opt-in ``compile: true`` compiles only DiT/text-fusion transformer blocks and
+executed frozen encoder decoder layers, lazily after resident placement. An
+object may select ``dit``/``encoder`` (both default true), ``backend`` (inductor,
+eager, aot_eager), ``mode`` (default only), ``dynamic`` (true), ``fullgraph``
+(false). CUDA graphs are disabled; chunks, projections, heads and VAE stay eager.
+Only resident ``parallelism: "pipeline"`` is supported. See ``krea2/compile.py``.
 
 Canonical RamTorch loop (see RamTorch/docs/pipeline_parallel.md):
 
@@ -33,8 +62,18 @@ Canonical RamTorch loop (see RamTorch/docs/pipeline_parallel.md):
     opt.step()
     <zero accumulators>
 
-Effective batch size = batch_size * n_microbatches (microbatches play the
-role of gradient accumulation in every mode).
+Legacy effective batch size = batch_size * n_microbatches (microbatches play
+the role of gradient accumulation in every mode).
+
+Opt-in top-level ``resolution_batching`` uses the shared dataloader config:
+its fixed effective batch and resolution-specific microbatch sizes override
+legacy batching/base-resolution knobs. Each step's trailing ``step_plan``
+metadata selects M; all encodes, model calls and gradient averaging use that
+step's M. VAE calls and preview microbatches are bounded by its microbatch size.
+``preview_samples`` defaults to 4; an integer requests that many samples (up to
+this step's batch), or ``"microbatches"`` requests the current step's M samples.
+``parquet_dataloader.data_epoch`` selects the initial plan epoch; the loader
+applies ``offset`` only to that epoch, then replans before each new iterator.
 
 Gotcha: ``grad_ckpt`` (per-block torch.utils.checkpoint inside a chunk) works
 only with resident stages — under the offload engine a bare checkpoint
@@ -86,6 +125,9 @@ except ImportError:
 from ramtorch import Pipeline
 
 from krea2.model.mmdit import SingleStreamDiT
+from krea2.muon import build_muon_optimizer, validate_muon_config
+from krea2.lion import Lion, validate_lion_config
+from krea2.compile import compile_transformer_blocks, validate_compile_config
 from krea2.model.autoencoder import QwenAutoencoder
 from krea2.model.sampling import prepare, timesteps as k2_timesteps
 from krea2.model.lora import inject_lora, lora_state_dict, trainable_param_count
@@ -116,6 +158,10 @@ from utils.ramtorch_helpers import (
 )
 
 from dataloaders.parquet_dataloader import ParquetTextImageDataset
+from dataloaders.resolution_batching import (
+    get_step_batching, resolution_batching_kwargs, resolution_batching_summary,
+    validate_resolution_alignment,
+)
 
 from krea2.train_utils import (
     TagTrainer,
@@ -172,10 +218,20 @@ def resolve_topology(cfg: dict) -> tuple[str, list[str], bool]:
 # ---------------------------------------------------------------------------
 
 def parallel_vae_encode(
-    aes: dict, devices: list[str], pixels: torch.Tensor, out_device: str
+    aes: dict, devices: list[str], pixels: torch.Tensor, out_device: str,
+    max_batch_size: int | None = None,
 ) -> torch.Tensor:
-    """Encode a pixel batch chunk-parallel across per-GPU VAE replicas."""
-    if len(devices) == 1:
+    """Encode in device order, optionally bounding every VAE call's batch.
+
+    The bound applies inside each device slice, including single-device runs;
+    only each bounded pixel sub-batch is transferred to its VAE device.
+    """
+    if max_batch_size is not None and (
+        isinstance(max_batch_size, bool) or not isinstance(max_batch_size, int)
+        or max_batch_size < 1
+    ):
+        raise ValueError("max_batch_size must be a positive integer")
+    if len(devices) == 1 and max_batch_size is None:
         return vae_encode(aes[devices[0]], pixels.to(devices[0])).to(out_device)
 
     chunks = pixels.tensor_split(len(devices), dim=0)
@@ -184,11 +240,20 @@ def parallel_vae_encode(
         if chunks[i].shape[0] == 0:
             return None
         dev = devices[i]
-        lat = vae_encode(aes[dev], chunks[i].to(dev, non_blocking=True))
-        out = lat.to(out_device)
-        torch.cuda.synchronize(dev)
+        if max_batch_size is None:
+            lat = vae_encode(aes[dev], chunks[i].to(dev, non_blocking=True))
+            out = lat.to(out_device)
+        else:
+            out = torch.cat([
+                vae_encode(aes[dev], part.to(dev, non_blocking=True)).to(out_device)
+                for part in chunks[i].split(max_batch_size, dim=0)
+            ], dim=0)
+        if torch.device(dev).type == "cuda":
+            torch.cuda.synchronize(dev)
         return out
 
+    if len(devices) == 1:
+        return _enc(0)
     with ThreadPoolExecutor(max_workers=len(devices)) as ex:
         results = list(ex.map(_enc, range(len(devices))))
     return torch.cat([r for r in results if r is not None], dim=0)
@@ -198,26 +263,52 @@ def parallel_vae_encode(
 # Text encoding through the frozen encoder chunks
 # ---------------------------------------------------------------------------
 
+def _optional_positive_int(value, name):
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, int) or value < 1
+    ):
+        raise ValueError(f"{name} must be a positive integer or None")
+    return value
+
+
 def encode_captions(
     enc_pipe: Pipeline,
     tokenizer: K2CaptionTokenizer,
     captions: list[str],
     n_microbatches: int,
     out_device: str,
+    max_batch_size: int | None = None,
+    max_microbatches: int | None = None,
 ):
     """Tokenize + chunked encoder inference.
 
     Returns (txt_mbs, txtmask_mbs): per-microbatch lists of
     [b, Ltxt, n_select, 2560] hiddens and [b, Ltxt] bool masks, already sliced
     past the chat-template prefix (mirrors Qwen3VLConditioner.forward).
+    ``max_microbatches`` limits nested microbatches per inference call without
+    changing their sample sizes or the order of returned lists.
     """
+    _optional_positive_int(max_batch_size, "max_batch_size")
+    _optional_positive_int(max_microbatches, "max_microbatches")
+    if n_microbatches is None:
+        raise ValueError("n_microbatches must be a positive integer")
+    _optional_positive_int(n_microbatches, "n_microbatches")
     ids, mask = tokenizer(captions)
-    ids_mbs = ids.chunk(n_microbatches, dim=0)
-    mask_mbs = mask.chunk(n_microbatches, dim=0)
+    if max_batch_size is None:
+        ids_mbs = ids.chunk(n_microbatches, dim=0)
+        mask_mbs = mask.chunk(n_microbatches, dim=0)
+    else:
+        # split, not chunk: ragged preview tails must still obey the bound.
+        ids_mbs = ids.split(max_batch_size, dim=0)
+        mask_mbs = mask.split(max_batch_size, dim=0)
     nested = tuple(zip(ids_mbs, mask_mbs))
-    outs = enc_pipe.infer(nested, n_microbatches=len(nested))
+    group_size = max_microbatches or len(nested)
     p = tokenizer.prefix_idx
-    txt_mbs = [o[:, p:].to(out_device) for o in outs]
+    txt_mbs = []
+    for start in range(0, len(nested), group_size):
+        group = nested[start:start + group_size]
+        outs = enc_pipe.infer(group, n_microbatches=len(group))
+        txt_mbs.extend(o[:, p:].to(out_device) for o in outs)
     txtmask_mbs = [m[:, p:].to(out_device) for m in mask_mbs]
     return txt_mbs, txtmask_mbs
 
@@ -247,24 +338,46 @@ def preview(
     maxres: int = 1280,
     tag_ids: torch.Tensor | None = None,
     tag_mask: torch.Tensor | None = None,
+    max_batch_size: int | None = None,
+    max_microbatches: int | None = None,
 ) -> torch.Tensor:
-    """Euler+CFG sampling through the chunked DiT. Returns a float32 CPU tensor
-    [2*n, 3, H, W] in [-1, 1]: generated samples followed by decoded GT."""
+    """Euler+CFG sampling, with grouped microbatches per CFG pass.
+
+    ``max_batch_size`` bounds encoder/DiT microbatches and VAE decode calls;
+    None retains the legacy single-batch behavior for direct callers.
+    ``max_microbatches`` caps encoder/DiT microbatches per inference call;
+    None sends all microbatches in one call, regardless of training settings.
+    Returns float32 CPU [2*n, 3, H, W]: samples followed by decoded GT.
+    """
     device = x0_clean_latent.device
     n_samples = min(n_samples, x0_clean_latent.shape[0])
+    if n_samples < 1:
+        raise ValueError("preview requires at least one sample")
+    _optional_positive_int(max_batch_size, "max_batch_size")
+    _optional_positive_int(max_microbatches, "max_microbatches")
+    batch_bound = max_batch_size or n_samples
     x0_ref = x0_clean_latent[:n_samples]
     _, _, latent_h, latent_w = x0_ref.shape
 
-    gt_pixels = vae_decode(ae, x0_ref).clamp(-1, 1).cpu().float()
+    def decode_cpu(latents):
+        # Move each decoded chunk off-device before decoding the next one.
+        return torch.cat([
+            vae_decode(ae, part).clamp(-1, 1).cpu().float()
+            for part in latents.split(batch_bound, dim=0)
+        ], dim=0)
+
+    gt_pixels = decode_cpu(x0_ref)
 
     txt_mbs, txtmask_mbs = encode_captions(
-        enc_pipe, tokenizer, list(captions[:n_samples]), 1, device
+        enc_pipe, tokenizer, list(captions[:n_samples]), 1, device,
+        max_batch_size=batch_bound, max_microbatches=max_microbatches,
     )
     untxt_mbs, untxtmask_mbs = encode_captions(
-        enc_pipe, tokenizer, [""] * n_samples, 1, device
+        enc_pipe, tokenizer, [""] * n_samples, 1, device,
+        max_batch_size=batch_bound, max_microbatches=max_microbatches,
     )
-    txt, txtmask = txt_mbs[0], txtmask_mbs[0]
-    untxt, untxtmask = untxt_mbs[0], untxtmask_mbs[0]
+    txt, txtmask = torch.cat(txt_mbs), torch.cat(txtmask_mbs)
+    untxt, untxtmask = torch.cat(untxt_mbs), torch.cat(untxtmask_mbs)
 
     taglen = 0
     if tag_ids is not None:
@@ -287,7 +400,16 @@ def preview(
     x2_res = (maxres // (compression * patch)) ** 2
     ts = k2_timesteps(img_tok.shape[1], steps, x1_res, x2_res, y1=y1, y2=y2, mu=mu)
 
-    head_chunk.set_seq(txt.shape[1], img_tok.shape[1], taglen=taglen)
+    def infer_microbatches(inputs):
+        nested = tuple(zip(*(value.split(batch_bound, dim=0) for value in inputs)))
+        # Nested inputs return one output per microbatch, not a merged tensor.
+        group_size = max_microbatches or len(nested)
+        outputs = []
+        for start in range(0, len(nested), group_size):
+            group = nested[start:start + group_size]
+            outputs.extend(output.to(device) for output in
+                           dit_pipe.infer(group, n_microbatches=len(group)))
+        return torch.cat(outputs, dim=0)
 
     img = img_tok
     for tcurr, tprev in zip(ts[:-1], ts[1:]):
@@ -297,8 +419,10 @@ def preview(
         if taglen:
             cond_in += (tag_ids, tag_mask)
             uncond_in += (tag_ids, untag_mask)
-        cond = dit_pipe.infer(cond_in, n_microbatches=1).to(device)
-        uncond = dit_pipe.infer(uncond_in, n_microbatches=1).to(device)
+        head_chunk.set_seq(txt.shape[1], img_tok.shape[1], taglen=taglen)
+        cond = infer_microbatches(cond_in)
+        head_chunk.set_seq(untxt.shape[1], img_tok.shape[1], taglen=taglen)
+        uncond = infer_microbatches(uncond_in)
         v = uncond + cfg_scale * (cond - uncond)
         img = img + (tprev - tcurr) * v.to(img.dtype)
 
@@ -309,7 +433,7 @@ def preview(
         h=latent_h // patch,
         w=latent_w // patch,
     )
-    pixels_out = vae_decode(ae, latent).clamp(-1, 1).cpu().float()
+    pixels_out = decode_cpu(latent)
     return torch.cat([pixels_out, gt_pixels], dim=0)
 
 
@@ -318,10 +442,28 @@ def preview(
 # ---------------------------------------------------------------------------
 
 def train(cfg: dict, config_path: str):
+    preview_n_microbatches = _optional_positive_int(
+        cfg.get("preview_n_microbatches"), "preview_n_microbatches"
+    )
+    compile_options = validate_compile_config(cfg)
+    muon_options = validate_muon_config(cfg)
+    lion_options = validate_lion_config(cfg)
+    if lion_options is not None:
+        # Keep reporting and tag LR inheritance consistent without mutating the
+        # caller's config. Explicit LR is never rescaled.
+        cfg = {**cfg, "lr": lion_options["lr"]}
+    batching_kwargs = resolution_batching_kwargs(cfg)
+    resolution_batching = batching_kwargs.get("resolution_batching")
+    if resolution_batching is not None:
+        print(resolution_batching_summary(resolution_batching))
     _pin_sdpa_backends()
     parallelism, devices, offload = resolve_topology(cfg)
     n_stages = len(devices)
-    n_mb = cfg.get("n_microbatches", cfg.get("grad_accum", 4))
+    legacy_n_mb = (
+        1 if resolution_batching is not None
+        else cfg.get("n_microbatches", cfg.get("grad_accum", 4))
+    )
+    n_mb = legacy_n_mb
     schedule = cfg.get("schedule", "staggered_1b1f")
     driver = devices[0]
     print(f"[{parallelism}] {n_stages} device(s): {devices} | "
@@ -335,6 +477,9 @@ def train(cfg: dict, config_path: str):
     encoder_id   = cfg.get("encoder_model_id", "Qwen/Qwen3-VL-4B-Instruct")
     enc_cfg      = ENCODER_CONFIGS[cfg.get("encoder_config", "qwen3_vl_4b")]
     dit_cfg      = MMDIT_CONFIGS[cfg.get("mmdit_config", "large_wide")]
+    validate_resolution_alignment(
+        resolution_batching, cfg.get("parquet_dataloader", {}), 8 * dit_cfg.patch
+    )
 
     # Tag conditioning is off unless the config carries a `tag_embed` block, in
     # which case the DiT gains a tag table and the sequence gains a tag span.
@@ -382,10 +527,6 @@ def train(cfg: dict, config_path: str):
     # Optimizer knobs
     # ------------------------------------------------------------------
     optimizer_impl = cfg.get("optimizer", "adamw")
-    if optimizer_impl not in ("adamw", "offload-adamw"):
-        raise ValueError(
-            f"optimizer must be 'adamw' or 'offload-adamw', got {optimizer_impl!r}"
-        )
     opt_bucket_mb  = cfg.get("optimizer_bucket_mb", 32.0)
     opt_window     = cfg.get("optimizer_window", 2)
     opt_stochastic = cfg.get("optimizer_stochastic_rounding", False)
@@ -453,6 +594,7 @@ def train(cfg: dict, config_path: str):
     )
     drop_grad_accumulators(enc_pipe)
     allow_tuple_infer(enc_pipe)
+    compile_transformer_blocks(enc_chunks, compile_options, target="encoder")
     del qwen  # frees the vision tower / lm_head / unused layers
     n_enc = sum(p.numel() for c in enc_chunks for p in c.parameters())
     print(f"  Encoder ready ({n_enc/1e9:.2f}B params, {len(enc_chunks)} chunks "
@@ -575,11 +717,12 @@ def train(cfg: dict, config_path: str):
     )
     set_resident_out_no_grad(dit_pipe, (3,))   # the relayed RoPE table
     allow_tuple_infer(dit_pipe)                # preview() goes through infer()
+    compile_transformer_blocks(dit_chunks, compile_options, target="dit")
 
     # ------------------------------------------------------------------
     # Optimizer / scheduler (one optimizer across all stage devices)
     # ------------------------------------------------------------------
-    lr            = cfg.get("lr", 1e-4)
+    lr            = lion_options["lr"] if lion_options is not None else cfg.get("lr", 1e-4)
     weight_decay  = cfg.get("weight_decay", 1e-4)
     warmup_steps  = cfg.get("warmup", 200)
     max_grad_norm = cfg.get("max_grad_norm", 1.0)
@@ -590,7 +733,20 @@ def train(cfg: dict, config_path: str):
     # rest, so `trainable` below is what the main optimizer and the grad clip
     # should see.
     trainable = tags.build_optimizer(dit, warmup=cfg.get("warmup", 200))
-    if optimizer_impl == "offload-adamw":
+    if optimizer_impl == "muon":
+        opt = build_muon_optimizer(dit, trainable, muon_options)
+        summary = ", ".join(
+            f"{type(child).__name__}[{child.param_groups[0]['params'][0].device}]: "
+            f"{sum(p.numel() for g in child.param_groups for p in g['params']) / 1e6:.1f}M"
+            for child in opt.optimizers
+        )
+        print(f"  Optimizer: {summary}; Muon scaling={muon_options['adjust_lr_fn']!r}, "
+              f"lr={lr:g}, AdamW lr={muon_options['adamw_lr']:g}.")
+    elif optimizer_impl == "lion":
+        opt = Lion(trainable, **lion_options)
+        print(f"  Optimizer: Lion (unfused, tensor-local); lr={lr:g}, "
+              f"weight_decay={weight_decay:g}, betas={lion_options['betas']}.")
+    elif optimizer_impl == "offload-adamw":
         opt = build_offload_adamw(
             dit_chunks, counts, devices,
             lr=lr, weight_decay=weight_decay, betas=(0.9, 0.95),
@@ -649,9 +805,13 @@ def train(cfg: dict, config_path: str):
     if not parquet_cfg:
         raise RuntimeError("No 'parquet_dataloader' config found.")
 
-    global_batch = cfg["batch_size"] * n_mb
+    global_batch = (
+        resolution_batching["effective_batch_size"] if resolution_batching is not None
+        else cfg["batch_size"] * n_mb
+    )
     dataset = ParquetTextImageDataset(
         batch_size=global_batch,
+        **batching_kwargs,
         parquet_sources=parquet_cfg["parquet_sources"],
         caption_columns=parquet_cfg["caption_columns"],
         filename_column=parquet_cfg.get("filename_column", "url"),
@@ -757,6 +917,7 @@ def train(cfg: dict, config_path: str):
     # ------------------------------------------------------------------
     torch.manual_seed(master_seed)
     epoch = 0
+    data_epoch = batching_kwargs.get("data_epoch", 0)
 
     x1_res = (minres // (compression * patch)) ** 2
     x2_res = (maxres // (compression * patch)) ** 2
@@ -766,12 +927,20 @@ def train(cfg: dict, config_path: str):
         torch.manual_seed(master_seed + epoch)
         dit.train()
 
+        if resolution_batching is not None:
+            dataset.set_epoch(data_epoch)
+            data_epoch += 1
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         _t_data = time.perf_counter()
         for batch_data in pbar:
             batch_data = batch_data[0]          # dummy_collate_fn wraps in a list
             images, captions, _idx, _lw = batch_data[:4]
+            n_mb, microbatch_size, resolution = get_step_batching(
+                batch_data, resolution_batching, legacy_n_mb
+            )
+            max_batch_size = microbatch_size if resolution_batching is not None else None
             B = images.shape[0]
+            current_preview_n = min(n_mb if preview_n == "microbatches" else preview_n, B)
             if B < n_mb or B % n_mb != 0:
                 continue                        # partial tail batch — skip
 
@@ -788,7 +957,9 @@ def train(cfg: dict, config_path: str):
             tag_ids, tag_mask = tags.batch(batch_data, is_uncond, driver)
 
             # ---------- VAE encode -------------------------------------------
-            x0_clean = parallel_vae_encode(aes, devices, images, driver)
+            x0_clean = parallel_vae_encode(
+                aes, devices, images, driver, max_batch_size=max_batch_size
+            )
             x0_noise = torch.randn_like(x0_clean)
 
             # ---------- Resolution-aware timestep sampling -------------------
@@ -869,6 +1040,8 @@ def train(cfg: dict, config_path: str):
                 # below the vocabulary size means the corpus never uses those
                 # ids and min_count could be raised.
                 post["tagrows"] = tags.opt.rows_trained()
+            if resolution_batching is not None:
+                post.update(M=n_mb, microbatch=microbatch_size, resolution=resolution)
             pbar.set_postfix(**post)
 
             csv_writer.writerow([
@@ -894,12 +1067,14 @@ def train(cfg: dict, config_path: str):
                     x0_clean, list(captions),
                     steps=preview_steps,
                     cfg_scale=preview_cfg,
-                    n_samples=min(preview_n, B),
+                    n_samples=current_preview_n,
+                    max_batch_size=microbatch_size,
+                    max_microbatches=preview_n_microbatches,
                     mu=cfg.get("preview_mu", None),
                     y1=mu_y1, y2=mu_y2, minres=minres, maxres=maxres,
                     tag_ids=pv_ids, tag_mask=pv_mask,
                 )
-                grid = make_grid((rows + 1) / 2, nrow=min(preview_n, B))
+                grid = make_grid((rows + 1) / 2, nrow=current_preview_n)
                 ext = "png" if preview_quality >= 100 else "jpg"
                 img_path = f"{cfg['preview_path']}/step_{global_step}.{ext}"
                 if _PIL_AVAILABLE:

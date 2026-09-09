@@ -1,5 +1,13 @@
 """train_tdm.py — TDM few-step distillation for Radiance with role-based LoRA.
 
+Opt-in top-level ``resolution_batching`` follows the shared dataloader config:
+its fixed effective batch and resolution-specific microbatch sizes supersede
+legacy batching/base-resolution knobs. ``step_plan`` metadata selects each
+step's M for all rollout, teacher/fake/student calls and gradient averaging.
+Unconditional text is cached by (B, M); previews obey the microbatch cap.
+``parquet_dataloader.data_epoch`` starts epoch planning; ``offset`` applies
+only to that initial epoch. Without the block the legacy loop is unchanged.
+
 Trajectory Distribution Matching (arXiv:2503.06674) distills the Radiance
 teacher into a K-step deterministic student, data-free (captions only). The
 classic recipe needs THREE copies of the model — frozen teacher, trainable
@@ -116,6 +124,10 @@ from utils.ramtorch_helpers import (
 )
 
 from dataloaders.parquet_dataloader import ParquetTextImageDataset
+from dataloaders.resolution_batching import (
+    get_step_batching, resolution_batching_kwargs, resolution_batching_summary,
+    validate_resolution_alignment,
+)
 
 from radiance.train import (
     PARALLELISM,
@@ -235,6 +247,10 @@ def preview_tdm(
 # ---------------------------------------------------------------------------
 
 def train(cfg: dict, config_path: str):
+    batching_kwargs = resolution_batching_kwargs(cfg)
+    resolution_batching = batching_kwargs.get("resolution_batching")
+    if resolution_batching is not None:
+        print(resolution_batching_summary(resolution_batching))
     # `kill -USR1 <pid>` dumps every thread's stack to stderr — the only way
     # to see where a wedged run is stuck when ptrace (py-spy) is unavailable
     # (the 2026-08-21 chroma run hung at step ~409 with one stage spinning).
@@ -245,7 +261,11 @@ def train(cfg: dict, config_path: str):
     _pin_sdpa_backends()
     parallelism, devices, offload = resolve_topology(cfg)
     n_stages = len(devices)
-    n_mb = cfg.get("n_microbatches", cfg.get("grad_accum", 4))
+    legacy_n_mb = (
+        1 if resolution_batching is not None
+        else cfg.get("n_microbatches", cfg.get("grad_accum", 4))
+    )
+    n_mb = legacy_n_mb
     schedule = cfg.get("schedule", "staggered_1b1f")
     driver = devices[0]
     print(f"[tdm/{parallelism}] {n_stages} device(s): {devices} | "
@@ -261,6 +281,9 @@ def train(cfg: dict, config_path: str):
     dit_cfg = RADIANCE_CONFIGS[cfg.get("radiance_config", "radiance_x0_p16")]
     if cfg.get("txt_pos_ids"):
         dit_cfg = copy_params(dit_cfg, txt_pos_ids=cfg["txt_pos_ids"])
+    validate_resolution_alignment(
+        resolution_batching, cfg.get("parquet_dataloader", {}), dit_cfg.patch_size
+    )
 
     # ------------------------------------------------------------------
     # Chunking / offload knobs (same surface as radiance/train.py)
@@ -522,9 +545,13 @@ def train(cfg: dict, config_path: str):
     if not parquet_cfg:
         raise RuntimeError("No 'parquet_dataloader' config found.")
 
-    global_batch = cfg["batch_size"] * n_mb
+    global_batch = (
+        resolution_batching["effective_batch_size"] if resolution_batching is not None
+        else cfg["batch_size"] * n_mb
+    )
     dataset = ParquetTextImageDataset(
         batch_size=global_batch,
+        **batching_kwargs,
         parquet_sources=parquet_cfg["parquet_sources"],
         caption_columns=parquet_cfg["caption_columns"],
         filename_column=parquet_cfg.get("filename_column", "url"),
@@ -723,19 +750,29 @@ def train(cfg: dict, config_path: str):
     # ------------------------------------------------------------------
     torch.manual_seed(master_seed)
     epoch = 0
+    data_epoch = batching_kwargs.get("data_epoch", 0)
     untxt_cache: tuple | None = None   # uncond embeddings are batch-invariant
+    untxt_cache_key: tuple[int, int] | None = None
 
     while True:
         epoch += 1
         torch.manual_seed(master_seed + epoch)
         dit.train()
 
+        if resolution_batching is not None:
+            dataset.set_epoch(data_epoch)
+            data_epoch += 1
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         _t_data = time.perf_counter()
         for batch_data in pbar:
             batch_data = batch_data[0]
             images, captions, _idx, _lw = batch_data[:4]
+            n_mb, microbatch_size, resolution = get_step_batching(
+                batch_data, resolution_batching, legacy_n_mb
+            )
+            max_batch_size = microbatch_size if resolution_batching is not None else None
             B = images.shape[0]
+            current_preview_n = min(preview_n, B, max_batch_size or B)
             if B < n_mb or B % n_mb != 0:
                 continue
 
@@ -744,10 +781,11 @@ def train(cfg: dict, config_path: str):
                 enc_pipe, tokenizer, list(captions), n_mb, driver
             )
             txtlen = txt_mbs[0].shape[1]
-            if untxt_cache is None or untxt_cache[0][0].shape[0] * n_mb != B:
+            if untxt_cache is None or untxt_cache_key != (B, n_mb):
                 untxt_cache = encode_captions(
                     enc_pipe, tokenizer, [""] * B, n_mb, driver
                 )
+                untxt_cache_key = (B, n_mb)
             untxt_mbs, untxtmask_mbs = untxt_cache
 
             # ---------- Pixel geometry + K-step schedule ----------
@@ -873,8 +911,11 @@ def train(cfg: dict, config_path: str):
             phase_s["opt"] += _t - _prev
 
             lr_now = sched.get_last_lr()[0]
-            pbar.set_postfix(loss_g=f"{loss_g:.4f}", loss_d=f"{loss_d:.4f}",
-                             lr=f"{lr_now:.2e}", step=global_step)
+            post = dict(loss_g=f"{loss_g:.4f}", loss_d=f"{loss_d:.4f}",
+                        lr=f"{lr_now:.2e}", step=global_step)
+            if resolution_batching is not None:
+                post.update(M=n_mb, microbatch=microbatch_size, resolution=resolution)
+            pbar.set_postfix(**post)
             csv_writer.writerow([
                 global_step, f"{loss_g:.6f}", f"{loss_d:.6f}",
                 f"{lr_now:.2e}", f"{time.time() - t0:.1f}",
@@ -894,16 +935,16 @@ def train(cfg: dict, config_path: str):
             # ---------- Preview ----------
             if eval_interval > 0 and global_step % eval_interval == 0:
                 dit.eval()
-                gt = images[: min(preview_n, B)].to(driver, dtype=dtype)
+                gt = images[:current_preview_n].to(driver, dtype=dtype)
                 rows = preview_tdm(
                     dit_pipe, dit_chunks, dit, enc_pipe, tokenizer, patch,
                     gt, list(captions),
                     steps=tdm_steps,
-                    n_samples=min(preview_n, B),
+                    n_samples=current_preview_n,
                     mu=mu_override,
                     y1=mu_y1, y2=mu_y2, minres=minres, maxres=maxres,
                 )
-                grid = make_grid((rows + 1) / 2, nrow=min(preview_n, B))
+                grid = make_grid((rows + 1) / 2, nrow=current_preview_n)
                 ext = "png" if preview_quality >= 100 else "jpg"
                 img_path = f"{cfg['preview_path']}/step_{global_step}.{ext}"
                 if _PIL_AVAILABLE:

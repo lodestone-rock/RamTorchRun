@@ -49,8 +49,16 @@ Canonical RamTorch loop (see RamTorch/docs/pipeline_parallel.md):
     opt.step()
     <zero accumulators>
 
-Effective batch size = batch_size * n_microbatches (microbatches play the
-role of gradient accumulation in every mode).
+Legacy effective batch size = batch_size * n_microbatches (microbatches play
+the role of gradient accumulation in every mode).
+
+Opt-in top-level ``resolution_batching`` uses the shared dataloader config:
+its fixed effective batch and resolution-specific microbatch sizes override
+legacy batching/base-resolution knobs. Each step's trailing ``step_plan``
+metadata selects M; all encodes, model calls and gradient averaging use that
+step's M. Previews are bounded by its microbatch size (Radiance has no VAE).
+``parquet_dataloader.data_epoch`` selects the initial plan epoch; the loader
+applies ``offset`` only to that epoch, then replans before each new iterator.
 
 Gotcha: ``grad_ckpt`` (per-block torch.utils.checkpoint inside a chunk) works
 only with resident stages — under the offload engine a bare checkpoint
@@ -128,6 +136,10 @@ from utils.ramtorch_helpers import (
 )
 
 from dataloaders.parquet_dataloader import ParquetTextImageDataset
+from dataloaders.resolution_batching import (
+    get_step_batching, resolution_batching_kwargs, resolution_batching_summary,
+    validate_resolution_alignment,
+)
 
 from radiance.train_utils import (
     DEFAULT_FROZEN,
@@ -288,6 +300,10 @@ def preview(
 # ---------------------------------------------------------------------------
 
 def train(cfg: dict, config_path: str):
+    batching_kwargs = resolution_batching_kwargs(cfg)
+    resolution_batching = batching_kwargs.get("resolution_batching")
+    if resolution_batching is not None:
+        print(resolution_batching_summary(resolution_batching))
     # `kill -USR1 <pid>` dumps every thread's stack to stderr — see the
     # 2026-08-21 worklog entry (a TDM run wedged with ptrace unavailable).
     import faulthandler
@@ -297,7 +313,11 @@ def train(cfg: dict, config_path: str):
     _pin_sdpa_backends()
     parallelism, devices, offload = resolve_topology(cfg)
     n_stages = len(devices)
-    n_mb = cfg.get("n_microbatches", cfg.get("grad_accum", 4))
+    legacy_n_mb = (
+        1 if resolution_batching is not None
+        else cfg.get("n_microbatches", cfg.get("grad_accum", 4))
+    )
+    n_mb = legacy_n_mb
     schedule = cfg.get("schedule", "staggered_1b1f")
     driver = devices[0]
     print(f"[{parallelism}] {n_stages} device(s): {devices} | "
@@ -313,6 +333,9 @@ def train(cfg: dict, config_path: str):
     dit_cfg = RADIANCE_CONFIGS[cfg.get("radiance_config", "radiance_x0_p16")]
     if cfg.get("txt_pos_ids"):
         dit_cfg = copy_params(dit_cfg, txt_pos_ids=cfg["txt_pos_ids"])
+    validate_resolution_alignment(
+        resolution_batching, cfg.get("parquet_dataloader", {}), dit_cfg.patch_size
+    )
 
     # ------------------------------------------------------------------
     # Chunking / offload knobs
@@ -590,9 +613,13 @@ def train(cfg: dict, config_path: str):
     if not parquet_cfg:
         raise RuntimeError("No 'parquet_dataloader' config found.")
 
-    global_batch = cfg["batch_size"] * n_mb
+    global_batch = (
+        resolution_batching["effective_batch_size"] if resolution_batching is not None
+        else cfg["batch_size"] * n_mb
+    )
     dataset = ParquetTextImageDataset(
         batch_size=global_batch,
+        **batching_kwargs,
         parquet_sources=parquet_cfg["parquet_sources"],
         caption_columns=parquet_cfg["caption_columns"],
         filename_column=parquet_cfg.get("filename_column", "url"),
@@ -695,6 +722,7 @@ def train(cfg: dict, config_path: str):
     # ------------------------------------------------------------------
     torch.manual_seed(master_seed)
     epoch = 0
+    data_epoch = batching_kwargs.get("data_epoch", 0)
 
     x1_res = (minres // patch) ** 2
     x2_res = (maxres // patch) ** 2
@@ -704,12 +732,20 @@ def train(cfg: dict, config_path: str):
         torch.manual_seed(master_seed + epoch)
         dit.train()
 
+        if resolution_batching is not None:
+            dataset.set_epoch(data_epoch)
+            data_epoch += 1
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         _t_data = time.perf_counter()
         for batch_data in pbar:
             batch_data = batch_data[0]          # dummy_collate_fn wraps in a list
             images, captions, _idx, _lw = batch_data[:4]
+            n_mb, microbatch_size, resolution = get_step_batching(
+                batch_data, resolution_batching, legacy_n_mb
+            )
+            max_batch_size = microbatch_size if resolution_batching is not None else None
             B = images.shape[0]
+            current_preview_n = min(preview_n, B, max_batch_size or B)
             if B < n_mb or B % n_mb != 0:
                 continue                        # partial tail batch — skip
 
@@ -788,7 +824,10 @@ def train(cfg: dict, config_path: str):
 
             loss_val = result.loss.item()
             lr_now = sched.get_last_lr()[0]
-            pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{lr_now:.2e}", step=global_step)
+            post = dict(loss=f"{loss_val:.4f}", lr=f"{lr_now:.2e}", step=global_step)
+            if resolution_batching is not None:
+                post.update(M=n_mb, microbatch=microbatch_size, resolution=resolution)
+            pbar.set_postfix(**post)
 
             csv_writer.writerow([
                 global_step, f"{loss_val:.6f}", f"{lr_now:.2e}",
@@ -811,11 +850,11 @@ def train(cfg: dict, config_path: str):
                     x0_clean, list(captions),
                     steps=preview_steps,
                     cfg_scale=preview_cfg,
-                    n_samples=min(preview_n, B),
+                    n_samples=current_preview_n,
                     mu=cfg.get("preview_mu", None),
                     y1=mu_y1, y2=mu_y2, minres=minres, maxres=maxres,
                 )
-                grid = make_grid((rows + 1) / 2, nrow=min(preview_n, B))
+                grid = make_grid((rows + 1) / 2, nrow=current_preview_n)
                 ext = "png" if preview_quality >= 100 else "jpg"
                 img_path = f"{cfg['preview_path']}/step_{global_step}.{ext}"
                 if _PIL_AVAILABLE:

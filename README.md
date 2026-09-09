@@ -273,9 +273,153 @@ Knobs worth reaching for, in order:
   30.5 s/step): one pass over host DDR beats streaming 28 B/param over PCIe,
   even with four links in parallel. It is here for models whose optimizer state
   does not fit in host RAM at fp32.
+  Krea-2's ordinary `train.py` additionally supports `"muon"` for resident
+  `parallelism: "pipeline"`, `mode: "full"` training. It uses native
+  `torch.optim.Muon` for hidden linear weights and AdamW for the remaining
+  trainable parameters; tag embeddings retain their separate RowAdamW.
+  LoRA, streamed modes, TDM and mass-LoRA are not supported by this option.
+  Both optimizer families follow the existing warmup. This is standard Muon,
+  not chunked Muon (CMuon). Krea ordinary `train.py` also supports `"lion"`
+  for both full FT and LoRA, resident or streamed. Lion updates the normal
+  trainable list without matrix-specific routing; tags keep RowAdamW.
 - `grad_ckpt` — per-block `torch.utils.checkpoint`, **resident stages only**.
   Under streaming it would recompute against the CPU masters; use
   `offload_backward: "checkpoint"` instead.
+
+### Krea-2 Muon learning rates
+
+Set `optimizer: "muon"` to opt in; existing AdamW configurations are unchanged.
+The default `muon.adjust_lr_fn: "match_rms_adamw"` uses the Moonlight scaling
+`0.2 * sqrt(max(rows, columns))`, so `lr` is on an AdamW-like scale rather than
+original Muon's scale. The fallback AdamW learning rate defaults to `lr`.
+Optional `muon` keys are `momentum` (0.95), `nesterov` (true), `ns_steps` (5),
+`adjust_lr_fn` (`"match_rms_adamw"`), `adamw_lr` (defaults to `lr`) and
+`exclude_prefixes` (dotted module/parameter names routed to AdamW instead).
+For example, add this fragment to a resident full-FT config:
+
+```json
+{
+  "optimizer": "muon",
+  "lr": 5e-6,
+  "muon": {
+    "adjust_lr_fn": "match_rms_adamw",
+    "momentum": 0.95,
+    "ns_steps": 5
+  }
+}
+```
+
+This is update-scale matching, not a guarantee that either optimizer has the
+same optimal LR. See the [PyTorch Muon documentation](https://docs.pytorch.org/docs/2.10/generated/torch.optim.Muon.html).
+
+Diffusion evidence: [CMuon (2026), sections 4 and 5.4](https://arxiv.org/html/2608.02502)
+uses global batch 1024 and sweeps 1e-4, 2e-4 and 3e-4; 2e-4 is near-optimal
+for its ImageNet DiT-XL training experiments. Those results use **chunked**
+Muon and training from scratch, not vanilla Muon fine-tuning of Krea-2.
+They do not establish a good LR for a 12.8B checkpoint at effective batch 16.
+For the existing low-LR annealing recipe, a conservative first experiment is
+RMS-matched Muon at the existing 5e-6, then a controlled comparison around it
+(e.g. 2.5e-6, 5e-6, 1e-5). This is an unvalidated recommendation, not a measured
+optimum. Keep effective batch fixed across resolutions; no automatic LR change
+or batch-scaling rule is applied when the microbatch/accumulation changes.
+Muon replaces two Adam moments with one momentum buffer for its matrix subset,
+but Newton–Schulz adds matrix multiplications and temporary memory; lower state
+memory does not guarantee faster steps or lower peak VRAM. Existing checkpoint
+files still save weights only, not Muon/AdamW moments or scheduler state.
+
+### Krea-2 preview microbatching
+
+Ordinary `krea2/train.py` accepts `preview_samples` as a positive integer or
+`"microbatches"` (the current step's accumulation count), capped to the available
+training batch. Preview text encoding and each DiT CFG pass use microbatches
+bounded by the current training microbatch size; VAE decoding uses the same
+bound and moves each decoded chunk to CPU. For E32/b1/M32,
+`"preview_samples": 32` schedules 32 size-one microbatches per CFG pass, not one
+32-image batch or 32 independent sampling loops. `eval_interval` is unchanged.
+Optional `preview_n_microbatches` independently caps the number of microbatches
+per preview encoder/DiT inference call. Set it to `16` with 32 samples/b1 to run
+two groups of 16, without changing training accumulation or increasing the
+per-microbatch image count. Omit it (or use null) for the previous uncapped behavior.
+
+### Krea-2 transformer-block compilation
+
+Ordinary `krea2/train.py` supports opt-in `"compile": true` for resident
+`parallelism: "pipeline"`. It lazily compiles individual DiT transformer blocks
+(including text-fusion blocks) and the executed Qwen text decoder layers.
+The VAE, embeddings, projections, output heads, and pipeline orchestration
+remain eager. Parameter identities and checkpoint keys are preserved.
+
+The equivalent explicit configuration is:
+
+```json
+{
+  "compile": {
+    "dit": true,
+    "encoder": true,
+    "backend": "inductor",
+    "mode": "default",
+    "dynamic": true,
+    "fullgraph": false
+  }
+}
+```
+
+CUDA graphs are disabled for the threaded pipeline. Block forwards share
+Dynamo's compilation lock and force backward lowering there to avoid PyTorch
+2.10's process-global FX tracing race. This serializes Python forward dispatch,
+not asynchronous GPU kernels; throughput must be measured. Persistent and
+mixed-order reductions are disabled: Torch 2.10 mixed-order fusion otherwise
+forces a persistent RMSNorm backward kernel over the GPU shared-memory limit.
+Dynamic shapes accommodate
+varying caption lengths/aspect buckets but do not guarantee zero recompiles.
+Compilation is lazy: first-use training/backward and preview paths can be slow.
+Backend errors are not silently swallowed; `fullgraph: false` can still allow
+normal Dynamo graph breaks. `aot_eager`/`eager` backends are diagnostic options,
+not production speedups. Weight streaming is unsupported with compilation.
+See [PyTorch regional compilation guidance](https://docs.pytorch.org/tutorials/recipes/regional_compilation.html).
+
+### Krea-2 Lion learning rates
+
+Lion is a shape-independent replacement for the main optimizer in ordinary
+`krea2/train.py` (`mode: "full"` or `"lora"`; all three parallelisms).
+It keeps one momentum buffer per updated parameter and uses sign updates;
+no Muon/AdamW matrix split is needed. Tag embeddings still use RowAdamW to
+avoid updating untouched rows. TDM and mass-LoRA trainers are not extended.
+This is a straightforward tensor implementation, not a fused/Triton kernel;
+streamed masters and their Lion state stay on CPU. No GPU performance claim.
+
+The [Lion authors, section 5](https://arxiv.org/abs/2302.06675) recommend
+**3–10x smaller LR and 3–10x larger weight decay** than AdamW, keeping the
+product `lr * weight_decay` similar. Their diffusion example uses AdamW
+`lr=3e-4, weight_decay=0.01` versus Lion `lr=3e-5, weight_decay=0.1`.
+They scale the whole LR schedule by the same ratio, retaining the schedule
+shape and clipping. This is a tuning heuristic, not a universal optimum;
+the paper reports smaller advantages at batch sizes below 64.
+
+For this repository's anneal baseline (`lr=5e-6, weight_decay=1e-4`), the
+10x conversion is the following config fragment, **not an automatically
+applied change**:
+
+```json
+{
+  "optimizer": "lion",
+  "lr": 5e-7,
+  "weight_decay": 1e-3,
+  "lion": {"betas": [0.9, 0.99]}
+}
+```
+
+The `lion` block is optional; its only option is `betas` (default `[0.9, 0.99]`).
+If omitted, Lion's top-level LR defaults to `1e-5`, and weight decay to `1e-4`;
+set both explicitly when converting a known AdamW recipe.
+Explicit LR/weight decay are used literally, with no automatic /10 or x10
+conversion. Existing warmup is retained; effective batch remains constant
+across resolutions, so LR is not changed when accumulation changes. Explicit
+`tag_embed.lr` and tag weight decay are separate settings and are not converted;
+if tag LR is omitted, it inherits the resolved top-level LR (including Lion's
+`1e-5` default). Set it explicitly to preserve the previous RowAdamW learning
+rate when switching to Lion. Checkpoints
+remain weights-only, with fresh momentum/scheduler on resumed training.
 
 Before spending GPU hours on a change to the chunk dicing, run the parity
 harness — it checks the chunked forward AND every gradient against the

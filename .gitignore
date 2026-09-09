@@ -26,3 +26,8 @@ profiles/
 
 # Scratch folder unrelated to this project (Engram paper visualization)
 engram_viz/
+
+# Local experiments and generated outputs
+/scratchpad/
+/experiments/
+/outputs/

@@ -191,7 +191,7 @@ class Tags:
 
 
 def common_env(model):
-    env = {"torch": torch, "F": F, "ThreadPoolExecutor": ThreadPoolExecutor,
+    env = {"benchmark_path": None, "torch": torch, "F": F, "ThreadPoolExecutor": ThreadPoolExecutor,
            "OffloadStage": StreamedStage, "get_step_batching": get_step_batching,
            "resolution_batching_kwargs": resolution_batching_kwargs,
            "cfg": {"resolution_batching": CONFIG},

@@ -31,3 +31,6 @@ engram_viz/
 /scratchpad/
 /experiments/
 /outputs/
+
+# S3/rustfs credentials (referenced by dataloaders s3_image_source)
+/credential/

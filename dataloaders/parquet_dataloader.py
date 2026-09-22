@@ -24,6 +24,11 @@ Example config snippet:
     "height_column":      "image_height",
     "loss_weight_column": null,          // or e.g. "sampling_probability"
     "image_folder_path":  "",            // base dir for local files; ignored for URLs
+    "s3_image_source": {                 // optional: fetch images from S3 instead of disk
+        "endpoint_url":    "http://localhost:9000",
+        "credential_file": "credential/local-rustfs.json",  // {"username": ..., "password": ...}
+        "strip_prefix":    "/mnt/nas_buckets/"   // file_path under this prefix -> <bucket>/<key>
+    },
     "base_res":           [512, 1024],   // multiple base resolutions
     "base_res_weights":   [0.25, 0.75], // optional: weighted sampling; omit for uniform
     ...
@@ -31,6 +36,7 @@ Example config snippet:
 """
 
 import os
+import json
 import math
 import random
 import logging
@@ -190,6 +196,44 @@ def _reinhard_tonemap_to_pil(arr: np.ndarray) -> Image.Image:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+_S3_CLIENT = None
+
+
+def _get_s3_client(s3_cfg: dict):
+    """Build (once per process) the boto3 client described by ``s3_image_source``.
+
+    Created lazily so each forked DataLoader worker gets its own client; a
+    client created before the fork would share a broken connection pool.
+    Credentials come either from ``credential_file`` (JSON with
+    ``username``/``password``) or inline ``access_key``/``secret_key``.
+    """
+    global _S3_CLIENT
+    if _S3_CLIENT is None:
+        import boto3
+        from botocore.config import Config as _BotoConfig
+
+        cred_file = s3_cfg.get("credential_file")
+        if cred_file:
+            with open(cred_file) as fh:
+                cred_json = json.load(fh)
+            cred = {
+                "aws_access_key_id": cred_json.get("username", cred_json.get("access_key", "")),
+                "aws_secret_access_key": cred_json.get("password", cred_json.get("secret_key", "")),
+            }
+        else:
+            cred = {
+                "aws_access_key_id": s3_cfg.get("access_key", ""),
+                "aws_secret_access_key": s3_cfg.get("secret_key", ""),
+            }
+        _S3_CLIENT = boto3.client(
+            "s3",
+            endpoint_url=s3_cfg["endpoint_url"],
+            config=_BotoConfig(signature_version="s3v4", retries={"max_attempts": 2}),
+            **cred,
+        )
+    return _S3_CLIENT
+
 
 def _collect_parquet_files(path: str) -> list[str]:
     """Walk *path* and return all .parquet file paths, sorted."""
@@ -494,6 +538,7 @@ class ParquetTextImageDataset(Dataset):
         max_tags: int = 128,
         resolution_batching: dict | None = None,
         data_epoch: int = 0,
+        s3_image_source: dict | None = None,
     ):
         from .resolution_batching import normalize_resolution_batching, validate_resolution_geometry
 
@@ -540,6 +585,10 @@ class ParquetTextImageDataset(Dataset):
         self.height_column = height_column
         self.loss_weight_column = loss_weight_column
         self.image_folder_path = image_folder_path
+        # Optional S3 image source: file_path values under ``strip_prefix`` are
+        # fetched from an S3 endpoint instead of the local filesystem.
+        self.s3_image_source = s3_image_source
+        self._s3_strip_prefix = (s3_image_source or {}).get("strip_prefix", "")
         self.base_res = base_res
         self.base_res_weights = base_res_weights
         self.ratio_cutoff = ratio_cutoff
@@ -978,6 +1027,20 @@ class ParquetTextImageDataset(Dataset):
     def _is_url(path: str) -> bool:
         return path.startswith("http://") or path.startswith("https://")
 
+    def _s3_ref(self, path: str) -> tuple[str, str] | None:
+        """Map *path* to ``(bucket, key)`` via ``s3_image_source``, or ``None``.
+
+        A path is an S3 reference when ``strip_prefix`` is configured and the
+        path starts with it; the remainder must be ``<bucket>/<key>``.
+        """
+        prefix = self._s3_strip_prefix
+        if not prefix or not path.startswith(prefix):
+            return None
+        bucket, _, key = path[len(prefix):].partition("/")
+        if not bucket or not key:
+            return None
+        return bucket, key
+
     @staticmethod
     def scale_and_crop_long_axis(image: Image.Image, target_height: int, target_width: int) -> Image.Image:
         if (target_width / target_height) >= (image.width / image.height):
@@ -1111,9 +1174,15 @@ class ParquetTextImageDataset(Dataset):
         return Image.open(BytesIO(data)).convert("RGB")
 
     def _read_image_bytes(self, path_or_url: str) -> bytes | None:
-        """Return the raw bytes for a local file or URL, or ``None`` on error."""
+        """Return the raw bytes for a local file, S3 object, or URL, or None on error."""
         try:
-            if self._is_url(path_or_url):
+            s3_ref = self._s3_ref(path_or_url)
+            if s3_ref is not None:
+                bucket, key = s3_ref
+                client = _get_s3_client(self.s3_image_source)
+                response = client.get_object(Bucket=bucket, Key=key)
+                return response["Body"].read()
+            elif self._is_url(path_or_url):
                 if self.session is None:
                     raise RuntimeError("requests is not installed; cannot load URLs")
                 response = self.session.get(path_or_url, timeout=self.timeout)
@@ -1135,6 +1204,12 @@ class ParquetTextImageDataset(Dataset):
                 return self._load_image_data(data, sample["filename"])
             else:
                 image_path = os.path.join(self.image_folder_path, sample["filename"])
+                if self._s3_ref(image_path) is not None:
+                    # S3 keys are authoritative: no local .jxl/alt-extension probing.
+                    data = self._read_image_bytes(image_path)
+                    if data is None:
+                        return None
+                    return self._load_image_data(data, image_path)
                 jxl_path = os.path.splitext(image_path)[0] + ".jxl"
                 if os.path.exists(jxl_path):
                     data = self._read_image_bytes(jxl_path)
@@ -1169,6 +1244,12 @@ class ParquetTextImageDataset(Dataset):
                 return self._load_image_data(data, ref_filename)
             else:
                 image_path = os.path.join(self.image_folder_path, ref_filename)
+                if self._s3_ref(image_path) is not None:
+                    # S3 keys are authoritative: no local .jxl/alt-extension probing.
+                    data = self._read_image_bytes(image_path)
+                    if data is None:
+                        return None
+                    return self._load_image_data(data, image_path)
                 jxl_path = os.path.splitext(image_path)[0] + ".jxl"
                 if os.path.exists(jxl_path):
                     data = self._read_image_bytes(jxl_path)

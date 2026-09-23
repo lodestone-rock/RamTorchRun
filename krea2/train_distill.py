@@ -336,7 +336,11 @@ def train(cfg: dict, config_path: str):
 
     def save_student(tag: str):
         sd = {k: v.detach().cpu().contiguous() for k, v in wrapper.model.state_dict().items()}
-        path = os.path.join(cfg["ckpt_path"], f"{ckpt_prefix}_step_{global_step}_{tag}.safetensors")
+        # ckpts/ subdir: housekeep.py auto-discovers runs/*/ckpts (keep newest
+        # 4 + every milestone step forever); run-root files are invisible to it.
+        ckpt_dir = os.path.join(cfg["ckpt_path"], "ckpts")
+        os.makedirs(ckpt_dir, exist_ok=True)
+        path = os.path.join(ckpt_dir, f"{ckpt_prefix}_step_{global_step}_{tag}.safetensors")
         save_file(sd, path)
         print(f"[ckpt] Saved {len(sd)} tensors -> {path}")
 

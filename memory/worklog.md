@@ -3236,3 +3236,14 @@ Gotchas:
   on distillation convergence. k2-distill-1024 was paused ~4min for the
   inference test and restarted from scratch (no mid-run resume; ~30 steps
   lost).
+
+- Housekeep coverage fix (same day): the generic housekeep (tmux `housekeep`,
+  Aug 27, default `--runs-root runs`) sweeps every runs/*/ckpts + previews
+  (keep 4 newest ckpts + every step%1000 forever, 200 previews); the k2-lion
+  instance (`--runs-root runs/k2-lion --milestone 10000`) is separate. Gotcha:
+  train_distill.py originally wrote checkpoints into the RUN ROOT, which
+  housekeep cannot see -> 7 x 6.1GB accumulated unnoticed while the disk sat
+  at 95%. Fixed save_student to ckpts/ subdir (repo convention), moved the
+  stray files, and left tmux session `distill-mover` relocating the live
+  run's stragglers (its in-memory code still writes the old path) until the
+  training session ends. First sweep freed 17.1 GiB.

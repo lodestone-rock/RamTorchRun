@@ -1,0 +1,99 @@
+{
+  "_comment": "1024px production run of the 2-block student distillation; same teacher/student/recipe as distill_student2.json (256px smoke). Batch 4/GPU (global 16) to keep activation memory sane at 1024.",
+  "seed": 45,
+  "teacher_checkpoint": "runs/k2-lion/1024-resume-21400-rustfs/ckpts/full_step_25600.safetensors",
+  "student_checkpoint": "checkpoints/krea2/student2_step25600.safetensors",
+  "keep_blocks": [
+    0,
+    27
+  ],
+  "mmdit_config": "large_wide",
+  "encoder_config": "qwen3_vl_4b",
+  "resolution": 1024,
+  "batch_size": 4,
+  "grad_accum": 1,
+  "n_gpus": 4,
+  "optimizer": "lion",
+  "lion": {
+    "betas": [
+      0.9,
+      0.99
+    ]
+  },
+  "lr": 1e-05,
+  "weight_decay": 0.0,
+  "warmup": 100,
+  "max_grad_norm": 1.0,
+  "uncond_ratio": 0.1,
+  "mu_y1": 0.5,
+  "mu_y2": 1.15,
+  "mu_override": null,
+  "mu_sigma": 1.0,
+  "minres": 256,
+  "maxres": 1280,
+  "eval_interval": 50,
+  "save_every_n_steps": 200,
+  "save_final": true,
+  "preview_steps": 8,
+  "max_steps": 0,
+  "initial_global_step": 0,
+  "ckpt_path": "runs/k2-distill-student2-1024",
+  "preview_path": "runs/k2-distill-student2-1024/previews",
+  "parquet_dataloader": {
+    "parquet_sources": {
+      "danbooru": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples/source=danbooru",
+        "n_samples": null
+      },
+      "e621": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples/source=e621",
+        "n_samples": null
+      }
+    },
+    "caption_columns": {
+      "tags": {
+        "weight": 2.0,
+        "is_tag_based": true
+      },
+      "midjourney_style_summary": {
+        "weight": 2.0,
+        "is_tag_based": false
+      },
+      "brief_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "10_word_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "long_caption": {
+        "weight": 1.0,
+        "is_tag_based": false
+      }
+    },
+    "filename_column": "file_path",
+    "width_column": "image_width",
+    "height_column": "image_height",
+    "loss_weight_column": null,
+    "image_folder_path": "",
+    "base_resolution": [
+      1024
+    ],
+    "base_resolution_weights": [
+      1.0
+    ],
+    "ratio_cutoff": 2.0,
+    "resolution_step": 64,
+    "shuffle_tags": true,
+    "tag_drop_percentage": 0.0,
+    "offset": 0,
+    "num_workers": 2,
+    "prefetch_factor": 2,
+    "s3_image_source": {
+      "endpoint_url": "http://localhost:9000",
+      "credential_file": "/mnt/datapool_u2/lodestone/RamTorchRun/credential/local-rustfs-readonly.json",
+      "strip_prefix": "/mnt/nas_buckets/"
+    }
+  }
+}

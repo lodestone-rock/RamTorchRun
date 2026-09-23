@@ -95,5 +95,6 @@
       "credential_file": "/mnt/datapool_u2/lodestone/RamTorchRun/credential/local-rustfs-readonly.json",
       "strip_prefix": "/mnt/nas_buckets/"
     }
-  }
+  },
+  "preview_guidance": 4.0
 }

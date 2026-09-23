@@ -122,30 +122,51 @@ def make_student_factory(student_cfg, student_ckpt: str):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def preview(student, conditioner, ae, prompts: list[str], patch: int,
-            resolution: int, steps: int, seed: int, out_path: str, dev: str):
+def preview(student, teacher, conditioner, ae, prompts: list[str], patch: int,
+            resolution: int, steps: int, seed: int, out_path: str, dev: str,
+            guidance: float):
+    """Two columns per prompt: pure student | student + g*(teacher - student).
+
+    The twisted column is the deployment metric (the student is the learned
+    CFG negative at inference); the pure-student column tracks the baseline
+    fit. Same noise per column, so they differ only by guidance.
+    """
     student.eval()
     context, txtmask = conditioner(prompts)
     txtlen = context.shape[1]
     b = len(prompts)
     h = w = resolution // 8
-    gen = torch.Generator(device=dev).manual_seed(seed)
-    x = torch.randn(b, 16, h, w, device=dev, dtype=torch.bfloat16, generator=gen)
-    ts = torch.linspace(1.0, 0.0, steps + 1, device=dev)
-    for i in range(steps):
-        t = ts[i].expand(b)
-        x_tok, pos, mask = prepare(x, txtlen, patch, txtmask)
-        with torch.autocast("cuda", torch.bfloat16):
-            v = student(x_tok, context, t, pos, mask)
-        v = rearrange(v.float(), "b (h w) (c ph pw) -> b c (h ph) (w pw)",
-                      h=h // patch, w=w // patch, ph=patch, pw=patch)
-        x = (x.float() + (ts[i + 1] - ts[i]) * v).to(torch.bfloat16)
-    pixels = vae_decode(ae, x)
-    grid = make_grid(pixels.clamp(-1, 1), nrow=b, normalize=True, value_range=(-1, 1))
+
+    def euler(use_teacher: bool, g: float, column_seed: int) -> torch.Tensor:
+        gen = torch.Generator(device=dev).manual_seed(column_seed)
+        x = torch.randn(b, 16, h, w, device=dev, dtype=torch.bfloat16, generator=gen)
+        ts = torch.linspace(1.0, 0.0, steps + 1, device=dev)
+        for i in range(steps):
+            t = ts[i].expand(b)
+            x_tok, pos, mask = prepare(x, txtlen, patch, txtmask)
+            with torch.autocast("cuda", torch.bfloat16):
+                v = student(x_tok, context, t, pos, mask)
+                if use_teacher:
+                    v_t = teacher(x_tok, context, t, pos, mask)
+                    v = v + g * (v_t - v)
+            v = rearrange(v.float(), "b (h w) (c ph pw) -> b c (h ph) (w pw)",
+                          h=h // patch, w=w // patch, ph=patch, pw=patch)
+            x = (x.float() + (ts[i + 1] - ts[i]) * v).to(torch.bfloat16)
+        return x
+
+    cols = [euler(False, 0.0, seed)]
+    twisted = teacher is not None and bool(guidance)
+    if twisted:
+        cols.append(euler(True, guidance, seed))
+    pixels = [vae_decode(ae, x).clamp(-1, 1) for x in cols]
+    rows = [torch.cat([col[r] for col in pixels], dim=2) for r in range(b)]
+    grid = torch.cat(rows, dim=1)
+    img = make_grid(grid, nrow=1, normalize=True, value_range=(-1, 1))
     from PIL import Image
-    Image.fromarray((grid.mul(255).add(0.5).clamp(0, 255).permute(1, 2, 0).to("cpu", torch.uint8)).numpy()).save(out_path, quality=95)
+    Image.fromarray((img.mul(255).add(0.5).clamp(0, 255).permute(1, 2, 0).to("cpu", torch.uint8)).numpy()).save(out_path, quality=95)
     student.train()
-    print(f"[preview] Saved {out_path}")
+    print(f"[preview] Saved {out_path}  (columns: student"
+          + (f" | twisted x{guidance:g}" if twisted else "") + ")")
 
 
 # ---------------------------------------------------------------------------
@@ -373,9 +394,11 @@ def train(cfg: dict, config_path: str):
                 csv_file.flush()
 
             if eval_interval and global_step % eval_interval == 0:
-                preview(wrapper.model, conditioners[driver], aes[driver], preview_prompts,
-                        patch, resolution, preview_steps, master_seed + global_step,
-                        os.path.join(cfg["preview_path"], f"step_{global_step}.jpg"), driver)
+                preview(wrapper.model, teachers[driver], conditioners[driver],
+                        aes[driver], preview_prompts, patch, resolution,
+                        preview_steps, master_seed + global_step,
+                        os.path.join(cfg["preview_path"], f"step_{global_step}.jpg"),
+                        driver, cfg.get("preview_guidance", 4.0))
             if save_every and global_step % save_every == 0:
                 save_student("ckpt")
             if max_steps and global_step >= max_steps:

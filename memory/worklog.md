@@ -3222,3 +3222,17 @@ Gotchas:
   no-bare-shell rule. `sequential_fb: true` in config = inline fb_fn for
   real tracebacks while debugging.
 - Next: 1024px run (bump resolution + base_resolution; batch 4/GPU safer).
+
+- Inference twist (same day): the student is a LEARNED CFG NEGATIVE, not a
+  standalone generator. `krea2/inference_distill.py` samples
+  v = student(x,t,c) + s*(teacher(x,t,c) - student(x,t,c)) with BOTH models
+  text-conditioned on the same prompt (no empty-prompt pass). Cost measured
+  at 256px/14 steps: student 1.9s, twisted s=4 3.7s (1.16x teacher-only
+  3.2s) vs 2x for classical CFG. Grid output puts prompts in rows, guidance
+  values in columns (same seed per column). Gotcha: move the whole
+  QwenAutoencoder wrapper to the device (ae.ae.to() alone leaves the
+  latents_mean/std buffers on CPU and decode dies). With an UNTRAINED
+  student, mid guidance washes out (negative is noise-scale); quality rides
+  on distillation convergence. k2-distill-1024 was paused ~4min for the
+  inference test and restarted from scratch (no mid-run resume; ~30 steps
+  lost).

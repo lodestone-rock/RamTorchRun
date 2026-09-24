@@ -3247,3 +3247,17 @@ Gotchas:
   stray files, and left tmux session `distill-mover` relocating the live
   run's stragglers (its in-memory code still writes the old path) until the
   training session ends. First sweep freed 17.1 GiB.
+
+- RunPod sweep (2026-09-24): inference_distill.py gained classical-CFG columns
+  ("cfg4.5" = teacher cond + teacher uncond) for head-to-head comparison.
+  First sweep accidentally used the PRE-training student (make_student output)
+  -> s>1 washed out; re-sweep with the step-11000 student flipped the result:
+  s>1 now SHARPENS instead of washing out (delta became meaningful as the
+  student converged). Usable extrapolation range ~1.1-4.5 (s6 degrades, s8
+  melts). Head-to-head at 1024/28 steps: classical cfg4.5 24.3s, twisted
+  s2-s3 13.6s (1.09x teacher-only 12.5s) with comparable-or-better scene
+  compliance on the test prompt. Gotcha: prepare() output mask must not
+  shadow the input text mask across Euler iterations (4608+4096=8704 seq-len
+  crash on iteration 2). Models relayed to RunPod via private HF repo
+  (lodestones/rt-sweep-models) at ~118MB/s home upload — 10 min vs ~4h over
+  the WG tunnel.

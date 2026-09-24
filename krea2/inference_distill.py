@@ -54,23 +54,33 @@ def load_dit(cfg, ckpt: str, dev: str) -> SingleStreamDiT:
 
 @torch.no_grad()
 def sample(student, teacher, guidance, context, txtmask, patch, h, w,
-           steps, seed, dev) -> torch.Tensor:
+           steps, seed, dev, uncond=None):
     """One Euler trajectory.
 
     guidance None -> pure teacher; 0.0 -> pure student (single pass);
     s > 0 -> v = student + s*(teacher - student), two passes per step.
+    uncond = (context_u, txtmask_u) switches to CLASSICAL CFG: teacher
+    positive / teacher uncond negative at the given scale.
     """
     b = context.shape[0]
     gen = torch.Generator(device=dev).manual_seed(seed)
     x = torch.randn(b, 16, h, w, device=dev, dtype=torch.bfloat16, generator=gen)
     ts = torch.linspace(1.0, 0.0, steps + 1, device=dev)
-    pure_teacher = guidance is None
-    pure_student = guidance == 0
+    if uncond is not None:
+        ctx_u, txtmask_u = uncond
+        txtlen_u = ctx_u.shape[1]
+    pure_teacher = guidance is None and uncond is None
+    pure_student = guidance == 0 and uncond is None
     for i in range(steps):
         t = ts[i].expand(b)
         x_tok, pos, mask = prepare(x, context.shape[1], patch, txtmask)
         with torch.autocast("cuda", torch.bfloat16):
-            if pure_teacher:
+            if uncond is not None:
+                x_tok_u, pos_u, mask_u_comb = prepare(x, txtlen_u, patch, txtmask_u)
+                v_c = teacher(x_tok, context, t, pos, mask)
+                v_u = teacher(x_tok_u, ctx_u, t, pos_u, mask_u_comb)
+                v = v_u + guidance * (v_c - v_u)
+            elif pure_teacher:
                 v = teacher(x_tok, context, t, pos, mask)
             elif pure_student:
                 v = student(x_tok, context, t, pos, mask)
@@ -90,10 +100,13 @@ def main() -> int:
     ap.add_argument("--teacher", default=DEFAULT_TEACHER)
     ap.add_argument("--prompts", nargs="+", required=True)
     ap.add_argument("--guidance", nargs="+", default=["0", "4", "teacher"],
-                    help="per-column guidance: float, or 'teacher' for the pure teacher")
+                    help="per-column guidance: float (twisted), 'cfg4.5' (classical "
+                         "teacher pos/uncond), or 'teacher' for the pure teacher")
     ap.add_argument("--resolution", type=int, default=256)
     ap.add_argument("--steps", type=int, default=28)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seeds", nargs="+", type=int, default=None,
+                    help="multi-seed rows override --seed; one grid row per (prompt, seed)")
     ap.add_argument("--out", default="outputs/distill-cfg")
     args = ap.parse_args()
 
@@ -104,8 +117,10 @@ def main() -> int:
     patch = dit_cfg.patch
     h = w = args.resolution // 8
 
-    need_student = any(g != "teacher" for g in args.guidance)
-    need_teacher = any(g == "teacher" or float(g) != 0 for g in args.guidance)
+    need_student = any(not (g == "teacher" or g.startswith("cfg")) for g in args.guidance)
+    need_teacher = any(
+        g == "teacher" or g.startswith("cfg") or (g != "teacher" and float(g) != 0)
+        for g in args.guidance)
 
     print("Loading conditioner + VAE...")
     conditioner = Qwen3VLConditioner("Qwen/Qwen3-VL-4B-Instruct",
@@ -125,24 +140,38 @@ def main() -> int:
         teacher = load_dit(dit_cfg, args.teacher, dev)
 
     context, txtmask = conditioner(args.prompts)
+    uncond = None
+    if any(g.startswith("cfg") for g in args.guidance):
+        uncond = conditioner([""] * len(args.prompts))
     os.makedirs(args.out, exist_ok=True)
 
-    all_pixels, labels = [], []
-    for g in args.guidance:
-        guidance = None if g == "teacher" else float(g)
-        label = "teacher" if g == "teacher" else (f"s{float(g):g}" if float(g) > 0 else "student")
-        t0 = time.time()
-        latents = sample(student, teacher, guidance, context, txtmask,
-                         patch, h, w, args.steps, args.seed, dev)
-        pixels = vae_decode(ae, latents).clamp(-1, 1)
-        all_pixels.append(pixels)
-        labels.append(label)
-        passes = 1 if guidance in (None, 0.0) else 2
-        print(f"  [{label}] {args.steps} steps x {passes} pass(es): {time.time() - t0:.1f}s")
+    labels = [g for g in args.guidance]
+    rows = []
+    seeds = args.seeds if args.seeds else [args.seed]
+    for seed in seeds:
+        seed_pixels = []
+        for g in args.guidance:
+            if g.startswith("cfg"):
+                guidance, uncond_arg = float(g[3:]), uncond
+                model_s, model_t = student, teacher
+            elif g == "teacher":
+                guidance, uncond_arg = None, None
+                model_s, model_t = None, teacher
+            else:
+                guidance = float(g)
+                uncond_arg = None
+                model_s, model_t = student, teacher
+            t0 = time.time()
+            latents = sample(model_s, model_t, guidance, context, txtmask,
+                             patch, h, w, args.steps, seed, dev, uncond=uncond_arg)
+            pixels = vae_decode(ae, latents).clamp(-1, 1)
+            seed_pixels.append(pixels)
+            passes = 1 if (uncond_arg is None and (guidance in (None, 0.0))) else 2
+            print(f"  [seed{seed}][{g}] {args.steps} steps x {passes} pass(es): {time.time() - t0:.1f}s", flush=True)
+        for r in range(len(args.prompts)):
+            rows.append(torch.cat([col[r] for col in seed_pixels], dim=2))
 
-    # Grid: prompts as rows, guidance values as columns.
-    n = len(args.prompts)
-    rows = [torch.cat([col[r] for col in all_pixels], dim=2) for r in range(n)]
+    # Grid: rows = (prompt, seed), columns = guidance values.
     grid = torch.cat(rows, dim=1)
     img = make_grid(grid, nrow=1, normalize=True, value_range=(-1, 1))
     arr = img.mul(255).add(0.5).clamp(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()

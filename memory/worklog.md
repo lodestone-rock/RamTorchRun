@@ -3261,3 +3261,29 @@ Gotchas:
   crash on iteration 2). Models relayed to RunPod via private HF repo
   (lodestones/rt-sweep-models) at ~118MB/s home upload — 10 min vs ~4h over
   the WG tunnel.
+
+## 2026-09-25 — Twisted-CFG RunPod validation sweeps
+
+- RunPod pod (RTX PRO 6000 96GB) used for inference sweeps while the home
+  box trains: env from scratch (torch 2.10 cu128, transformers 5.15,
+  diffusers 0.39), models relayed via private HF repo
+  lodestones/rt-sweep-models (~118MB/s home upload; the WG tunnel to the
+  workspace PC caps ~3.5MB/s single-stream, ~10.6MB/s with 10 parallel —
+  HF relay is the route).
+- Sweep results (1024px, 28-30 steps, seed grids):
+  - PRE-training student: s>1 washes out (delta = student error).
+  - step-11000 student: s1.1-4.5 EXTRAPOLATES cleanly (adds sharpness);
+    s6 degrades, s8 melts. Sweet spot 1.25-2.
+  - vs classical cfg4.5 (teacher pos/uncond): twisted s2-s3 comparable or
+    better scene compliance at 13.6s vs 24.3s per image (~56% compute).
+  - 5 popular e621 artists (general-rated, top by favs: jayrnski, advos,
+    nagasaki wonderful polyester, ncs, louart): 5/5 twisted renders the
+    artist full style (fisheye, meme formats, icon layouts, finish level)
+    while cfg4 gives flat/sparse reductions. Consistent across seeds.
+- Multi-seed grid support (--seeds) + classical-CFG columns (cfgX) added to
+  inference_distill.py. Gotcha: prepare() output mask must not shadow the
+  input text mask across Euler steps (seq-len blowup on iteration 2).
+- Sweep scripts + all grids backed up in the workspace scratchpad
+  (scratchpad/runpod/). HF relay repo left in place for future sweeps.
+- Training meanwhile: ~11.2k+ steps (~1.6 epochs), loss plateau ~0.04,
+  milestone ckpts 1000-11000 banked.

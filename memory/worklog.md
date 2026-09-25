@@ -3287,3 +3287,15 @@ Gotchas:
   (scratchpad/runpod/). HF relay repo left in place for future sweeps.
 - Training meanwhile: ~11.2k+ steps (~1.6 epochs), loss plateau ~0.04,
   milestone ckpts 1000-11000 banked.
+
+- Long-caption sweep (2026-09-25): 5 dataset-style long_caption prompts
+  (taran fiddler / dahecksajerry / latex / alsares / kenket+lofi) with the
+  step-16400 student. Classical cfg4 collapses on ALL FIVE (near-black
+  frames, tiny thumbnails in voids, underexposure); twisted s1.5-2 renders
+  complete attribute-faithful illustrations with signature text in-frame
+  every time, at ~52% of the compute. Long captions are where the learned
+  negative shines most. Conclusion of the experiment: for long-caption
+  e621-style prompting the twisted scheme (teacher positive, distilled
+  student negative, both text-conditioned) beats classical CFG outright,
+  not just on cost. All grids + scripts backed up in the workspace
+  scratchpad/runpod/. Pod can be terminated; models stay on the HF relay.

@@ -128,6 +128,8 @@ from krea2.model.mmdit import SingleStreamDiT
 from krea2.muon import build_muon_optimizer, validate_muon_config
 from krea2.lion import Lion, validate_lion_config
 from krea2.compile import compile_transformer_blocks, validate_compile_config
+from krea2.checkpointing import apply_selective_checkpoint, validate_selective_checkpoint_config
+from krea2.preview_context import inference_no_grad
 from krea2.model.autoencoder import QwenAutoencoder
 from krea2.model.sampling import prepare, timesteps as k2_timesteps
 from krea2.model.lora import inject_lora, lora_state_dict, trainable_param_count
@@ -146,6 +148,7 @@ from utils.checkpoint import (
     load_lora_checkpoint,
     merge_lora_into_base_sd,
 )
+from utils.profiling import TraceCapture
 from utils.ramtorch_helpers import (
     allow_tuple_infer,
     build_offload_adamw,
@@ -407,8 +410,9 @@ def preview(
         outputs = []
         for start in range(0, len(nested), group_size):
             group = nested[start:start + group_size]
-            outputs.extend(output.to(device) for output in
-                           dit_pipe.infer(group, n_microbatches=len(group)))
+            with inference_no_grad(dit_pipe):
+                outputs.extend(output.to(device) for output in
+                               dit_pipe.infer(group, n_microbatches=len(group)))
         return torch.cat(outputs, dim=0)
 
     img = img_tok
@@ -509,6 +513,8 @@ def train(cfg: dict, config_path: str):
 
     # A bool or a fraction of each stage's chunks; validated here rather than
     # at the call site so a bad value fails before the ~51 GB checkpoint load.
+    selective_options = validate_selective_checkpoint_config(cfg)
+    benchmark_path = cfg.get("benchmark_jsonl")
     grad_ckpt = float(cfg.get("grad_ckpt", False))
     if not 0.0 <= grad_ckpt <= 1.0:
         raise ValueError(
@@ -675,6 +681,9 @@ def train(cfg: dict, config_path: str):
     # ------------------------------------------------------------------
     # DiT chunks -> Pipeline
     # ------------------------------------------------------------------
+    apply_selective_checkpoint(dit, selective_options)
+    if selective_options is not None:
+        print(f"  Selective activation checkpointing: {selective_options}")
     dit_chunks = build_dit_chunks(dit, blocks_per_chunk=blocks_per_chunk)
     head_chunk = dit_chunks[-1]
     counts = cfg.get("chunks_per_stage") or balance_chunks_by_bytes(dit_chunks, n_stages)
@@ -819,6 +828,7 @@ def train(cfg: dict, config_path: str):
         height_column=parquet_cfg.get("height_column", "image_height"),
         loss_weight_column=parquet_cfg.get("loss_weight_column", None),
         image_folder_path=parquet_cfg.get("image_folder_path", ""),
+        s3_image_source=parquet_cfg.get("s3_image_source", None),
         base_res=parquet_cfg.get("base_resolution", [256]),
         base_res_weights=parquet_cfg.get("base_resolution_weights", None),
         ratio_cutoff=parquet_cfg.get("ratio_cutoff", 2.0),
@@ -875,6 +885,22 @@ def train(cfg: dict, config_path: str):
         # the original trainer's loss.
         return F.mse_loss(out.float(), target.float())
 
+    # Optional Perfetto capture: "profile_trace": {"path": ..., "warmup": N,
+    # "active": M} profiles M loop iterations after N warmup iterations
+    # (iteration = one full train step). The trace is written on window close.
+    prof_cfg = cfg.get("profile_trace")
+    prof_tc = None
+    if prof_cfg:
+        prof_tc = TraceCapture(
+            prof_cfg["path"],
+            warmup=prof_cfg.get("warmup", 1),
+            active=prof_cfg.get("active", 3),
+            devices=devices,
+        )
+        print(f"[profile] capturing {prof_tc.active} step(s) after "
+              f"{prof_tc.warmup} warmup -> {prof_cfg['path']}")
+    prof_base_step = cfg.get("initial_global_step", 0)
+
     csv_path = os.path.join(cfg["ckpt_path"], "loss_log.csv")
     csv_file = open(csv_path, "a", newline="")
     csv_writer = csv.writer(csv_file)
@@ -888,6 +914,8 @@ def train(cfg: dict, config_path: str):
     phase_s = dict(data=0.0, fwdbwd=0.0, flush=0.0, clip=0.0, opt=0.0)
 
     def _finish(tag: str):
+        if prof_tc is not None:
+            prof_tc.close()   # no-op once the window has closed and exported
         # Stats BEFORE the save: a full-FT checkpoint is ~51 GB, and a slow or
         # failing write should not take the run's measurements with it.
         tot = sum(phase_s.values()) or 1.0
@@ -943,6 +971,12 @@ def train(cfg: dict, config_path: str):
             current_preview_n = min(n_mb if preview_n == "microbatches" else preview_n, B)
             if B < n_mb or B % n_mb != 0:
                 continue                        # partial tail batch — skip
+
+            if benchmark_path:
+                for dev in devices:
+                    torch.cuda.synchronize(dev)
+                    torch.cuda.reset_peak_memory_stats(dev)
+                benchmark_batch_start = time.perf_counter()
 
             # ---------- Text conditioning (uncond dropout + chunked encode)
             # The uncond coin is drawn per sample and reused for the tags: a
@@ -1003,6 +1037,16 @@ def train(cfg: dict, config_path: str):
             _t = time.perf_counter()
             phase_s["data"] += _t - _t_data
 
+            if benchmark_path:
+                for dev in devices:
+                    torch.cuda.synchronize(dev)
+                benchmark_start = time.perf_counter()
+
+            # Perfetto window: iteration index = steps completed this run.
+            prof_cm = prof_tc.iteration(global_step - prof_base_step) if prof_tc else None
+            if prof_cm is not None:
+                prof_cm.__enter__()
+
             result = dit_pipe.step(
                 nested,
                 targets=v_target,
@@ -1030,8 +1074,26 @@ def train(cfg: dict, config_path: str):
             zero_grads(dit_pipe)
             _t, _prev = time.perf_counter(), _t
             phase_s["opt"] += _t - _prev
+            if prof_cm is not None:
+                prof_cm.__exit__(None, None, None)
+                prof_cm = None
 
             loss_val = result.loss.item()
+            if benchmark_path:
+                for dev in devices:
+                    torch.cuda.synchronize(dev)
+                metric = {
+                    "phase": "train", "step": global_step, "loss": loss_val,
+                    "update_seconds": time.perf_counter() - benchmark_start,
+                    "batch_seconds": time.perf_counter() - benchmark_batch_start,
+                    "peak_allocated_bytes": [torch.cuda.max_memory_allocated(d) for d in devices],
+                    "peak_reserved_bytes": [torch.cuda.max_memory_reserved(d) for d in devices],
+                    "free_bytes": [torch.cuda.mem_get_info(d)[0] for d in devices],
+                    "total_bytes": [torch.cuda.mem_get_info(d)[1] for d in devices],
+                    "latent_shape": list(x0_clean.shape), "text_length": txtlen,
+                }
+                with open(benchmark_path, "a") as metrics:
+                    metrics.write(json.dumps(metric) + "\n")
             lr_now = sched.get_last_lr()[0]
             post = {"loss": f"{loss_val:.4f}", "lr": f"{lr_now:.2e}",
                     "step": global_step}
@@ -1059,6 +1121,11 @@ def train(cfg: dict, config_path: str):
 
             # ---------- Preview ----------------------------------------------
             if eval_interval > 0 and global_step % eval_interval == 0:
+                if benchmark_path:
+                    for dev in devices:
+                        torch.cuda.synchronize(dev)
+                        torch.cuda.reset_peak_memory_stats(dev)
+                    preview_start = time.perf_counter()
                 dit.eval()
                 pv_ids, pv_mask = tags.undropped()
                 rows = preview(
@@ -1084,6 +1151,18 @@ def train(cfg: dict, config_path: str):
                     from torchvision.utils import save_image
                     save_image(grid, img_path)
                 print(f"[preview] Saved {img_path}")
+                if benchmark_path:
+                    for dev in devices:
+                        torch.cuda.synchronize(dev)
+                    with open(benchmark_path, "a") as metrics:
+                        metrics.write(json.dumps({
+                            "phase": "preview", "step": global_step,
+                            "update_seconds": time.perf_counter() - preview_start,
+                            "peak_allocated_bytes": [torch.cuda.max_memory_allocated(d) for d in devices],
+                            "peak_reserved_bytes": [torch.cuda.max_memory_reserved(d) for d in devices],
+                            "free_bytes": [torch.cuda.mem_get_info(d)[0] for d in devices],
+                            "total_bytes": [torch.cuda.mem_get_info(d)[1] for d in devices],
+                        }) + "\n")
                 dit.train()
 
             global_step += 1

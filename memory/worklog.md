@@ -3299,3 +3299,17 @@ Gotchas:
   student negative, both text-conditioned) beats classical CFG outright,
   not just on cost. All grids + scripts backed up in the workspace
   scratchpad/runpod/. Pod can be terminated; models stay on the HF relay.
+
+- v3 run incident + full-epoch switch (2026-09-26): k2-lion v3 crashed at
+  step 26346 with cuDNN mha_graph.execute failure in attention backward
+  (bool-masked DiT attention only runs on cuDNN; v3 long captions present a
+  new seq shape nearly every batch — graph cache/workspace transient).
+  Recovered by executing the scheduled switch early: restart into
+  config_full_epoch.json (steps_per_epoch removed -> plan defaults to a
+  TRUE full pass: 23054 steps ~8.5 days, no repeats) from checkpoint 26200.
+  7779 split kept. Gotchas: k2 train.py saves full_step_<N>.safetensors
+  (NO _ckpt suffix - that is the distill trainer convention); a watcher for
+  saves must match that name, and restart_oom.sh had the same bug in its
+  sed AND its python path (both fixed; canonical copy in the workspace
+  scratchpad). If mha_graph failures recur, next lever is a
+  empty-cache-and-retry wrapper around dit_pipe.step.

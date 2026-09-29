@@ -1,0 +1,86 @@
+{
+  "_comment": "Tag-conditioning run: rank-32 LoRA on the whole backbone + full-rank TagCodeEmbedder (30-bit tag codes -> 2-layer residual MLP at 6144), DDP via ramtorch MultiGPUWrapper (ZeRO-1). Base = k2-lion v3 full_step_30000, FROZEN bf16; trainable = LoRA + tag MLP (~76M dense + 60M LoRA). Data: trainer_samples_v3, all 5 sources; caption = 5 bands incl. tags-as-text (weight 1.0, shuffled, never dropped); tag_column tags -> per-tag 10% dropout (each dropped token -> anchor code 0); uncond_ratio 0.1 drops caption AND whole tag block (bit-exact no-op). 256px first, 2 plan-epochs (steps_per_epoch omitted = full pass 20175 steps), then switch to 512. Codes: checkpoints/tag_vocab/codes_v2_30b.parquet (min hamming 4, fingerprint-bound to tags_v2).",
+  "seed": 42,
+  "initial_global_step": 0,
+  "full_checkpoint": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-lion/1024-resume-25600-v3/ckpts/full_step_30000.safetensors",
+  "mmdit_config": "large_wide",
+  "encoder_config": "qwen3_vl_4b",
+  "encoder_model_id": "Qwen/Qwen3-VL-4B-Instruct",
+  "ae_model_id": "Qwen/Qwen-Image",
+
+  "lora_rank": 32,
+  "lora_alpha": 32.0,
+  "lora_exclude_prefixes": ["tagcode"],
+  "tag_code": {
+    "code_path": "checkpoints/tag_vocab/codes_v2_30b.parquet",
+    "vocab_path": "checkpoints/tag_vocab/tags_v2.parquet",
+    "n_bits": 30,
+    "max_tags": 128,
+    "tag_drop_prob": 0.1
+  },
+
+  "resolution": 256,
+  "batch_size": 8,
+  "grad_accum": 1,
+  "n_gpus": 4,
+
+  "optimizer": "lion",
+  "lion": { "betas": [0.9, 0.99] },
+  "lr": 1e-4,
+  "weight_decay": 0.0,
+  "warmup": 100,
+  "max_grad_norm": 1.0,
+
+  "uncond_ratio": 0.1,
+  "mu_y1": 0.5,
+  "mu_y2": 1.15,
+  "mu_sigma": 1.0,
+  "minres": 256,
+  "maxres": 1280,
+
+  "eval_interval": 50,
+  "save_every_n_steps": 200,
+  "save_final": true,
+  "preview_steps": 12,
+  "max_steps": 0,
+
+  "ckpt_path": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-tagsddp-256",
+  "preview_path": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-tagsddp-256/previews",
+
+  "parquet_dataloader": {
+    "parquet_sources": {
+      "danbooru": { "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=danbooru", "n_samples": null },
+      "deviantart": { "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=deviantart", "n_samples": null },
+      "e621": { "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=e621", "n_samples": null },
+      "midjourney": { "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=midjourney", "n_samples": null },
+      "reddit": { "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=reddit", "n_samples": null }
+    },
+    "caption_columns": {
+      "tags": { "weight": 1.0, "is_tag_based": true },
+      "midjourney_style_summary": { "weight": 1.0, "is_tag_based": false },
+      "brief_summary": { "weight": 1.0, "is_tag_based": false },
+      "10_word_summary": { "weight": 1.0, "is_tag_based": false },
+      "long_caption": { "weight": 1.0, "is_tag_based": false }
+    },
+    "tag_column": "tags",
+    "filename_column": "file_path",
+    "width_column": "image_width",
+    "height_column": "image_height",
+    "loss_weight_column": null,
+    "image_folder_path": "",
+    "base_resolution": [256],
+    "base_resolution_weights": [1.0],
+    "ratio_cutoff": 2.0,
+    "resolution_step": 64,
+    "shuffle_tags": true,
+    "tag_drop_percentage": 0.0,
+    "offset": 0,
+    "num_workers": 2,
+    "prefetch_factor": 2,
+    "s3_image_source": {
+      "endpoint_url": "http://localhost:9000",
+      "credential_file": "/mnt/datapool_u2/lodestone/RamTorchRun/credential/local-rustfs-readonly.json",
+      "strip_prefix": "/mnt/nas_buckets/"
+    }
+  }
+}

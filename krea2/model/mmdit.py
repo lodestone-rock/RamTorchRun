@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -8,6 +9,21 @@ import torch.utils.checkpoint as _ckpt
 from einops import rearrange
 from torch import Tensor
 from torch.nn.attention import SDPBackend, sdpa_kernel
+
+from krea2.checkpointing import checkpoint_block, checkpoint_component
+from krea2.model.triton_swiglu import triton_silu_mul
+
+# SwiGLU implementation toggle: vendored Axolotl Triton kernels
+# (model/triton_swiglu.py — Apache-2.0, (c) Axolotl AI; bit-exact forward vs
+# eager, in-place single-backward). Default off; opt in via
+# KREA2_TRITON_SWIGLU=1 or set_triton_swiglu(True) before the first forward.
+_TRITON_SWIGLU = os.environ.get("KREA2_TRITON_SWIGLU", "0").lower() not in ("", "0", "false", "no")
+
+
+def set_triton_swiglu(enabled: bool) -> None:
+    """Toggle the vendored Axolotl Triton SwiGLU kernel for all Krea blocks."""
+    global _TRITON_SWIGLU
+    _TRITON_SWIGLU = bool(enabled)
 
 
 def rope(pos: Tensor, dim: int, theta: float = 1e4, ntk: float = 1.0) -> Tensor:
@@ -199,7 +215,29 @@ class SwiGLU(torch.nn.Module):
         self.down = torch.nn.Linear(mlpdim, features, bias=bias)
 
     def forward(self, x: Tensor) -> Tensor:
-        return self.down(F.silu(self.gate(x)) * self.up(x))
+        if _TRITON_SWIGLU:
+            if not getattr(self, "_selective_checkpoint_enabled", False):
+                gate = self.gate(x)
+                up = self.up(x)
+                return self.down(triton_silu_mul(gate, up))
+            with checkpoint_component("mlp.gate"):
+                gate = self.gate(x)
+            with checkpoint_component("mlp.up"):
+                up = self.up(x)
+            hidden = triton_silu_mul(gate, up)
+            with checkpoint_component("mlp.down"):
+                return self.down(hidden)
+        # Keep the original eager/compile path free of context-manager dispatch.
+        if not getattr(self, "_selective_checkpoint_enabled", False):
+            return self.down(F.silu(self.gate(x)) * self.up(x))
+        with checkpoint_component("mlp.gate"):
+            gate = self.gate(x)
+        gate = F.silu(gate)
+        with checkpoint_component("mlp.up"):
+            up = self.up(x)
+        hidden = gate * up
+        with checkpoint_component("mlp.down"):
+            return self.down(hidden)
 
 
 class Attention(torch.nn.Module):
@@ -220,7 +258,14 @@ class Attention(torch.nn.Module):
     def forward(
         self, qkv: Tensor, freqs: Tensor | None = None, mask: Tensor | None = None
     ) -> Tensor:
-        q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
+        selective = getattr(self, "_selective_checkpoint_enabled", False)
+        if selective:
+            with checkpoint_component("attn.qkv"):
+                q, k, v = self.wq(qkv), self.wk(qkv), self.wv(qkv)
+            with checkpoint_component("attn.gate"):
+                gate = self.gate(qkv)
+        else:
+            q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
 
         q, k, v = (
             rearrange(q, "B L (H D) -> B H L D", H=self.heads),
@@ -232,7 +277,16 @@ class Attention(torch.nn.Module):
         if freqs is not None:
             q, k = ropeapply(q, k, freqs)
         impl = getattr(self, "attention_impl", attention)
-        out = self.wo(impl(q, k, v, mask=mask, gqa=self.gqa) * F.sigmoid(gate))
+        if selective:
+            # Enclose the implementation, so fused SDPA and math QK/AV matmuls
+            # have the same label; custom attention implementations work too.
+            with checkpoint_component("attn.core"):
+                core = impl(q, k, v, mask=mask, gqa=self.gqa)
+            gated = core * F.sigmoid(gate)
+            with checkpoint_component("attn.out"):
+                out = self.wo(gated)
+        else:
+            out = self.wo(impl(q, k, v, mask=mask, gqa=self.gqa) * F.sigmoid(gate))
 
         return out
 
@@ -309,7 +363,7 @@ class TextFusionTransformer(torch.nn.Module):
         x = x.reshape(b * l, n, d)
         for block in self.layerwise_blocks:
             if torch.is_grad_enabled() and getattr(self, 'grad_ckpt', False):
-                x = _ckpt.checkpoint(block, x.contiguous(), None, use_reentrant=False)
+                x = checkpoint_block(block, x.contiguous(), None)
             else:
                 x = block(x.contiguous(), mask=None)
         x = rearrange(x, "(b l) n d -> b l d n", b=b, l=l)
@@ -323,7 +377,7 @@ class TextFusionTransformer(torch.nn.Module):
 
         for block in self.refiner_blocks:
             if torch.is_grad_enabled() and getattr(self, 'grad_ckpt', False):
-                x = _ckpt.checkpoint(block, x, mask, use_reentrant=False)
+                x = checkpoint_block(block, x, mask)
             else:
                 x = block(x, mask=mask)
 
@@ -472,8 +526,9 @@ class SingleStreamDiT(nn.Module):
         # The head slices off everything before the image span, so the tag
         # block counts as part of the prefix length.
         txtlen, imglen = context.shape[1], img.shape[1]
-        if tag_ids is not None and self.tagembed is not None:
-            tagtok = self.tagembed(tag_ids, tag_mask)
+        tagembed = self.tagembed if self.tagembed is not None else getattr(self, "tagcode", None)
+        if tag_ids is not None and tagembed is not None:
+            tagtok = tagembed(tag_ids, tag_mask)
             txtlen += tagtok.shape[1]
             combined = torch.cat((context, tagtok, img), dim=1)
         else:
@@ -517,9 +572,7 @@ class SingleStreamDiT(nn.Module):
         )
         for i, block in enumerate(self.blocks):
             if torch.is_grad_enabled() and getattr(self, 'grad_ckpt', False):
-                combined = _ckpt.checkpoint(
-                    block, combined, tvec, freqs, mask, use_reentrant=False
-                )
+                combined = checkpoint_block(block, combined, tvec, freqs, mask)
             else:
                 combined = block(combined, tvec, freqs, mask)
             if return_hidden_at is not None and i in return_hidden_at:

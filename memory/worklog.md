@@ -3313,3 +3313,223 @@ Gotchas:
   sed AND its python path (both fixed; canonical copy in the workspace
   scratchpad). If mha_graph failures recur, next lever is a
   empty-cache-and-retry wrapper around dit_pipe.step.
+
+- Vendored Axolotl Triton SwiGLU + toggle (2026-09-26): added
+  krea2/model/triton_swiglu.py — SwiGLU fwd/bwd Triton kernels vendored from
+  axolotl-ai-cloud/axolotl (Apache-2.0, (c) Axolotl AI; design credit also
+  Unsloth per upstream). Kernels verbatim; registered as krea2::swiglu_fwd /
+  krea2::swiglu_bwd dispatcher ops (torch.library.custom_op) so the SAC policy
+  sees them; wrapper generalizes to N-D and falls back to eager on CPU. Opt-in
+  via KREA2_TRITON_SWIGLU=1 or mmdit.set_triton_swiglu(True); default OFF —
+  eager path byte-identical. SwiGLU.forward got the toggle branch (both plain
+  and SAC paths). Verified on wangaratta GPU0 with the live SAC recompute list
+  (attn.qkv/gate/out): forward BITWISE-identical to eager in plain autograd and
+  under SAC; grads within bf16 noise (worst rel 1.3e-2); retained activations
+  per MLP @4096 tok: eager 472MiB vs triton 240MiB plain, 208MiB vs 112MiB
+  under SAC; ~2% faster. Check tool: krea2/tools/check_triton_swiglu.py
+  (PASS). check_chunk_parity 18/18 still green (toggle off, CPU). Gotchas:
+  bwd is in-place (single-backward only — no retain_graph/double-backward);
+  uncommitted in the repo tree alongside the other in-flight work. k2-lion-v3
+  was stopped (SIGKILL after a stuck SIGINT at step 26250; lost <=50 steps,
+  resumed from full_step_26200) to free GPUs for the test, then relaunched
+  with the identical config_full_epoch.json command — stepping normally,
+  ~34s/it, same lopsided GPU profile.
+
+- CPU-state Lion + fused kernel (2026-09-26): krea2/lion.py gained
+  lion:{state_device:'cpu'} — momentum + master weights on pinned host memory,
+  host-side update via the vendored fused CPU kernel krea2/csrc/fused_lion.cpp
+  (single at::parallel_for pass, fp32 opmath for bf16; structure from PyTorch
+  FusedAdamKernel, algo ref DeepSpeedCPULion; kernel + bench built in-session,
+  Apache-2.0, lives in the workspace scratchpad/fused_lion_cpu). Needs ninja
+  in the venv (uv pip install ninja) AND .venv/bin on PATH for cpp builds;
+  builds lazily on first step, AVX512 rebuild probed, falls back to plain
+  torch ops if the build fails. Parity vs GPU-resident Lion: within 1 bf16 ulp
+  after 3 steps @lr 1e-3. Frees ~6GB/GPU of momentum for ~2x param bytes of
+  PCIe per step.
+- Profile probe ATTEMPT (7788 + cpu-lion + microbatch 2) ABORTED: resumed
+  weights-only from full_step_26600, config_profile_7788_cpulion_mb2.json,
+  8 steps planned (max_steps absolute 26609), M=16 x mb2 confirmed. Steps ran
+  at 487/359/310/284s (vs 36s live) with ~0% GPU util and 231% host CPU; then
+  wedged >10min mid-step INSIDE the profiler window (steps 3-5) — killed it,
+  so NO trace was exported (export happens at window close). Slowness predates
+  the profiler window, so it's the config (suspect: CPU-lion host transfers
+  serializing the pipeline; parallelism fix under investigation), not CUPTI.
+  Probe config kept for the rerun after the optimizer fix. Live k2-lion-v3 is
+  DOWN (GPUs held free for the fix + re-benchmark); relaunch with
+  config_full_epoch.json, resumes from full_step_26600 (~100-170 steps redo).
+
+- CPU fused-lion parallelism ROOT-CAUSED + FIXED in krea2/lion.py: vendored
+  kernel was compiled without -fopenmp, so at::parallel_for silently degraded
+  to serial (cpp_extension does not add OpenMP itself; _OPENMP undefined ->
+  serial fallback). This was the suspected cause of the 231%-CPU 300-500s
+  steps in the aborted cpulion profile probe. Fix: -fopenmp in extra_cflags +
+  extra_ldflags of both load() calls. Verified through the trainer's own
+  _fused_lion_ext() loader on node0 (taskset, nice 19): 300M-param step
+  2475ms @1.00-core -> 307ms @8 -> 90ms @32 threads (66.5 GB/s, 30.5 cores
+  busy); linear scaling 1->32 threads, socket wall ~70-85 GB/s (Milan 7713 is
+  AVX2-only, 8-wide; bandwidth-bound so it doesn't matter). fp32 parity
+  bitwise-exact. Notes for the rerun: torch caches the ext binary by flags
+  hash, so the first trainer step after this fix rebuilds once (~1min, needs
+  ninja on PATH — self-contained copy in scratchpad/cpu_lion_bench/pydeps,
+  trainer venv untouched); budget optimizer threads explicitly (e.g.
+  torch.set_num_threads(16-32) for the host step) so the fused pass doesn't
+  grab all 128 cores from dataloader workers; foreach CPU optimizers are ~3x
+  slower than plain torch ops on this box — don't use them host-side.
+  Benchmarks in scratchpad/cpu_lion_bench/. Live k2-lion-v3 still DOWN as
+  left; GPUs untouched; relaunch + profiler rerun unblocked.
+
+- CPU fused-lion full-machine saturation sweep (both sockets, 300M params,
+  nice 19): saturation at ~96 threads / ~115-117 GB/s (51ms per 300M-param
+  step); 128-256 threads flat, HT adds nothing. MPOL_INTERLEAVE and explicit
+  per-socket first-touch placement (split01 + node0-first taskset mask) score
+  identically (117 GB/s) — the two-socket DRAM+xGMI mix is the wall, no
+  further NUMA trickery needed for this access pattern. Control: buffers all
+  first-touched on node0 while threads span both sockets -> only ~65 GB/s,
+  WORSE than single-socket 32t (74 GB/s) — memory placement matters more than
+  thread count. Practical sweet spots: 32 threads (74 GB/s) for politeness,
+  ~96 for max throughput. 7B-param host-side lion step projects to ~1.2s at
+  saturation (140 GB ideal traffic) before PCIe transfers.
+
+- SGD OOM ablation closes the 7788+mb2 memory question (2026-09-26): with
+  optimizer: 'sgd' (ZERO state) the probe STILL OOMs on cuda:1 (stage 1,
+  7 chunks) asking 144MiB with 137MiB free — activations alone exceed the
+  stage at microbatch 2. So the lion8 OOM (204MiB short, same stage) was never
+  about state size: 7788+mb2 only fits with ~6GB/GPU of optimizer memory
+  offloaded to host (the original cpu-lion design). Probe matrix so far, all
+  killed, no trace exported (window never closed): cpu-lion+ES 285-490s/it,
+  wedged step4 in-window; lion8+ES OOM step3; paged+ES ran 41s/it steps 1-2
+  then wedged step3 in-window; paged no-ES wedged step2 PRE-window; sgd+ES
+  OOM. Two takeaways: (1) paged-lion8+mb2+ES is the only config that both
+  fits and runs at speed pre-window; (2) every wedge inside the profiler
+  window points at CUPTI x (cuDNN mha_graph or threaded pipeline), while the
+  paged no-ES wedge at step2 points at unified-memory paging stalls under
+  pressure — keep expandable_segments ON with paged. train.py/muon.py now
+  accept optimizer 'sgd' (stateless, for memory ablations) alongside
+  lion/lion8/lion8paged. Probe configs + logs in the run dir
+  (train_probe_*.log). Live k2-lion-v3 still DOWN; GPUs free.
+
+- SOLVED: 7788+mb2 fits with SAC mlp recompute (2026-09-26): extended the
+  SAC recompute list with mlp.gate/mlp.up/mlp.down (SwiGLU matmuls — backward
+  re-runs 3 extra GEMMs/MLP, drops the saved gate_out/up_out/hidden) and the
+  sgd zero-state probe COMPLETED all 8 steps: no OOM, ~44-48s/it, Peak VRAM
+  71.4/90.1/93.1/54.1 GB (GPU2 rides high but fits). Time split: fwdbwd 85%,
+  data 15%, opt ~0. First successful trace:
+  profiles/k2_7788_sgd_mb2_mlprecomp.json.gz (44MB) — zipped with the probe
+  log into k2_7788_sgd_mb2_mlprecomp_bundle.zip and pulled to the workspace
+  (local/profiles/). Config kept: config_profile_7788_sgd_mb2_mlprecomp.json.
+  Verdict for mb2 experiments: GPU-resident states (lion8) need this mlp
+  recompute to fit at 7788+mb2; throughput NOTE — mb2 steps cost ~46s vs 36s
+  at mb1 for the SAME 32 images, so doubling the microbatch did NOT improve
+  images/s (pipeline was already saturated; fwdbwd is GEMM-bound). Next probe
+  candidates: lion8/lion8paged + mlp-recompute (memory now allows), and/or
+  revert to mb1 for max throughput. Live k2-lion-v3 RELAUNCHED after the
+  probes on config_full_epoch.json (lion, mb1, 7779) — resumes WEIGHTS-ONLY
+  from full_step_26200 per the config's full_checkpoint pointer (NOT the
+  newest ckpt): fresh momentum + 100-step warmup, ~500 steps of redo.
+
+- Streaming inference integrated (2026-09-26): ramtorch venv upgraded 1.8.0
+  -> 1.11.0 for Pipeline.infer_loop/infer_submit/infer_open (persistent stage
+  workers, no drain/refill between rounds). GOTCHA: 'uv pip install --upgrade
+  ramtorch' silently dragged torch 2.10->2.14 and broke the env (Qwen3VL
+  import failure + corrupted nvidia-cudnn/cusparseLt payloads); fixed with
+  'uv sync --reinstall' (restores the lock) THEN 'uv pip install --no-deps
+  ramtorch==1.11.0' to layer the new ramtorch without dep changes.
+  check_chunk_parity 18/18 on 1.11.0. krea2/inference.py sample_pipeline got
+  an opt-in streaming=True path (+--streaming CLI): the Euler loop runs
+  through infer_loop with per-microbatch CFG pairs ([uncond_i, cond_i] rows
+  per microbatch — per-sample independence required by the API); unequal
+  caption lengths are equalized by zero-padding the shorter text block with
+  masked-off rows, keeping ALL real text/img rope positions byte-identical
+  (re-deriving pos at the padded length shifts image rope and changes outputs
+  O(1) — do not do that). Two hard-won gotchas: (1) infer_loop(steps=N) runs
+  N model rounds but only N-1 update_fn calls — pass steps=len(ts) or you
+  drop the final Euler update; (2) streamed outputs arrive on the LAST
+  stage's device — .to(driver) before scheduler math. Verified on CPU tiny
+  harness (check_streaming_sample.py): bitwise-identical images vs the
+  barriered path, CFG and no-CFG. Real-model benchmark on the live 4-GPU
+  pipeline (2 prompts, 28 steps, 1024px, warm caches): barrier 193s vs
+  streaming 94s END-TO-END = ~2.05x (the 28x2 barriered infer() calls each
+  joined workers + synced 4 devices; streaming keeps workers resident).
+  Images match (mean pixel diff ~0.3-0.5/255, amplified kernel-order noise).
+  Benchmark dirs: previews/bench_barrier*, previews/bench_stream; copies in
+  the workspace. NOTE: preview() in train.py still uses the barriered path
+  (ragged grouped microbatches + per-pass set_seq make it a harder refactor).
+  Live k2-lion-v3 relaunched again after the benchmark (resumes 26200 per
+  config pointer).
+
+- Perfetto capture set produced (2026-09-26): three traces now in profiles/
+  (copies in the workspace local/profiles/): (1) k2_train_2step.json.gz 21MB —
+  2 training steps, stable config (lion/mb1/7779); fwdbwd 76% / data 24%,
+  opt ~0.1s, peak VRAM 62-77GB. (2) k2_infer_stream.json.gz 3MB — the NEW
+  streaming inference loop (infer_loop) on the real 12B pipeline, 2 steps
+  captured. (3) k2_train_preview_2step.json.gz 52.5MB — 2 training steps PLUS
+  the trainer's preview (barriered inference) INSIDE the same window:
+  profile_trace warmup=0 active=2 + eval_interval=2 fires the preview after
+  step 2 inside the capture; config kept as
+  config_profile_2step_preview.json. Inference.py --profile now also works
+  with --streaming (whole-loop window: warmup 0 / active 1 semantics). All
+  open at ui.perfetto.dev. Live k2-lion-v3 relaunched after the captures
+  (resumes full_step_26200 per config pointer).
+
+- cuDNN crash root-caused + fixed via cudnn upgrade (2026-09-27): the second
+  mha_graph.execute(...).is_good()==false crash hit at step 27114 (13.4h into
+  the full-epoch run; first incident 26346 — roughly every ~800 steps / many
+  hours). Root cause is NOT the trainer: upstream pytorch #190321 documents
+  the identical intermittent failure (same error, same Qwen3-VL family),
+  traced to cuDNN fused-MHA plan/workspace selection that is memory-state
+  dependent with dynamic shapes; NeMo #2659 confirms the kernel defect was
+  fixed in cuDNN >9.20; our venv had nvidia-cudnn-cu12 9.10.2.21 on Blackwell
+  sm_120 running bool-masked attention BACKWARD through cuDNN (the fragile
+  path — a HF model card describes the exact training-loop death). Fix:
+  nvidia-cudnn-cu12 upgraded --no-deps to 9.26.0.51 (torch 2.10 untouched,
+  import + check_chunk_parity 18/18 verified). Resume hardening: bumped
+  config_full_epoch full_checkpoint 26200->27000 (the crashed run had banked
+  26800+27000), initial_global_step 27001, AND parquet_dataloader.offset
+  0->800 (offset unit = batches/steps of the epoch plan; verified the epoch
+  replanned 23054->22254 = exactly -800) so the sample stream continues where
+  the crashed run stopped instead of re-feeding 800 steps. GOTCHAS: uv pip
+  upgrade of any nvidia/torch-adjacent package can drag torch — always
+  --no-deps for leaf packages and re-verify torch version + Qwen3VL import
+  after; full_checkpoint in the config is an EXPLICIT pointer (set_seq-style
+  resume), it never auto-latest. If the crash recurs on 9.26 despite this,
+  next levers: torch.cuda.memory.set_per_process_memory_fraction(0.9)
+  (NVIDIA-suggested memory-state workaround in #190321) or
+  torch.backends.cuda.enable_cudnn_sdp(False) (falls back off cuDNN; bool
+  mask then needs mem-efficient/math — slower). Live k2-lion-v3 relaunched:
+  step 27006 on the shifted stream, ~33s/it, epoch now 22254 steps.
+
+## 2026-09-30 — Tag-code embedding: bit-code encoder built, DDP smoke green
+
+- tags_v2 vocab rebuilt from v3 corpora: 227,961 tags (v3 has 228,653 unique
+  normalized; coverage of tags_v1 was 84.9% distinct / 98.1% instances — v2
+  adds the missing ~34k incl. e621 rating tags).
+- Bit codes: 24-bit was MATHEMATICALLY IMPOSSIBLE at min-hamming 4 (Hamming
+  bound: ball 2325 words x 228k codes needs 2^30). Final: 30-bit words, d=4,
+  invariant greedy with a banned-neighborhood bitmask (2GB bool over 2^30):
+  accept word -> OR its ball; same-round accepts ban incrementally so the
+  invariant never breaks. 27s for all 228k, sample-verified d=4, 0 dupes.
+  Gotchas along the way: sampled-ref filter alone leaves d=1 pairs (birthday
+  effect); per-tag exact repair is O(viol x n) = 448GB churn per batch
+  (unusable); same-round batch-accept corrupts the invariant unless each
+  accept bans before the next word is considered. 24b file deleted.
+- krea2/model/tag_code.py TagCodeEmbedder: tag_id -> 30-bit code (zero word
+  = uncond anchor; tag t uses codes[t+1]) -> {-1,+1}/sqrt(30) -> sum of
+  60 per-bit 6144-d embeddings -> RMSNorm -> 2-layer residual MLP -> RMSNorm.
+  Dense ~76M params, fp32 masters, rides the main optimizer (RowAdamW dies).
+  Contract kept: bag semantics (per-token, no cross-tag mixing), all-masked
+  = exact no-op, permutation-equivariant, fingerprint-checked on load.
+- mmdit.forward: tag branch now falls back to self.tagcode when tagembed is
+  None (same position/mask contract, taglen folded into txtlen as before).
+- krea2/train_tags_ddp.py + configs/train_tags_ddp.json: DDP trainer
+  (MultiGPUWrapper ZeRO-1, bf16 frozen base 25.6GB/GPU + fp32 LoRA/tagcode
+  masters 194M total trainable, Lion 1e-4). Base = k2-lion v3
+  full_step_30000 (v3 paused at 30000, PAUSE_WATCHDOG file set; remove it +
+  restart_oom.sh to resume v3). Data: v3 5 sources, tag_column=tags, per-tag
+  dropout 10% (dropped token -> anchor), uncond drops caption+tagblock.
+  256px batch 8/GPU. Smoke 3 steps green: 81GB peak, ckpt saves.
+- Gotchas: MultiGPUWrapper casts EVERY replica to its dtype arg (fp32 =
+  51GB/GPU OOM) — pass bf16 and re-cast trainable masters to fp32 after
+  setup() (ownership survives via Parameter identity); inject_lora creates
+  lora_A/B on CPU regardless of module device (the wrapper .to() fixes it);
+  monolithic forward at 256px/batch8 without grad_ckpt = 60GB activations —
+  d.grad_ckpt=True is mandatory (fwd+bwd peak 57GB with it).

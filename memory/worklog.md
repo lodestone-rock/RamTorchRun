@@ -3533,3 +3533,50 @@ Gotchas:
   lora_A/B on CPU regardless of module device (the wrapper .to() fixes it);
   monolithic forward at 256px/batch8 without grad_ckpt = 60GB activations —
   d.grad_ckpt=True is mandatory (fwd+bwd peak 57GB with it).
+
+## 2026-09-30 — Tag-KV injection: tags become per-block keys/values; DDP run launched
+
+- User redesign: tag tokens no longer ride the sequence. `tag_mode: "kv"`
+  (new SingleMMDiTConfig field; default "context" is the old path bit-for-bit)
+  appends the tag encoder's output to the wk/wv INPUT ONLY in every block —
+  q, gate and out stay on the [txt|img] sequence, tag rows produce no output
+  and never enter the residual stream (pseudo cross-attention). Gradient to
+  the tag encoder becomes 28 shallow one-block paths instead of one
+  28-block-deep chain; tags also stop paying q/out/MLP compute per block
+  (kv cost unchanged — they were already keys). No per-block adapter: the
+  block's own (LoRA) kv weights do the per-layer differentiation.
+- Mechanism: `Attention.forward(kv_extra=...)` concats [x; tag_emb] before the
+  UNFUSED wk/wv (wq untouched — zero wasted tag-q FLOPs); the RoPE table is
+  built at kv length (sequence rows then the TAG_POS_AXIS0 marker rows), q
+  reads the first L rows; the mask becomes rectangular (B,1,L,L+T).
+  prepare() is UNCHANGED — callers still build [txt|tags|img] pos/mask and
+  the model peels the tag span (txtlen excludes tags in kv mode, so the head
+  slice and per-token-t fill are unchanged). local_attention raises under kv.
+  CONTRACT: the tag span of the mask TENSOR is the visibility source of
+  truth; the tag_mask argument only zeroes the encoder output. Trainer and
+  sampler already build these consistently.
+- cuDNN probe (scratchpad/kv_sdpa_probe.py): q_len != kv_len + rectangular
+  bool mask + GQA 48/12 runs fine on cudnn 9.26, fwd AND bwd, on all tested
+  shapes (bf16-noise agreement vs math; 1.0ms vs 18ms). Masked-tag sample ==
+  tagless sample BITWISE. mem_eff/flash have NO kernel for this shape class —
+  cudnn is the only fused path, math the only fallback.
+- `krea2/tools/check_tag_kv.py` (13 CPU checks, all pass): untagged kv ==
+  base bitwise; all-masked block == base bitwise with EXACTLY zero tagcode
+  grad, with and without grad_ckpt; permutation invariance 2.4e-7; tags
+  absent from the residual stream; grad reaches the encoder; anchor-id
+  all-masked block (CFG negative) == base. check_chunk_parity 18/18 and
+  check_tag_embed 28/28 still green (context path untouched; chunk chain
+  kv support is a later phase — DDP-only for now).
+- DDP smoke 3 steps green (loss .31/.19/.30, peak 77GB vs 81 in-context —
+  tags left the MLPs). Full run LAUNCHED: tmux `k2-tags-kv`, config
+  `train_tags_kv.json` (= the tagsddp recipe verbatim + tag_mode kv; base =
+  v3 full_step_30000), run dir `runs/k2-tags-kv-256`. 4.05 s/step at 256px,
+  ~80GB/GPU. The in-context run (k2-tagsddp, step 3000 banked) was stopped
+  on user call with <=400 unsaved steps — no A/B; kv is the line now.
+- Gotchas: (1) pos/mask carrying a tag span with tag_ids=None crashes on a
+  seq/mask length mismatch after the 256 pad — production callers never do
+  this, but check tools must build tagless inputs with taglen=0; (2) probe
+  traps: a fresh randn_like upstream grad per backend makes grad comparisons
+  garbage (rel err sqrt(2) = uncorrelated, not bf16 noise); unsqueeze(2) vs
+  unsqueeze(3) TRANSPOSES the rectangular mask (queries: unsqueeze(1)+(3),
+  keys: unsqueeze(1)+(2)).

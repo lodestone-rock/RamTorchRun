@@ -1,5 +1,5 @@
 {
-  "_comment": "Tag-conditioning run: rank-32 LoRA on the whole backbone + full-rank TagCodeEmbedder (30-bit tag codes -> 2-layer residual MLP at 6144), DDP via ramtorch MultiGPUWrapper (ZeRO-1). Base = k2-lion v3 full_step_30000, FROZEN bf16; trainable = LoRA + tag MLP (~76M dense + 60M LoRA). Data: trainer_samples_v3, all 5 sources; caption = 5 bands incl. tags-as-text (weight 1.0, shuffled, never dropped); tag_column tags -> per-tag 10% dropout (each dropped token -> anchor code 0); uncond_ratio 0.1 drops caption AND whole tag block (bit-exact no-op). 256px first, 2 plan-epochs; preview at 1000-step cadence (28 steps @ 1024res, ~5% overhead), save every 1000 into ckpts/ (steps_per_epoch omitted = full pass 20175 steps), then switch to 512. Codes: checkpoints/tag_vocab/codes_v2_30b.parquet (min hamming 4, fingerprint-bound to tags_v2).",
+  "_comment": "Tag-KV run: tag embeddings injected as per-block KEYS/VALUES only (tag_mode=kv, pseudo cross-attention) instead of riding the sequence \u2014 gradient to the TagCodeEmbedder is a shallow one-block path from each of the 28 blocks instead of one 28-block-deep chain, and tag rows never enter the residual stream. Everything else is the in-context tagsddp recipe verbatim for a clean comparison: rank-32 LoRA on the whole backbone + full-rank TagCodeEmbedder (30-bit codes -> 2-layer residual MLP at 6144), DDP via ramtorch MultiGPUWrapper (ZeRO-1). Base = k2-lion v3 full_step_30000, FROZEN bf16; trainable = LoRA + tag MLP (~76M dense + 60M LoRA). Data: trainer_samples_v3, all 5 sources; caption = 5 bands incl. tags-as-text (weight 1.0, shuffled, never dropped); tag_column tags -> per-tag 10% dropout (each dropped token -> anchor code 0); uncond_ratio 0.1 drops caption AND whole tag block (bit-exact no-op). 256px first (steps_per_epoch omitted = full pass 20175 steps), preview at 1000-step cadence (28 steps @ 1024res), save every 1000 into ckpts/, then switch to 512. Codes: checkpoints/tag_vocab/codes_v2_30b.parquet (min hamming 4, fingerprint-bound to tags_v2).",
   "seed": 42,
   "initial_global_step": 0,
   "full_checkpoint": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-lion/1024-resume-25600-v3/ckpts/full_step_30000.safetensors",
@@ -45,8 +45,8 @@
   "save_final": true,
   "preview_steps": 28,
   "max_steps": 0,
-  "ckpt_path": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-tagsddp-256",
-  "preview_path": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-tagsddp-256/previews",
+  "ckpt_path": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-tags-kv-256",
+  "preview_path": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-tags-kv-256/previews",
   "parquet_dataloader": {
     "parquet_sources": {
       "danbooru": {
@@ -116,5 +116,6 @@
       "credential_file": "/mnt/datapool_u2/lodestone/RamTorchRun/credential/local-rustfs-readonly.json",
       "strip_prefix": "/mnt/nas_buckets/"
     }
-  }
+  },
+  "tag_mode": "kv"
 }

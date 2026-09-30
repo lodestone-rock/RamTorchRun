@@ -37,8 +37,8 @@ import torch
 import torch.nn.functional as F
 import pyarrow.parquet as pq
 from einops import rearrange
-from PIL import Image
 from safetensors.torch import load_file, save_file
+from PIL import Image
 from torch.optim.lr_scheduler import LinearLR
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
@@ -138,37 +138,101 @@ def make_train_factory(cfg: dict, dit_cfg, vocab_size: int, code_path: str,
 
 
 @torch.no_grad()
-def preview(student, conditioner, ae, prompts, patch, resolution, steps, seed,
-            out_path, dev, cfg_scale=4.5):
-    student.eval()
-    context, txtmask = conditioner(prompts)
-    txtlen = context.shape[1]
-    b = len(prompts)
-    h = w = resolution // 8
-    tag_ids = torch.zeros(b, 1, dtype=torch.int64, device=dev)  # anchor-only: no tags at preview
-    tag_mask = torch.zeros(b, 1, dtype=torch.bool, device=dev)
-    gen = torch.Generator(device=dev).manual_seed(seed)
-    x = torch.randn(b, 16, h, w, device=dev, dtype=torch.bfloat16, generator=gen)
+def preview_dataset(model, conditioner, ae, pieces, patch, resolution, steps,
+                    out_path, dev, cfg_scale=4.5, mu_y1=0.5, mu_y2=1.15,
+                    mu_sigma=1.0, minres=256, maxres=1280, mu_override=None,
+                    preview_res=512, seed=0):
+    """Dataset-driven preview: rows = conditioning variants, cols = samples.
 
-    # cond + uncond contexts
-    ctx_u, mask_u = conditioner([""] * b)
-    ts = torch.linspace(1.0, 0.0, steps + 1, device=dev)
-    for i in range(steps):
-        t = ts[i].expand(b)
-        x_tok, pos, mask = prepare(x, txtlen, patch, txtmask, taglen=1, tagmask=tag_mask)
-        x_tok_u, pos_u, mask_u2 = prepare(x, ctx_u.shape[1], patch, mask_u, taglen=1, tagmask=tag_mask)
-        with torch.autocast("cuda", torch.bfloat16):
-            v_c = student(x_tok, context, t, pos, mask, tag_ids, tag_mask)
-            v_u = student(x_tok_u, ctx_u, t, pos_u, mask_u2, tag_ids, tag_mask)
-            v = v_u + cfg_scale * (v_c - v_u)
-        v = rearrange(v.float(), "b (h w) (c ph pw) -> b c (h ph) (w pw)",
-                      h=h // patch, w=w // patch, ph=patch, pw=patch)
-        x = (x.float() + (ts[i + 1] - ts[i]) * v).to(torch.bfloat16)
-    pixels = vae_decode(ae, x).clamp(-1, 1)
-    grid = make_grid(pixels, nrow=b, normalize=True, value_range=(-1, 1))
-    Image.fromarray((grid.mul(255).add(0.5).clamp(0, 255).permute(1, 2, 0)
-                     .to("cpu", torch.uint8)).numpy()).save(out_path, quality=95)
-    print(f"[preview] Saved {out_path}")
+    ``pieces``: list of per-GPU dicts {images [b,3,H,W] (CPU float [-1,1]),
+    captions [b], tag_ids [b,T], tag_mask [b,T]} — the batch each GPU just
+    trained on (real data -> the GT row is meaningful). Each GPU renders its
+    own b samples in 4 conditioning variants; the caller stitches
+    [4, total_b, 3, H, W] across GPUs into the grid.
+
+    Rows (top->bottom):
+      1. both — text caption + real tag embeddings, CFG
+      2. text — caption only, tag block all-anchor, CFG
+      3. tags — tag embeddings only, caption blanked, CFG
+      4. gt — dataset images, bilinear-upscaled to the sampling resolution
+
+    Sampling renders NATIVE 1024 regardless of training resolution — the
+    point is to see the conditioning effect at full quality. The GT row is
+    the dataset image bilinear-upscaled to 1024 for an honest comparison.
+    All rows share one noise draw + schedule per sample, so row differences
+    are pure conditioning. CFG uncond pass = blank caption + anchor tags.
+    """
+    model.eval()
+    torch.cuda.set_device(dev)   # thread-local: allocations land on this GPU
+    h = w = preview_res // 8
+    b = len(pieces[0]["captions"])
+    device = dev
+
+    ctx_full, m_full = conditioner(pieces[0]["captions"])
+    ctx_none, m_none = conditioner([""] * b)
+    tag_ids = pieces[0]["tag_ids"].to(device)
+    tag_mask = pieces[0]["tag_mask"].to(device)
+
+    compression = 8
+    x1 = (minres // (compression * patch)) ** 2
+    x2 = (maxres // (compression * patch)) ** 2
+    mu = mu_override if mu_override is not None else _mu_from_seq_len(
+        h * w, x1, x2, mu_y1, mu_y2)
+
+    gen = torch.Generator(device=device).manual_seed(seed)
+    init_noise = torch.randn(b, 16, h, w, device=device, dtype=torch.bfloat16,
+                             generator=gen)
+    u_ids = torch.zeros_like(tag_ids)
+    u_msk = torch.zeros_like(tag_mask)
+    ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
+
+    def sample_one_sample(j: int) -> torch.Tensor:
+        """Render ONE sample's 3 sampling variants (batch-1 forwards).
+
+        Within a GPU, samples render sequentially: a single 1024-res sample's
+        activations are tiny next to the resident training state, so batch-1
+        is the OOM-safe unit. (Parallelism lives ACROSS GPUs — the caller
+        runs one thread per GPU.)
+        """
+        ctx_f, m_f = ctx_full[j:j + 1], m_full[j:j + 1]
+        ctx_n, m_n = ctx_none[j:j + 1], m_none[j:j + 1]
+        ids_f, msk_f = tag_ids[j:j + 1], tag_mask[j:j + 1]
+        noise = init_noise[j:j + 1].clone()
+
+        def sample(ctx, cmask, ids, msk):
+            x = noise.clone()
+            for i in range(steps):
+                t = ts[i].expand(1)
+                x_tok, pos, mask = prepare(x, ctx.shape[1], patch, cmask,
+                                           taglen=ids.shape[1], tagmask=msk)
+                x_tok_u, pos_u, mask_u = prepare(x, ctx_n.shape[1], patch,
+                                                 m_n, taglen=ids.shape[1],
+                                                 tagmask=u_msk[j:j + 1])
+                with torch.autocast("cuda", torch.bfloat16):
+                    v_c = model(x_tok, ctx, t, pos, mask, ids, msk)
+                    v_u = model(x_tok_u, ctx_n, t, pos_u, mask_u, u_ids[j:j + 1], u_msk[j:j + 1])
+                v = v_u + cfg_scale * (v_c - v_u)
+                v = rearrange(v.float(), "b (h w) (c ph pw) -> b c (h ph) (w pw)",
+                              h=h // patch, w=w // patch, ph=patch, pw=patch)
+                x = (x.float() + (ts[i + 1] - ts[i]) * v).to(torch.bfloat16)
+            return x
+
+        latents = [
+            sample(ctx_f, m_f, ids_f, msk_f),                 # both
+            sample(ctx_f, m_f, u_ids[j:j + 1], u_msk[j:j + 1]),   # text only
+            sample(ctx_n, m_n, ids_f, msk_f),                 # tags only
+        ]
+        pixels = [vae_decode(ae, xl).clamp(-1, 1) for xl in latents]
+        gt = pieces[0]["images"][j:j + 1].to(device, torch.bfloat16)
+        gt = F.interpolate(gt, size=(h * 8, w * 8), mode="bilinear",
+                           align_corners=False).clamp(-1, 1)
+        pixels.append(gt)
+        return torch.stack(pixels, dim=0).cpu()               # [4, 1, 3, R, R]
+
+    outs = [sample_one_sample(j) for j in range(b)]
+    stack = torch.cat(outs, dim=1)                            # [4, b, 3, R, R]
+    model.train()
+    return stack
 
 
 def train(cfg: dict, config_path: str):
@@ -187,6 +251,12 @@ def train(cfg: dict, config_path: str):
 
     bases, conditioners, aes, dit_cfg, enc_cfg = build_frozen(cfg, devices)
     patch = dit_cfg.patch
+    # "context" (tags in the sequence) vs "kv" (tags as per-block keys/values,
+    # never in the residual stream). One config field flips the whole forward;
+    # the frozen bases never receive tag_ids, so the mode only affects the
+    # trainable replicas built in make_train_factory.
+    dit_cfg.tag_mode = str(cfg.get("tag_mode", "context"))
+    print(f"  tag_mode: {dit_cfg.tag_mode}")
 
     os.makedirs(cfg["ckpt_path"], exist_ok=True)
     os.makedirs(cfg["preview_path"], exist_ok=True)
@@ -198,12 +268,34 @@ def train(cfg: dict, config_path: str):
     uncond_ratio = float(cfg.get("uncond_ratio", 0.1))
     tag_drop_prob = float(cfg.get("tag_code", {}).get("tag_drop_prob", 0.1))
     minres, maxres = cfg.get("minres", 256), cfg.get("maxres", 1280)
+    mu_y1 = cfg.get("mu_y1", 0.5)
+    mu_y2 = cfg.get("mu_y2", 1.15)
+    mu_sigma = cfg.get("mu_sigma", 1.0)
+    mu_override = cfg.get("mu_override")
     max_steps = cfg.get("max_steps", 0)
     eval_interval = int(cfg.get("eval_interval", 50))
     save_every = int(cfg.get("save_every_n_steps", 200))
     master_seed = int(cfg.get("seed", 42))
     global_step = int(cfg.get("initial_global_step", 0))
     compression = 8
+
+    # Resume: pick up the newest tagslora checkpoint unless the config says
+    # otherwise. The save format (lora + tagcode + code buffers) is exactly
+    # what MultiGPUWrapper._apply_state_dict expects via checkpoint_path.
+    resume_path = cfg.get("resume_checkpoint")
+    if resume_path is None:
+        import glob as _glob
+        import re as _re
+        cands = (_glob.glob(os.path.join(cfg["ckpt_path"], "ckpts", "tagslora_step_*_ckpt.safetensors"))
+                  or _glob.glob(os.path.join(cfg["ckpt_path"], "tagslora_step_*_ckpt.safetensors")))
+        if cands:
+            latest = max(cands, key=lambda p: int(_re.search(r"step_(\d+)_", p).group(1)))
+            resume_path = latest
+    if resume_path and not cfg.get("fresh_start"):
+        n0 = int(__import__("re").search(r"step_(\d+)_", resume_path).group(1))
+        if n0 > global_step:
+            global_step = n0
+        print(f"[resume] from {resume_path} (step {global_step})")
 
     lion_options = validate_lion_config(cfg)
     if lion_options is not None:
@@ -224,6 +316,7 @@ def train(cfg: dict, config_path: str):
         scheduler_factory=lambda o: LinearLR(o, start_factor=1e-5, end_factor=1.0,
                                              total_iters=warmup_steps),
         n_gpus=n_gpus,
+        checkpoint_path=(resume_path or ""),
         # The wrapper unconditionally casts every replica to `dtype` after
         # moving to device. bf16 keeps the frozen base at 25.6GB; trainable
         # masters are re-cast to fp32 below (the wrapper exposes .models as
@@ -343,7 +436,9 @@ def train(cfg: dict, config_path: str):
         sd = {k: v.detach().cpu().contiguous()
               for k, v in wrapper.model.state_dict().items()
               if p_requires_grad(k, wrapper.model)}
-        path = os.path.join(cfg["ckpt_path"], f"tagslora_step_{global_step}_{tag}.safetensors")
+        ckpt_dir = os.path.join(cfg["ckpt_path"], "ckpts")   # housekeep sweeps runs/*/ckpts
+        os.makedirs(ckpt_dir, exist_ok=True)
+        path = os.path.join(ckpt_dir, f"tagslora_step_{global_step}_{tag}.safetensors")
         save_file(sd, path)
         print(f"[ckpt] Saved {len(sd)} tensors -> {path}")
 
@@ -398,11 +493,54 @@ def train(cfg: dict, config_path: str):
                 csv_file.flush()
 
             if eval_interval and global_step % eval_interval == 0:
-                preview(wrapper.model, conditioners[driver], aes[driver], prompts,
-                        patch, resolution, cfg.get("preview_steps", 12),
-                        master_seed + global_step,
-                        os.path.join(cfg["preview_path"], f"step_{global_step}.jpg"),
-                        driver)
+                # Dataset-driven 4-row preview. PARALLEL ACROSS GPUs (one
+                # thread per GPU via the wrapper executor); WITHIN a GPU the
+                # samples render one at a time (batch-1 forwards — the OOM-safe
+                # unit next to the resident training state). 4 GPUs -> 4
+                # samples in flight at once.
+                prev_res = int(cfg.get("preview_res", 1024))
+                prev_steps = int(cfg.get("preview_steps", 12))
+                # Preview renders through the WRAPPER's own long-lived executor
+                # threads (same threading proven by thousands of training
+                # steps). Per thread: set_device (thread-local), torch.no_grad,
+                # one sample at a time (batch-1 forwards are the OOM-safe unit
+                # next to the resident training state). No empty_cache, no
+                # backend swapping from worker threads.
+
+                def render(g):
+                    dev_g = devices[g]
+                    piece = {
+                        "images": images[g * per:(g + 1) * per][:2].cpu(),
+                        "captions": captions[g * per:(g + 1) * per][:2],
+                        "tag_ids": tag_ids[g * per:(g + 1) * per][:2],
+                        "tag_mask": tag_mask[g * per:(g + 1) * per][:2],
+                    }
+                    try:
+                        with torch.cuda.device(dev_g), torch.no_grad():
+                            return preview_dataset(
+                                wrapper.models[g], conditioners[dev_g],
+                                aes[dev_g], [piece], patch, resolution,
+                                prev_steps, None, dev_g,
+                                cfg_scale=cfg.get("preview_cfg_scale", 4.5),
+                                mu_y1=mu_y1, mu_y2=mu_y2, mu_sigma=mu_sigma,
+                                minres=minres, maxres=maxres, mu_override=mu_override,
+                                preview_res=prev_res, seed=master_seed + global_step)
+                    finally:
+                        wrapper.models[g].train()
+
+                stacks = list(wrapper.executor.map(render, range(n_gpus)))
+                grid_stack = torch.cat(stacks, dim=1)      # [4, n_gpus*2, 3, R, R]
+                # make_grid wants 4D: flatten variant-major -> [4*cols, 3, R, R],
+                # then nrow=cols lays out 4 rows of cols in exactly that order.
+                flat = grid_stack.flatten(0, 1)
+                grid = make_grid(flat, nrow=flat.shape[0] // 4,
+                                 normalize=True, value_range=(-1, 1))
+                arr = (grid.mul(255).add(0.5).clamp(0, 255).permute(1, 2, 0)
+                       .to("cpu", torch.uint8).numpy())
+                img_path = os.path.join(cfg["preview_path"], f"step_{global_step}.jpg")
+                Image.fromarray(arr).save(img_path, quality=95)
+                print(f"[preview] Saved {img_path} "
+                      f"(rows: both | text | tags | gt, cols: {grid_stack.shape[1]})")
             if save_every and global_step % save_every == 0:
                 save("ckpt")
             if max_steps and global_step >= max_steps:

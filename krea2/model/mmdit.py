@@ -37,13 +37,15 @@ def rope(pos: Tensor, dim: int, theta: float = 1e4, ntk: float = 1.0) -> Tensor:
     return out.float()
 
 
-def ropeapply(xq: Tensor, xk: Tensor, freqs: Tensor) -> tuple[Tensor, Tensor]:
-    xq_ = xq.float().reshape(*xq.shape[:-1], -1, 1, 2)
-    xk_ = xk.float().reshape(*xk.shape[:-1], -1, 1, 2)
+def _rope_one(x: Tensor, freqs: Tensor) -> Tensor:
+    x_ = x.float().reshape(*x.shape[:-1], -1, 1, 2)
     freqs = freqs[:, None, :, :, :]
-    xq_ = freqs[..., 0] * xq_[..., 0] + freqs[..., 1] * xq_[..., 1]
-    xk_ = freqs[..., 0] * xk_[..., 0] + freqs[..., 1] * xk_[..., 1]
-    return xq_.reshape(*xq.shape).to(xq.dtype), xk_.reshape(*xk.shape).to(xk.dtype)
+    x_ = freqs[..., 0] * x_[..., 0] + freqs[..., 1] * x_[..., 1]
+    return x_.reshape(*x.shape).to(x.dtype)
+
+
+def ropeapply(xq: Tensor, xk: Tensor, freqs: Tensor) -> tuple[Tensor, Tensor]:
+    return _rope_one(xq, freqs), _rope_one(xk, freqs)
 
 
 # sdpa_kernel() saves/restores PROCESS-GLOBAL backend flags — it is not
@@ -126,6 +128,15 @@ class SingleMMDiTConfig:
     # (the default) leaves the model bit-identical to a build without it.
     tag_vocab: int = 0
     tag_dim: int = 512
+    # How tag tokens reach the attention. "context" (default) concatenates them
+    # onto the sequence between the text prefix and the image tokens — they ride
+    # every block and are refined per layer. "kv" instead keeps them OUT of the
+    # residual stream: the tag encoder's output is passed to every block as
+    # extra keys/values only (pseudo cross-attention), so the gradient to the
+    # tag encoder is a shallow one-block path from every layer instead of one
+    # 28-block-deep chain. Only the monolithic forward supports "kv" for now;
+    # the chunk chain (pipeline trainers) is context-mode.
+    tag_mode: str = "context"
 
 
 class SimpleModulation(torch.nn.Module):
@@ -256,16 +267,29 @@ class Attention(torch.nn.Module):
         self.wo = torch.nn.Linear(dim, dim, bias=bias)
 
     def forward(
-        self, qkv: Tensor, freqs: Tensor | None = None, mask: Tensor | None = None
+        self,
+        qkv: Tensor,
+        freqs: Tensor | None = None,
+        mask: Tensor | None = None,
+        kv_extra: Tensor | None = None,
     ) -> Tensor:
+        """kv_extra: optional [B, T, dim] tag embeddings appended to the KEYS
+        and VALUES only (pseudo cross-attention). Queries, the gate and the
+        output stay on the input sequence — the extra rows never enter the
+        residual stream. When given, `freqs` must be at kv length (L+T rows:
+        sequence positions then the tag marker rows) and `mask` must be
+        (B, 1, L, L+T)."""
         selective = getattr(self, "_selective_checkpoint_enabled", False)
+        kv_in = torch.cat((qkv, kv_extra.to(qkv.dtype)), dim=1) if kv_extra is not None else qkv
         if selective:
             with checkpoint_component("attn.qkv"):
-                q, k, v = self.wq(qkv), self.wk(qkv), self.wv(qkv)
+                q = self.wq(qkv)
+                k, v = self.wk(kv_in), self.wv(kv_in)
             with checkpoint_component("attn.gate"):
                 gate = self.gate(qkv)
         else:
-            q, k, v, gate = self.wq(qkv), self.wk(qkv), self.wv(qkv), self.gate(qkv)
+            q, gate = self.wq(qkv), self.gate(qkv)
+            k, v = self.wk(kv_in), self.wv(kv_in)
 
         q, k, v = (
             rearrange(q, "B L (H D) -> B H L D", H=self.heads),
@@ -275,7 +299,12 @@ class Attention(torch.nn.Module):
 
         q, k, v = self.qknorm(q, k, v)
         if freqs is not None:
-            q, k = ropeapply(q, k, freqs)
+            if kv_extra is not None:
+                # kv-length table: q reads the sequence rows, k the whole thing.
+                q = _rope_one(q, freqs[:, : q.shape[2]])
+                k = _rope_one(k, freqs)
+            else:
+                q, k = ropeapply(q, k, freqs)
         impl = getattr(self, "attention_impl", attention)
         if selective:
             # Enclose the implementation, so fused SDPA and math QK/AV matmuls
@@ -401,11 +430,16 @@ class SingleStreamBlock(nn.Module):
         self.mlp = SwiGLU(features, multiplier, bias)
 
     def forward(
-        self, x: Tensor, vec: Tensor, freqs: Tensor, mask: Tensor | None = None
+        self,
+        x: Tensor,
+        vec: Tensor,
+        freqs: Tensor,
+        mask: Tensor | None = None,
+        kv_extra: Tensor | None = None,
     ) -> Tensor:
         prescale, preshift, pregate, postscale, postshift, postgate = self.mod(vec)
         x = x + pregate * self.attn(
-            (1 + prescale) * self.prenorm(x) + preshift, freqs, mask
+            (1 + prescale) * self.prenorm(x) + preshift, freqs, mask, kv_extra
         )
         x = x + postgate * self.mlp((1 + postscale) * self.postnorm(x) + postshift)
 
@@ -502,9 +536,12 @@ class SingleStreamDiT(nn.Module):
         return_hidden_at: optional block indices; if given, returns
         (output, {idx: hidden}) where hidden is the block output sliced to
         image tokens, [B, N_img, D].
-        tag_ids/tag_mask: optional [B, T] tag lookup, inserted between the text
-        prefix and the image tokens. `pos`/`mask` must already carry the tag
-        rows (see `prepare(..., taglen=T)`).
+        tag_ids/tag_mask: optional [B, T] tag lookup. `pos`/`mask` must always
+        carry the tag rows laid out [text | tags | image] (see
+        `prepare(..., taglen=T)`). With config.tag_mode "context" (default) the
+        tag tokens are inserted into the sequence between the text prefix and
+        the image tokens; with "kv" they are stripped back out and injected as
+        keys/values only in every block (never in the residual stream).
         """
         img = self.first(img)
         per_token_t = t.dim() == 2
@@ -527,10 +564,28 @@ class SingleStreamDiT(nn.Module):
         # block counts as part of the prefix length.
         txtlen, imglen = context.shape[1], img.shape[1]
         tagembed = self.tagembed if self.tagembed is not None else getattr(self, "tagcode", None)
+        tag_mode = getattr(self.config, "tag_mode", "context")
+        kv_extra: Tensor | None = None   # kv-mode tag embeddings (never in the stream)
+        tag_pos = tag_rows = None
         if tag_ids is not None and tagembed is not None:
             tagtok = tagembed(tag_ids, tag_mask)
-            txtlen += tagtok.shape[1]
-            combined = torch.cat((context, tagtok, img), dim=1)
+            if tag_mode == "kv":
+                # KV-only injection ("pseudo cross-attention"): the tag encoder's
+                # output becomes extra keys/values in EVERY block, but never
+                # joins the residual stream — tag rows produce no output and the
+                # gradient to the tag encoder is a shallow one-block path from
+                # each layer instead of one 28-block-deep chain. pos/mask arrive
+                # laid out [text | tags | image] (prepare() keeps building them
+                # that way); peel the tag span off and keep it for the kv side.
+                taglen = tagtok.shape[1]
+                tag_pos, tag_rows = pos[:, txtlen : txtlen + taglen], mask[:, txtlen : txtlen + taglen]
+                pos = torch.cat((pos[:, :txtlen], pos[:, txtlen + taglen :]), dim=1)
+                mask = torch.cat((mask[:, :txtlen], mask[:, txtlen + taglen :]), dim=1)
+                kv_extra = tagtok
+                combined = torch.cat((context, img), dim=1)
+            else:
+                txtlen += tagtok.shape[1]
+                combined = torch.cat((context, tagtok, img), dim=1)
         else:
             combined = torch.cat((context, img), dim=1)
 
@@ -560,10 +615,24 @@ class SingleStreamDiT(nn.Module):
 
         local_attention = getattr(self, "local_attention", None)
         if local_attention is not None:
+            if kv_extra is not None:
+                raise NotImplementedError(
+                    "local_attention is incompatible with tag_mode='kv'"
+                )
             local_attention.prepare(mask, pos, txtlen, imglen)
-        mask = _mask(mask)
+        if kv_extra is not None:
+            # Rectangular (B, 1, L, L+T) mask: sequence queries see their normal
+            # sequence keys plus the tag keys; masked-off tag slots (per-token
+            # dropout, uncond, ragged rows) are dropped, which keeps an
+            # all-masked tag block an exact no-op. freqs run the kv length —
+            # sequence rows (unchanged positions) then the tag marker rows.
+            kv_rows = torch.cat((mask, tag_rows), dim=1)
+            mask = mask.unsqueeze(1).unsqueeze(3) * kv_rows.unsqueeze(1).unsqueeze(2)
+            freqs = self.posemb(torch.cat((pos, tag_pos), dim=1))
+        else:
+            mask = _mask(mask)
 
-        freqs = self.posemb(pos)
+            freqs = self.posemb(pos)
 
         hiddens: dict[int, Tensor] = {}
         hidden_only = (
@@ -572,9 +641,9 @@ class SingleStreamDiT(nn.Module):
         )
         for i, block in enumerate(self.blocks):
             if torch.is_grad_enabled() and getattr(self, 'grad_ckpt', False):
-                combined = checkpoint_block(block, combined, tvec, freqs, mask)
+                combined = checkpoint_block(block, combined, tvec, freqs, mask, kv_extra)
             else:
-                combined = block(combined, tvec, freqs, mask)
+                combined = block(combined, tvec, freqs, mask, kv_extra)
             if return_hidden_at is not None and i in return_hidden_at:
                 hiddens[i] = combined[:, txtlen : txtlen + imglen, :]
             if hidden_only and i >= max(return_hidden_at):

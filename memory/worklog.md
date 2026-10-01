@@ -3690,3 +3690,44 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   freeze the encoder at random init and train only a reader (LoRA on
   wk/wv) — the reverse cold-start test; an auxiliary per-tag loss; or stop
   the line. Run left stepping at decision time.
+
+## 2026-10-01 (cont.) — the periodic GPU-idle stalls: hunt + instrumented restart
+
+- User spotted 0%/100% GPU oscillation. Measured: median step 3.10s but
+  186/5849 steps stalled >6s (20-67s each) every ~25 steps — ~30% of wall
+  time. Hunt, in order:
+  - Loader suspected -> num_workers 2->8 / prefetch 2->8 restart at ckpt6000
+    (offset honored): SAME stall period. Workers not the bottleneck.
+  - Instrumented fb_fn + main loop (t_cond/t_vae/t_prep/t_fwd/t_bwd +
+    gap/step_total logged to trackio; restart-2 at ckpt7000, offset 7000).
+    **gap median 0.00s over 500 instrumented steps — the loader delivers
+    instantly; definitively exonerated** (the 8-worker bump fixed a
+    non-problem). multi_gpu.py is clean: executor.map joins per step by
+    design (ZeRO all-reduce needs it).
+  - Trackio show dashboard suspected (the LoRA control run, no trackio,
+    stalled only 0.8%; the tc runs with trackio ~5%): killed it — stalls
+    continued; restarted it — stalls STAYED gone. Exonerated both ways.
+  - The one caught stall: 7.0s ALL inside step_total (wrapper.step), GPUs
+    0%, workers idle, main process spiked to 270% CPU at stall onset.
+- **Post-restart-2 the run is CLEAN: 2/500 slow steps (one is the resume
+  cold-start, one mild 8.6s), median 3.20s, p90 3.40s** vs every ~20 steps
+  before. The fresh process cleared it — accumulated state in the 8h
+  process (candidates: CUDA allocator fragmentation despite
+  expandable_segments, cudnn plan cache, S3 client state), not a code path
+  and not any of the suspects above. The dashboard back up does NOT bring
+  the stalls back.
+- Instrumentation live in train_tags_ddp.py: if the stalls recur, the
+  step_total-vs-gap split localizes them (loader vs training) per step in
+  trackio; true GPU-phase attribution needs torch.cuda.synchronize() around
+  the t_* measurements (current t_* values are async launch times, ~0).
+- Trackio DB gotchas: the dying process logs a few post-checkpoint steps
+  (steps 7001-7014 exist in BOTH old and new key formats) — filter
+  instrumented queries on the grad_norm_t_cond key; the metrics column is
+  a BLOB so LIKE does not match (parse in Python). Monitor runs: trackio
+  show on wangaratta (tmux trackio-show) + a detached SSH tunnel
+  (ControlPath=none, setsid, immune to shell reaping) forwarding 7860 to
+  the workspace; localhost:7860 serves the dashboard.
+- Stallhunt tooling saved: scratchpad/tc_rearm.sh (+ tc_rearm7000.sh,
+  rearm*.sh pattern: wait for ckpt file -> stop after save -> relaunch with
+  edited config), scratchpad/tc_phase_analysis.py (phase medians + top
+  slow steps from the trackio DB).

@@ -3662,3 +3662,31 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   dashboard makes the dynamics visible. Open question the run answers:
   does a frozen reader change the collapse dynamics at all, or does the
   map homogenize identically?
+
+## 2026-10-01 (cont.) — tagcode-only at lr 2e-5: collapsed AGAIN, LR is not the lever
+
+- Collapse check at ckpt1000 of runs/k2-tags-kv-tc-256 (tagcode-only, no
+  LoRA, lr 2e-5, frozen backbone): tag-tag cos mean **1.0000** (min 0.9998)
+  over the 8-tag probe — identical to the lr 1e-4 LoRA runs at the same
+  step count. Script: runs/k2-tags-kv-tc-256/tagtag_cos.py (scratchpad copy
+  tagcode_tagtag_cos.py; needs the 3-deep sys.path shim when run from a run
+  dir — first watcher attempt died on ModuleNotFoundError).
+- The 5x lower LR changed nothing about the collapse in step space: Lion
+  sign updates make the DIRECTION dominant, and the consistent
+  homogenize gradient wins at any magnitude. bit_embed itself stayed at
+  init (||W|| 606.8 vs init ~609) — the collapse came through fc1/fc2
+  GROWING (||W|| 45 init -> 111.5/102.8, ~2.5x in 1000 steps, consistent
+  sign walk at +-2e-5) into a shared, tag-independent map whose output
+  swamps the bit-sum. Contrast with the LoRA run, where fc1/fc2 COLLAPSED
+  toward zero (norm 4197 -> 516): two different weight-space paths, same
+  tag-independent output. The MLP residual is the collapse vector either
+  way; the bit-sum path (bit_embed + RMSNorm) is inherently
+  tag-discriminative and stayed stable in every run.
+- Structural conclusion: loss-only training of the full encoder
+  homogenizes at any LR, with or without a trainable reader. The
+  per-tag information is destroyed by the MLP path, not by bit_embed.
+- Options (not implemented): train ONLY bit_embed with fc1/fc2 frozen at
+  init or dropped (preserves the 0.49-separation map by construction);
+  freeze the encoder at random init and train only a reader (LoRA on
+  wk/wv) — the reverse cold-start test; an auxiliary per-tag loss; or stop
+  the line. Run left stepping at decision time.

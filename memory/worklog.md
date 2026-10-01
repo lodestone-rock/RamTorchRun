@@ -3580,3 +3580,54 @@ Gotchas:
   garbage (rel err sqrt(2) = uncorrelated, not bf16 noise); unsqueeze(2) vs
   unsqueeze(3) TRANSPOSES the rectangular mask (queries: unsqueeze(1)+(3),
   keys: unsqueeze(1)+(2)).
+
+## 2026-10-01 — Tag-code encoder COLLAPSED to a constant map: tag-tag cos 1.0000
+
+Weight analysis of the tag-KV run (runs/k2-tags-kv-256, ckpt 1000 vs 9000,
+8000 steps @ Lion 1e-4) plus the context run as control
+(runs/k2-tagsddp-256, 1000 vs 3000). Verdict: **the TagCodeEmbedder collapsed
+ALL tags to essentially one vector within the first ~1000 steps, in BOTH
+injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
+
+- tag-tag cosine of the encoder output over 8 synthetic tags:
+  INIT (random bit_embed N(0,1), default Linear init) 0.487 -> ckpt1000
+  0.9999 (kv) / 0.9995 (context) -> ckpt9000 **1.0000** (kv, min=max=1.0000).
+  The tag->embedding map is constant to 4 decimals; the tag kv carries
+  ~zero per-tag information. This is why previews show no tag conditioning
+  and why the loss is FLAT: 0.209 (steps 0-200) -> 0.201 (2k) -> 0.202 (4k)
+  -> 0.207 (6k) -> 0.214 (9.2-9.4k). Not kv-injection-specific — the
+  in-context run collapsed identically by ckpt1000.
+- The collapse mechanism is visible in the weights: fc1/fc2 walked at FULL
+  lr every step in a sign-consistent direction (max|delta| = 0.800 EXACTLY =
+  lr x 8000 steps; 96% of entries moved >1e-2) with the norm COLLAPSING 8x
+  (4197 -> 516) — under Lion (scale-free sign updates) even a tiny
+  consistent gradient gives full-lr steps, and the consistent direction is
+  "homogenize/suppress the tag signal". The MLP residual is being actively
+  shrunk toward a constant offset. norm_out gains DID adapt (|scale| mean
+  0.025 -> 0.146) — a global per-channel rescale, not per-tag.
+- The encoder output change between checkpoints is a GLOBAL transform, not
+  per-tag learning: cos(old,new) = 0.502 IDENTICAL for all tags (kv, 8000
+  steps) and 0.80 (context, 2000 steps). bit_embed rows all moved ~equally
+  (uniform across all 60 bit rows). LoRA reference tensors move healthily
+  (cos 0.21-0.26, mean|d| 3.4e-2) — the optimizer/gradient path itself works.
+- Root cause: two-sided cold start. The base wk/wv never saw tag keys, so
+  random-but-DISTINCT tag embeddings are out-of-distribution noise that
+  INCREASES loss; the fastest gradient direction is to homogenize them.
+  Per-tag distinctiveness only pays once the model attends to tags — which
+  it never learns while the keys carry no consistent signal. Lion's
+  scale-free sign updates make the collapse take ~1000 steps (~67 min),
+  not the ~10k+ a scale-bound optimizer would need. The init's
+  distinctiveness (cos 0.487, actually usable) was destroyed, not exploited.
+- Implication: the Hamming-d4 bit-sum design (26/30 shared rows between
+  min-distance tags) is not the binding problem — the encoder collapsed far
+  past the init's 0.487. The problem is the objective provides no early
+  gradient for tag distinctiveness in either injection mode.
+- Candidate fixes (not implemented): freeze the tag encoder for the first
+  N steps so the LoRA adapts to the distinct init keys before the encoder
+  can collapse (unfreeze after attention mass on tag keys exists); an
+  auxiliary per-tag loss (contrastive/reconstruction) to force
+  distinctiveness independent of the diffusion loss; or accept that
+  loss-only training of a tag encoder needs the model to already use tags.
+  Higher LR is NOT a lever (Lion is scale-free — direction, not magnitude,
+  is the problem). kv run left running at decision time; 9 checkpoints
+  (1000-9000) + previews banked.

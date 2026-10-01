@@ -3731,3 +3731,49 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   rearm*.sh pattern: wait for ckpt file -> stop after save -> relaunch with
   edited config), scratchpad/tc_phase_analysis.py (phase medians + top
   slow steps from the trackio DB).
+
+## 2026-10-01 (cont.) — tag distribution + per-token gradient attenuation + solo anchor BUG
+
+- Tag distribution over the full trainer corpus (763,463 rows, 35.9M
+  matched instances, 227,927 distinct; script scratchpad/tag_weight_plot.py
+  + /tmp/tag_counts.pkl): top-10 = 8.7% of instances, top-25 = 16%, top-100
+  = 33%, top-1000 = 72%, top-5000 = 90%. Head is stop-word-like: mammal
+  450k, solo 431k, female 331k, clothing 330k, breasts 319k, 1girl 288k,
+  hair 287k... presence up to ~59% of rows. Mean 47 matched tags/row ->
+  top-25 occupy ~17% of slots. CRITICAL anchor for schedules: median tag
+  freq = 2 (half the vocab has f<=2), mean = 157 — a median-anchored
+  schedule clips ~90% of grad mass to the floor (it is a 10x LR cut on the
+  whole channel, NOT attenuation); the MEAN anchor is the sane crossover.
+- Schedules measured (see local/tag_weight_schedules.png): atten-only
+  a=0.5/0.8 median-anchored -> overall weight 0.11 (broken, per above);
+  sym a=0.5 mean [1/2,2] -> top-25 0.5x, tail 2x, top-100 grad share 33%
+  -> 28.4%; sym a=0.8 mean [1/3,3] -> top-25 0.33x, tail 3x, top-100 ->
+  23.6%. User chose GENTLE: alpha 0.5, clip [0.5, 2.0], warmup 0->1 over
+  1000 steps.
+- Implementation (user design, verified exact): per-token gradient scale
+  via a tensor hook on the encoder OUTPUT (kv_extra) — the single point
+  where all 28 blocks' kv fan-in grads aggregate, so ONE scale covers
+  bit_embed + fc1 + fc2 + norms per token; forward semantics untouched.
+  w_t = clip((mean_f/f_t)^alpha, low, high); effective = 1 + ramp*(w_t-1);
+  ramp driven per step by set_atten_step. scratchpad/check_atten_hook.py:
+  hooked == manual output-scaling BITWISE (0.0 diff) at ramp 1, hooked ==
+  baseline bitwise at ramp 0. Attenuation only in kv mode; no-op unless
+  enabled (TagCodeEmbedder._grad_scale).
+- Config: tag_code.grad_attenuation {alpha, clip_low, clip_high,
+  warmup_steps, freq_parquet}; freq table checkpoints/tag_vocab/
+  tag_freq_v3.parquet = matched-tag counts over the ACTUAL trainer corpus
+  (NOT the vocab-build counts — they differ, e.g. solo 431k vs 219k,
+  because matcher counts include prose-trie matches on non-booru captions).
+- BUG FOUND + FIXED (blocks any fresh run): per-tag dropout mapped dropped
+  tokens to id 0, but id 0 is a REAL tag (solo — vocab.ids["solo"]=0) and
+  codes[0] was the reserved zero word: ~10% of all tag tokens aliased to
+  solo, and solo's own 431k instances trained the anchor code instead of
+  solo. Fix: codes buffer now holds exactly vocab rows (tag t -> codes[t],
+  no reserved row) and the trainer's dropout MASKS tokens out (the exact
+  no-op path, consistent with CFG-negative semantics) instead of using a
+  sentinel id. check_tag_kv 13/13 still green with the new shape.
+- Fresh run LAUNCHED: tmux k2-tags-tc2, config train_tags_kv_tc2.json,
+  runs/k2-tags-kv-tc2-256 (v2 run stopped at ckpt 7000 — its encoder was
+  collapsed anyway; attenuation cannot un-collapse a constant map).
+  trackio logs atten_ramp per step; expect grad_norm to DECREASE ~40% over
+  the ramp as the head's weight falls — that is the schedule, not decay.

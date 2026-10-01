@@ -3631,3 +3631,34 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   Higher LR is NOT a lever (Lion is scale-free — direction, not magnitude,
   is the problem). kv run left running at decision time; 9 checkpoints
   (1000-9000) + previews banked.
+
+## 2026-10-01 — Tag-KV v2: no LoRA, tagcode-only training + Trackio monitoring
+
+- User call: "fried the conditioning" — stop the LoRA run (stopped at ckpt
+  9000 banked) and isolate the tagcode. New trainer features
+  (krea2/train_tags_ddp.py):
+  - `lora_rank: 0` gates inject_lora off — trainable = TagCodeEmbedder only
+    (75.9M), backbone frozen bf16 base, requires_grad=False.
+  - Trackio (HF, installed 0.40.0 via uv pip — pure-python deps only, no
+    torch drags; dry-run checked first) monitoring: `trackio_project` in the
+    config enables it. Logs loss / lr / PRE-CLIP gradient norms every step —
+    total plus per-group splits (tagcode.bit_embed / fc1+fc2 mlp / RMSNorm
+    gains) captured by fb_fn into a per-GPU dict, logged from the main loop
+    after wrapper.step(); the preview grid is logged as trackio.Image at
+    eval steps; finish() at the end. Local storage by default
+    (~/.cache/huggingface/trackio/<project>.db); pass trackio_space_id to
+    sync to a HF Space instead. View: `.venv/bin/python -m trackio.show
+    <project>` on wangaratta + SSH port-forward, or a HF Space.
+- New run: config `train_tags_kv_tc.json` (= the collapsed run's recipe +
+  lora_rank 0, lr 2e-5 = 1/5th, trackio project k2-tags-tc, run dir
+  runs/k2-tags-kv-tc-256). Smoke 3 steps green: 75.9M trainable, 61GB peak
+  (vs 77 with LoRA), 7-tensor tagcode-only checkpoints. Full run LAUNCHED
+  tmux `k2-tags-tc`: 3.2 s/step (faster than 4.05 with LoRA), 64GB/GPU.
+- Early gradient readings (the monitoring's first data): total tagcode grad
+  norm ~0.011-0.014, bit_embed group ~6-8e-5 — the loss-gradient signal
+  through the FROZEN attention is minuscule. Under Lion scale-free sign
+  updates that tiny-but-consistent signal still produced full-lr steps in
+  the collapsed run; at lr 2e-5 the homogenize walk is 5x slower and the
+  dashboard makes the dynamics visible. Open question the run answers:
+  does a frozen reader change the collapse dynamics at all, or does the
+  map homogenize identically?

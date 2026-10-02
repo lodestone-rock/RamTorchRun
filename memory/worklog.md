@@ -3830,3 +3830,45 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
 - Run LAUNCHED: tmux k2-tags-table, config train_tags_table.json, run dir
   runs/k2-tags-table-256, trackio k2-tags-tc (+rows_trained every 50 steps).
   Collapse metric unchanged: tag-tag cosine of raw table rows at ckpt 1000.
+
+## 2026-10-02 (cont.) — table run retired WITHOUT collapsing (it never opened); code run v3: trainable codes + 5x lr, RESUMED from tc2 17000
+
+- Table run verdict (user, from previews): "worse" — and the numbers agree
+  it never even started: gate mean -0.0001 / max 0.010 after 500 steps at
+  lr 2e-5 (tag-tag cos of raw rows x gate = 0.032 — near the random-init
+  orthogonality; the tag channel was effectively OFF). The zero-init gate +
+  low lr never opened the channel. Stopped at ckpts 500/1000 banked.
+- User's redesign: revert to the bit-code encoder but FREE THE INPUT.
+  `tag_code.trainable_codes: true` adds `code_embed = nn.Embedding(vocab,
+  30)` initialized at the exact ±1 binary pattern (NOT the 1/sqrt(30)-scaled
+  unpack — the interpolation only uses sign) and trained freely. Forward:
+  w = (1+x)/2; h = w @ bit_embed[1::2] + (1-w) @ bit_embed[0::2] — reduces
+  EXACTLY to the frozen sign-lookup sum at init (w in {0,1}) and is
+  differentiable in x: tags leave the hypercube corners/unit sphere. +6.8M
+  dense params; codes buffer stays for fingerprint + init source; masked
+  no-op + permutation contracts untouched.
+- Run = RESUME from runs/k2-tags-kv-tc2-256/ckpts/
+  tagslora_step_17000_ckpt.safetensors (user: don't start over): trained
+  bit_embed/fc1/fc2/norms continue; code_embed fresh at binary init; Lion
+  momentum restarts at zero (disclosed); global_step continues 17001+;
+  parquet offset 17000 continues the data stream; attenuation full ramp
+  immediately (grad_attenuation.start_step=0 -> ramp=min(1,17000/1000)=1 —
+  NOTE the default start_step=resume-step would have re-warmed 0->1 over
+  1000 steps; pinned to 0 for tc2 continuity). lr 1e-4 (5x — user's read:
+  the tc2 fry was partly LoRA-era interference + too-weak signal; table run
+  proved the gate-at-2e-5 never opened). Save/preview 500 @ 1 sample/GPU,
+  16 workers. Fresh dir runs/k2-tags-code2-256; trackio k2-tags-tc.
+- check_tag_kv now runs code / code_free / table: 13+26+... 43 checks total,
+  all pass. code_free specifics: init == frozen path to 4.8e-7 (fp32 noise)
+  — the CHECK had two traps: the two builds draw different random code words
+  (code_embed ctor shifts RNG -> copy state_dict + RE-DERIVE code_embed from
+  the copied codes, which is exactly the production load_codes invariant),
+  and the matmul path is only ~1e-7-equivalent (fp32 order), not bitwise.
+  code_embed receives gradient (grad reaches the free input layer).
+- GOTCHA for resume+trainable_codes: the wrapper's _apply_state_dict loads
+  the tc2 tagcode.* keys and reports code_embed.* as NEW — intended (fresh
+  binary init). Smoke 3 steps: 82.7M trainable, losses .25/.19/.31, peak
+  61GB, 8-tensor ckpt (adds code_embed.weight). Run LAUNCHED tmux
+  k2-tags-code2. Collapse metric now: tag-tag cosine of code_embed rows at
+  ckpt 500/1000 (+17500/+18000) — does the FREE input stay distinct where
+  the pinned one homogenized.

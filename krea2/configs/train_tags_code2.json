@@ -1,0 +1,134 @@
+{
+  "_comment": "Tag-CODE v3 run: back to the bit-code TagCodeEmbedder (the direct table run never opened \u2014 gate ~0.01 after 500 steps at lr 2e-5 \u2014 and previews showed no tag conditioning) with TWO changes: (1) TRAINABLE CODES \u2014 tag_code.trainable_codes adds a free per-tag [vocab x 30] table initialized at the exact +/-1 binary pattern; forward interpolates w=(1+x)/2 through the per-bit dictionary (w@E1 + (1-w)@E0), reducing exactly to the frozen sign-lookup at init but differentiable in x, so tags can leave the hypercube corners / unit sphere. +6.8M dense params. (2) lr 1e-4 (5x tc2's 2e-5). RESUME from runs/k2-tags-kv-tc2-256/ckpts/tagslora_step_17000_ckpt.safetensors: bit_embed/fc1/fc2/norms/codes continue trained; code_embed starts fresh at binary init; Lion momentum restarts at zero; global_step continues at 17000 (parquet offset 17000 continues the data stream; attenuation ramp = 1 immediately, full schedule as tc2 trained). Attenuation KEPT ON (gentle 0.5, clip [0.5,2]). No LoRA (tagcode-only). save/preview 500 @ 1 sample/GPU, 16 workers. Fresh dir runs/k2-tags-code2-256.",
+  "seed": 42,
+  "initial_global_step": 0,
+  "full_checkpoint": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-lion/1024-resume-25600-v3/ckpts/full_step_30000.safetensors",
+  "mmdit_config": "large_wide",
+  "encoder_config": "qwen3_vl_4b",
+  "encoder_model_id": "Qwen/Qwen3-VL-4B-Instruct",
+  "ae_model_id": "Qwen/Qwen-Image",
+  "lora_rank": 0,
+  "lora_alpha": 32.0,
+  "lora_exclude_prefixes": [
+    "tagcode"
+  ],
+  "tag_code": {
+    "code_path": "checkpoints/tag_vocab/codes_v2_30b.parquet",
+    "vocab_path": "checkpoints/tag_vocab/tags_v2.parquet",
+    "n_bits": 30,
+    "max_tags": 128,
+    "tag_drop_prob": 0.1,
+    "grad_attenuation": {
+      "alpha": 0.5,
+      "clip_low": 0.5,
+      "clip_high": 2.0,
+      "warmup_steps": 1000,
+      "freq_parquet": "checkpoints/tag_vocab/tag_freq_v3.parquet",
+      "start_step": 0
+    },
+    "trainable_codes": true
+  },
+  "resolution": 256,
+  "batch_size": 8,
+  "grad_accum": 1,
+  "n_gpus": 4,
+  "optimizer": "lion",
+  "lion": {
+    "betas": [
+      0.9,
+      0.99
+    ]
+  },
+  "lr": 0.0001,
+  "weight_decay": 0.0,
+  "warmup": 100,
+  "max_grad_norm": 1.0,
+  "uncond_ratio": 0.1,
+  "mu_y1": 0.5,
+  "mu_y2": 1.15,
+  "mu_sigma": 1.0,
+  "minres": 256,
+  "maxres": 1280,
+  "eval_interval": 500,
+  "save_every_n_steps": 500,
+  "save_final": true,
+  "preview_steps": 28,
+  "max_steps": 0,
+  "ckpt_path": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-tags-code2-256",
+  "preview_path": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-tags-code2-256/previews",
+  "parquet_dataloader": {
+    "parquet_sources": {
+      "danbooru": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=danbooru",
+        "n_samples": null
+      },
+      "deviantart": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=deviantart",
+        "n_samples": null
+      },
+      "e621": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=e621",
+        "n_samples": null
+      },
+      "midjourney": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=midjourney",
+        "n_samples": null
+      },
+      "reddit": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=reddit",
+        "n_samples": null
+      }
+    },
+    "caption_columns": {
+      "tags": {
+        "weight": 1.0,
+        "is_tag_based": true
+      },
+      "midjourney_style_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "brief_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "10_word_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "long_caption": {
+        "weight": 1.0,
+        "is_tag_based": false
+      }
+    },
+    "tag_column": "tags",
+    "filename_column": "file_path",
+    "width_column": "image_width",
+    "height_column": "image_height",
+    "loss_weight_column": null,
+    "image_folder_path": "",
+    "base_resolution": [
+      256
+    ],
+    "base_resolution_weights": [
+      1.0
+    ],
+    "ratio_cutoff": 2.0,
+    "resolution_step": 64,
+    "shuffle_tags": true,
+    "tag_drop_percentage": 0.0,
+    "offset": 17000,
+    "num_workers": 16,
+    "prefetch_factor": 8,
+    "s3_image_source": {
+      "endpoint_url": "http://localhost:9000",
+      "credential_file": "/mnt/datapool_u2/lodestone/RamTorchRun/credential/local-rustfs-readonly.json",
+      "strip_prefix": "/mnt/nas_buckets/"
+    }
+  },
+  "tag_mode": "kv",
+  "trackio_project": "k2-tags-tc",
+  "tag_encoder": "code",
+  "preview_samples_per_gpu": 1,
+  "resume_checkpoint": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-tags-kv-tc2-256/ckpts/tagslora_step_17000_ckpt.safetensors"
+}

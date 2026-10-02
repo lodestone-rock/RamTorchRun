@@ -146,7 +146,8 @@ def make_train_factory(cfg: dict, dit_cfg, vocab_size: int, code_path: str,
             te.gate.requires_grad_(True)
         else:
             tc = TagCodeEmbedder(vocab_size, d.config.features,
-                                 n_bits=int(cfg.get("tag_code", {}).get("n_bits", 30)))
+                                 n_bits=int(cfg.get("tag_code", {}).get("n_bits", 30)),
+                                 trainable_codes=bool(cfg.get("tag_code", {}).get("trainable_codes", False)))
             tc.load_codes(code_path, vocab_fingerprint)
             d.tagcode = tc
         # Activation checkpointing on every block (the repo norm — measured

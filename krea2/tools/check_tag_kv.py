@@ -53,16 +53,23 @@ VOCAB = 64
 
 
 def build(encoder: str, seed: int = 7) -> SingleStreamDiT:
-    """encoder: "code" (TagCodeEmbedder) or "table" (TagEmbedder direct)."""
+    """encoder: "code" (frozen unpack), "code_free" (trainable code table),
+    or "table" (TagEmbedder direct)."""
     torch.manual_seed(seed)
     dit = SingleStreamDiT(TINY)
-    if encoder == "code":
-        tc = TagCodeEmbedder(VOCAB, TINY.features, n_bits=30)
+    if encoder in ("code", "code_free"):
+        tc = TagCodeEmbedder(VOCAB, TINY.features, n_bits=30,
+                             trainable_codes=(encoder == "code_free"))
         with torch.no_grad():
             # random 30-bit words (nonzero, distinct enough); id 0 is a real
             # tag now (no anchor row), exactly as utils/tag_codes.py produces.
             words = torch.randint(1, 1 << 30, (VOCAB,), dtype=torch.int64)
             tc.codes = words   # vocab rows, no anchor: id 0 is a real tag now
+            tc.load_codes = tc.load_codes  # no-op keep; codes filled above
+            if encoder == "code_free":
+                bits = ((tc.codes.unsqueeze(-1) >>
+                         torch.arange(30, device=tc.codes.device, dtype=torch.int64)) & 1)
+                tc.code_embed.weight.copy_(bits.float().mul_(2.0).sub_(1.0))
             tc.bit_embed.weight.normal_(0, 0.05)
             tc.fc1.weight.normal_(0, 0.05)
             tc.fc2.weight.normal_(0, 0.05)
@@ -116,8 +123,40 @@ def ok(name: str, cond: bool, detail: str = ""):
 
 
 def main():
-    for enc_kind in ("code", "table"):
+    for enc_kind in ("code", "code_free", "table"):
         run_suite(enc_kind)
+    # code_free init equivalence: at the ±1 init the interpolated path must
+    # match the frozen sign-lookup path to float noise. Copy the frozen
+    # weights over first — the extra code_embed ctor consumes RNG, so the two
+    # builds would otherwise have different bit_embed/fc weights (an artifact,
+    # not the property under test).
+    torch.manual_seed(11)
+    kv_f = build("code_free")
+    kv_frozen = build("code")
+    kv_f.tagcode.load_state_dict(kv_frozen.tagcode.state_dict(), strict=False)
+    # Re-derive code_embed from the COPIED codes: the two builds draw different
+    # random code words (the free ctor shifts RNG), and code_embed is not in
+    # the frozen state_dict. This is exactly the production invariant —
+    # load_codes fills code_embed from the loaded code words.
+    with torch.no_grad():
+        bits = ((kv_f.tagcode.codes.unsqueeze(-1) >>
+                 torch.arange(30, device=kv_f.tagcode.codes.device,
+                              dtype=torch.int64)) & 1)
+        kv_f.tagcode.code_embed.weight.copy_(bits.float().mul_(2.0).sub_(1.0))
+    (img, context, t, pos, mask), (ids, msk) = make_inputs()
+    with torch.no_grad():
+        o_free = kv_f(img, context, t, pos, mask, tag_ids=ids, tag_mask=msk)
+        o_frozen = kv_frozen(img, context, t, pos, mask, tag_ids=ids, tag_mask=msk)
+    d = (o_free.float() - o_frozen.float()).abs().max().item()
+    ok(f"[code_free] init == frozen path (matmul-order tolerance)", d < 1e-4,
+       f"max|delta|={d:.3e}")
+    # gradient reaches the free code table
+    kv_f.zero_grad(set_to_none=True)
+    o = kv_f(img, context, t, pos, mask, tag_ids=ids, tag_mask=msk)
+    o.float().sum().backward()
+    g_ce = kv_f.tagcode.code_embed.weight.grad
+    ok(f"[code_free] code_embed receives gradient",
+       g_ce is not None and g_ce.abs().sum() > 0)
 
 
 def run_suite(kind: str):
@@ -180,7 +219,7 @@ def run_suite(kind: str):
         kv.grad_ckpt = gc
         o = kv(img, context, t, pos, mask, tag_ids=ids, tag_mask=msk)
         o.float().sum().backward()
-        if kind == "code":
+        if kind in ("code", "code_free"):
             g_bit = enc.bit_embed.weight.grad
             g_fc2 = enc.fc2.weight.grad
             ok(f"[{enc_name}] tagcode receives gradient (grad_ckpt={gc})",

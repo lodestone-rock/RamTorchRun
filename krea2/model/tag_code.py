@@ -39,18 +39,21 @@ from .mmdit import RMSNorm
 class TagCodeEmbedder(nn.Module):
     """``[B, T] tag ids -> [B, T, features]`` DiT tokens via bit codes.
 
-    ``codes`` is an [vocab_size + 1] int64 tensor of code words: row 0 is
-    the all-zero uncond anchor; tag id t uses codes[t + 1]. Codes come from
-    utils/tag_codes.py (30-bit words, min Hamming distance 4, verified).
-    Ids above the table (padding is masked anyway) clamp safely.
+    ``codes`` is an [vocab_size] int64 tensor of code words: row t is tag t's
+    code (id 0 is a REAL tag — solo in tags_v2 — there is no reserved anchor
+    id; "dropped" is expressed by masking, never by a sentinel id). Codes
+    come from utils/tag_codes.py (30-bit words, min Hamming distance 4,
+    verified). Ids above the table (padding is masked anyway) clamp safely.
     """
 
-    def __init__(self, vocab_size: int, features: int, n_bits: int = 30):
+    def __init__(self, vocab_size: int, features: int, n_bits: int = 30,
+                 trainable_codes: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.features = features
         self.n_bits = n_bits
-        buf = torch.zeros(vocab_size + 1, dtype=torch.int64)
+        self.trainable_codes = trainable_codes
+        buf = torch.zeros(vocab_size, dtype=torch.int64)
         self.register_buffer("codes", buf, persistent=True)
         self.register_buffer("code_fingerprint", torch.zeros(16, dtype=torch.uint8),
                              persistent=True)
@@ -59,6 +62,22 @@ class TagCodeEmbedder(nn.Module):
         self.fc1 = nn.Linear(features, features, bias=False)
         self.fc2 = nn.Linear(features, features, bias=False)
         self.norm_out = RMSNorm(features)
+        if trainable_codes:
+            # Free the input: a per-tag [n_bits] table initialized at the exact
+            # ±1 binary pattern (filled by load_codes) and trained freely —
+            # tags can leave the hypercube corners / unit sphere entirely
+            # instead of being pinned to unpack(codes) forever. Filled in
+            # load_codes once the code words are known.
+            self.code_embed = nn.Embedding(vocab_size, n_bits)
+        # Per-token gradient attenuation (see enable_grad_attenuation):
+        # _grad_scale is None or {"weights": [vocab] float32, "warmup": int,
+        # "start": int}; _atten_ramp in [0, 1] interpolates the effective
+        # per-token weight from 1.0 (off) to w_t (full schedule) over the
+        # warmup. The hook lives on the encoder OUTPUT tensor — the single
+        # point where all 28 blocks' kv fan-in gradients aggregate — so one
+        # scale covers bit_embed + fc1 + fc2 + norms per token.
+        self._grad_scale = None
+        self._atten_ramp = 0.0
 
     # -- code handling ------------------------------------------------------
 
@@ -67,7 +86,7 @@ class TagCodeEmbedder(nn.Module):
 
         The parquet carries the vocab file's sha1 fingerprint; if given, the
         caller's fingerprint (hex string) is compared. The code table holds
-        exactly vocab_size rows; tag t -> codes[t + 1], row 0 stays zero.
+        exactly vocab_size rows; tag id t -> codes[t].
         """
         t = pq.read_table(path, columns=["code", "vocab_fingerprint"])
         have = t.column("vocab_fingerprint")[0].as_py()
@@ -82,12 +101,20 @@ class TagCodeEmbedder(nn.Module):
                 f"code table has {len(codes)} rows, vocab has {self.vocab_size}"
             )
         device = self.codes.device
-        self.codes = torch.from_numpy(
-            np.concatenate([[0], codes.astype(np.int64)])
-        ).to(device)
+        self.codes = torch.from_numpy(codes.astype(np.int64)).to(device)
         fp_bytes = bytes.fromhex(have)
         self.code_fingerprint = torch.frombuffer(
             fp_bytes, dtype=torch.uint8).clone().to(device)
+        if self.trainable_codes:
+            # Init the free code table at the exact ±1 binary pattern (NOT the
+            # 1/sqrt(n)-scaled unpack: the interpolation below only cares about
+            # sign, and ±1 makes it reduce to the frozen path at init).
+            bits = ((self.codes.unsqueeze(-1) >>
+                     torch.arange(self.n_bits, device=self.codes.device,
+                                  dtype=torch.int64)) & 1)
+            with torch.no_grad():
+                self.code_embed.weight.copy_(bits.float().mul_(2.0).sub_(1.0))
+            self._code_embed_ready = True
 
     @staticmethod
     def _unpack(code_word: Tensor) -> Tensor:
@@ -104,12 +131,83 @@ class TagCodeEmbedder(nn.Module):
         block, which the caller must also drop from the attention mask (the
         existing prepare()/DiT plumbing does).
         """
-        code_word = self.codes[tag_ids.clamp(0, len(self.codes) - 1)]
-        bits = self._unpack(code_word)                       # [B, T, 30]
-        idx = (torch.arange(self.n_bits, device=bits.device) * 2
-               + (bits > 0).to(torch.int64))                 # [B, T, n_bits]
-        h = self.bit_embed(idx.clamp(0, 2 * self.n_bits - 1)).sum(-2)  # [B, T, F]
+        ids = tag_ids.clamp(0, len(self.codes) - 1)
+        if self.trainable_codes:
+            # Continuous codes through the per-bit dictionary: with
+            # w = (1 + x)/2, h = w @ E1 + (1-w) @ E0 reduces EXACTLY to the
+            # frozen sign-lookup sum at the ±1 init (w in {0, 1}) and is
+            # differentiable in x — tags can leave the hypercube corners.
+            x = self.code_embed(ids)                              # [B, T, 30]
+            w1 = (1.0 + x).mul_(0.5)
+            E_all = self.bit_embed.weight                         # [2*30, F]
+            E1, E0 = E_all[1::2], E_all[0::2]                     # [30, F]
+            h = w1.matmul(E1) + (1.0 - w1).matmul(E0)             # [B, T, F]
+        else:
+            code_word = self.codes[ids]
+            bits = self._unpack(code_word)                       # [B, T, 30]
+            idx = (torch.arange(self.n_bits, device=bits.device) * 2
+                   + (bits > 0).to(torch.int64))                 # [B, T, n_bits]
+            h = self.bit_embed(idx.clamp(0, 2 * self.n_bits - 1)).sum(-2)  # [B, T, F]
         h = h * self.norm_in(h)
         h2 = self.fc2(torch.nn.functional.gelu(self.fc1(h)))
         out = self.norm_out(h + h2)
         return out * tag_mask.unsqueeze(-1).to(out.dtype)
+
+    # -- per-token gradient attenuation -------------------------------------
+
+    def enable_grad_attenuation(self, freq_parquet: str, alpha: float,
+                                low: float, high: float, warmup_steps: int,
+                                start_step: int = 0):
+        """Build the per-tag gradient weight table and arm the ramp.
+
+        w_t = clip((mean_freq / freq_t) ** alpha, low, high) — a symmetric
+        log-space schedule around the corpus-mean tag frequency: head tags
+        (f >> mean) get attenuated, tail tags (f << mean) get boosted, both
+        clipped. The effective weight is 1.0 while the ramp is 0 and w_t at
+        ramp 1 (set_atten_step drives the ramp linearly over warmup_steps).
+
+        freq_parquet: columns (id, freq) over the vocab id space, counted
+        over the ACTUAL training corpus (not the vocab-build counts).
+        """
+        import pyarrow.parquet as pq
+
+        t = pq.read_table(freq_parquet, columns=["id", "freq"])
+        ids = t.column("id").to_pylist()
+        freqs = t.column("freq").to_pylist()
+        if len(ids) != self.vocab_size:
+            raise ValueError(
+                f"freq table has {len(ids)} rows, vocab has {self.vocab_size}"
+            )
+        mean_f = sum(freqs) / max(1, len(freqs))
+        w = [max(low, min(high, (mean_f / max(1, f)) ** alpha)) for f in freqs]
+        weights = torch.tensor(w, dtype=torch.float32, device=self.codes.device)
+        self._grad_scale = {"weights": weights, "warmup": int(warmup_steps),
+                            "start": int(start_step), "alpha": alpha,
+                            "low": low, "high": high, "mean_f": mean_f}
+        self._atten_ramp = 0.0
+
+    def set_atten_step(self, global_step: int):
+        """Drive the warmup ramp; call once per optimizer step, every replica."""
+        if self._grad_scale is None:
+            return
+        start, warm = self._grad_scale["start"], self._grad_scale["warmup"]
+        self._atten_ramp = min(1.0, max(0.0, (global_step - start) / max(1, warm)))
+
+    def maybe_attach_output_hook(self, out: Tensor, tag_ids: Tensor):
+        """Scale dL/d(out) per token on the way back through the encoder.
+
+        Called from SingleStreamDiT.forward right after the kv branch builds
+        the tag token block: `out` is the encoder output whose gradient
+        aggregates the kv fan-in from EVERY block, so one hook covers the
+        whole per-tag gradient path (bit_embed + fc1 + fc2 + norms). Masked
+        positions have zero gradient, so their weights are irrelevant.
+        """
+        if self._grad_scale is None or not torch.is_grad_enabled():
+            return
+        if not (out.requires_grad and torch.is_tensor(tag_ids)):
+            return
+        weights = self._grad_scale["weights"]
+        w = weights[tag_ids.clamp(0, len(weights) - 1)]      # [B, T]
+        scale = 1.0 + self._atten_ramp * (w - 1.0)
+        out.register_hook(
+            lambda g: g * scale.to(g.dtype).unsqueeze(-1))

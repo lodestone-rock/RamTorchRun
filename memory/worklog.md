@@ -3777,3 +3777,56 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   collapsed anyway; attenuation cannot un-collapse a constant map).
   trackio logs atten_ramp per step; expect grad_norm to DECREASE ~40% over
   the ramp as the head's weight falls — that is the schedule, not decay.
+
+## 2026-10-02 — Tag-TABLE run: direct 6144 table + RowLion (bit-code retired)
+
+- User call: the bit-code projector "constrains the model too strongly" —
+  replace TagCodeEmbedder with a plain embedding table and let the model
+  learn from it. tc2 (tagcode-only) stopped at ckpt 17000 banked.
+- NEW `utils/row_lion.py` RowLion (mirrors RowAdamW's structure): row-sparse
+  Lion over the table, touched rows = nonzero-grad rows (exact — no grad
+  path exists to untouched rows; the attenuation hook scales but never
+  un-zeros), fp32 master + momentum on the ZeRO-1 owner GPU, per-row step
+  counters driving linear warmup (a row's first steps don't jump to full
+  lr). Update math mirrors krea2/lion.py exactly (decay first, then
+  sign(b1*m + (1-b1)*g), then m = b2*m + (1-b2)*g) — scratchpad/
+  check_row_lion.py: continuously-touched rows BITWISE equal to dense Lion,
+  gap rows differ BY DESIGN (dense drifts previously-touched rows on
+  zero-grad steps via carried momentum — sign(momentum) is nonzero forever;
+  that drift is the reason the row-sparse form is required), untouched rows
+  move by exactly 0.0, state round-trip OK. GOTCHA: CPU row_steps must be
+  indexed with idx_cpu (the owner's grad is CUDA — first smoke crashed on
+  the device mismatch; RowAdamW's idx_cpu pattern applied).
+- TagEmbedder gained `direct` mode: tag_dim == features, NO norm/proj,
+  output = zero-init per-channel gate * embed[ids] * mask — the gate
+  preserves the step-0 exact no-op (fresh table injects nothing; ControlNet
+  zero-init pattern). The attenuation hook (enable_grad_attenuation /
+  set_atten_step / maybe_attach_output_hook) is duplicated onto TagEmbedder —
+  same output-tensor contract, covers table rows + gate.
+- Trainer: `tag_encoder: "table" | "code"` config switch. Table path: freeze
+  backbone, attach TagEmbedder (vocab tags_v2, tag_dim 6144, direct), gate
+  fp32-restored, embed.weight stays bf16 (RowLion holds the fp32 master);
+  optimizer_factory filters the table out via a _is_row_table param flag
+  (ZeRO-1 hands GPU0 the whole 1.4B table, GPU1 the gate, GPUs 2/3 nothing
+  -> _NoOpOpt shim because torch optimizers raise on empty param lists, and
+  scheduler_factory=None because a torch LRScheduler cannot wrap the shim);
+  step loop uses the split API (forward_backward_only -> reduce_grads ->
+  clip_grads -> row_lion.step() -> optimizer_step) — the wrapper's
+  reduce/broadcast handle the table like any trainable param, so sync is
+  free code. Checkpoints add rowlion_master (fp32) + rowlion_row_steps;
+  momentum restarts at zero on resume (disclosed). Constant LR (per-row
+  warmup instead of a scheduler).
+- Verification: check_tag_kv now runs BOTH encoders — 13 code checks + 15
+  table checks, all pass (untagged no-op bitwise; all-masked no-op with
+  zero encoder grad incl. grad_ckpt; permutation; gate-grad/table-zero-grad
+  at closed gate; tags reach output once the gate opens; CFG-negative path).
+  3-step smoke: losses .30/.19/.31, peak 74.5GB owner / 63GB others, ckpt
+  saved (embed bf16 2.8GB + fp32 master 5.6GB + gate + row_steps), 1156
+  distinct rows trained in 3 steps (~0.5% of the table/step — the row-sparse
+  behavior confirmed on real data).
+- Preview cadence: 500 (was 1000) at 1 sample/GPU = 4-column grids
+  (preview_samples_per_gpu config knob, default 2 = old behavior);
+  checkpoints stay at 1000 (~8.4GB each with the fp32 master).
+- Run LAUNCHED: tmux k2-tags-table, config train_tags_table.json, run dir
+  runs/k2-tags-table-256, trackio k2-tags-tc (+rows_trained every 50 steps).
+  Collapse metric unchanged: tag-tag cosine of raw table rows at ckpt 1000.

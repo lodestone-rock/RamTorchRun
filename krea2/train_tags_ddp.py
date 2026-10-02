@@ -145,9 +145,14 @@ def make_train_factory(cfg: dict, dit_cfg, vocab_size: int, code_path: str,
             te.embed.weight._is_row_table = True   # factory filters it out
             te.gate.requires_grad_(True)
         else:
+            tcfg = cfg.get("tag_code", {})
             tc = TagCodeEmbedder(vocab_size, d.config.features,
-                                 n_bits=int(cfg.get("tag_code", {}).get("n_bits", 30)),
-                                 trainable_codes=bool(cfg.get("tag_code", {}).get("trainable_codes", False)))
+                                 n_bits=int(tcfg.get("n_bits", 30)),
+                                 trainable_codes=bool(tcfg.get("trainable_codes", False)),
+                                 n_sinks=int(tcfg.get("n_sinks", 0)),
+                                 encoder_layers=int(tcfg.get("encoder_layers", 0)),
+                                 encoder_heads=int(tcfg.get("encoder_heads", 48)),
+                                 encoder_mlp_mult=int(tcfg.get("encoder_mlp_mult", 4)))
             tc.load_codes(code_path, vocab_fingerprint)
             d.tagcode = tc
         # Activation checkpointing on every block (the repo norm — measured
@@ -194,6 +199,14 @@ def preview_dataset(model, conditioner, ae, pieces, patch, resolution, steps,
     tag_ids = pieces[0]["tag_ids"].to(device)
     tag_mask = pieces[0]["tag_mask"].to(device)
 
+    # Sink registers for the cond passes: the last n_sinks slots lit. The CFG
+    # uncond pass (u_ids/u_msk, all-dark) stays bitwise base.
+    n_sink = int(getattr(getattr(model, "tagcode", None), "n_sinks", 0) or 0)
+    if n_sink:
+        sink = model.tagcode.sink_ids(device=device).to(tag_ids.dtype)
+        tag_ids[:, -n_sink:] = sink
+        tag_mask[:, -n_sink:] = True
+
     compression = 8
     x1 = (minres // (compression * patch)) ** 2
     x2 = (maxres // (compression * patch)) ** 2
@@ -205,6 +218,13 @@ def preview_dataset(model, conditioner, ae, pieces, patch, resolution, steps,
                              generator=gen)
     u_ids = torch.zeros_like(tag_ids)
     u_msk = torch.zeros_like(tag_mask)
+    # "text only" row is a COND pass (guidance applies) — its sinks stay lit;
+    # the CFG uncond pass keeps the all-dark u_ids/u_msk.
+    u_ids_cond = u_ids.clone()
+    u_msk_cond = u_msk.clone()
+    if n_sink:
+        u_ids_cond[:, -n_sink:] = sink
+        u_msk_cond[:, -n_sink:] = True
     ts = torch.linspace(1.0, 0.0, steps + 1, device=device)
 
     def sample_one_sample(j: int) -> torch.Tensor:
@@ -240,7 +260,7 @@ def preview_dataset(model, conditioner, ae, pieces, patch, resolution, steps,
 
         latents = [
             sample(ctx_f, m_f, ids_f, msk_f),                 # both
-            sample(ctx_f, m_f, u_ids[j:j + 1], u_msk[j:j + 1]),   # text only
+            sample(ctx_f, m_f, u_ids_cond[j:j + 1], u_msk_cond[j:j + 1]),   # text only
             sample(ctx_n, m_n, ids_f, msk_f),                 # tags only
         ]
         pixels = [vae_decode(ae, xl).clamp(-1, 1) for xl in latents]
@@ -401,6 +421,25 @@ def train(cfg: dict, config_path: str):
         assert not bad, f"non-fp32 trainable masters: {[tuple(p.shape) for p in bad]}"
     print(f"  fp32 masters restored on {n_gpus} replica(s)")
 
+    # code_embed resume fixup: a checkpoint from before the sinks carries
+    # [vocab] rows while the new table is [vocab + n_sinks] — _apply_state_dict
+    # skips the shape-mismatched key, so copy the overlap manually (sink rows
+    # stay at their fresh zero init).
+    if resume_path and encoder_kind == "code":
+        ce = load_file(resume_path).get("tagcode.code_embed.weight")
+        has_tc = hasattr(wrapper.models[0], "tagcode") and hasattr(
+            wrapper.models[0].tagcode, "code_embed")
+        if ce is not None and has_tc:
+            new_w = wrapper.models[0].tagcode.code_embed.weight
+            if ce.shape[0] != new_w.shape[0]:
+                n = min(ce.shape[0], new_w.shape[0])
+                for g in range(n_gpus):
+                    w = wrapper.models[g].tagcode.code_embed.weight
+                    with torch.no_grad():
+                        w[:n].copy_(ce[:n].to(w.device, w.dtype))
+                print(f"  code_embed: copied {n} rows from the {ce.shape[0]}-row "
+                      f"checkpoint (sink rows fresh)")
+
     # RowLion: row-sparse Lion over the table, stepped on the ZeRO-1 owner
     # only (the wrapper's reduce_grads sums the table grad there; the dense
     # gate rides the normal owned-param optimizer; broadcast_params syncs both).
@@ -514,6 +553,14 @@ def train(cfg: dict, config_path: str):
         msk = tag_mask.clone()
         per_token = torch.rand(ids.shape, device=dev) < tag_drop_prob
         msk = msk & ~per_token & ~torch.tensor(is_uncond, device=dev)[:, None]
+        # Sink registers: the last n_sinks slots are ALWAYS lit on cond rows
+        # (they train only through the cond pass) and fully dark on uncond
+        # rows — v_uncond stays bitwise base.
+        n_sink = int(cfg.get("tag_code", {}).get("n_sinks", 0) or 0)
+        if n_sink and hasattr(model, "tagcode"):
+            sink = model.tagcode.sink_ids(device=dev)
+            ids[:, -n_sink:] = sink
+            msk[:, -n_sink:] = ~torch.tensor(is_uncond, device=dev)[:, None]
 
         t4 = t[:, None, None, None].to(x0.dtype)
         noise = torch.randn(x0.shape, device=dev, dtype=x0.dtype)

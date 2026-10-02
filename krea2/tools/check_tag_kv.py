@@ -54,22 +54,26 @@ VOCAB = 64
 
 def build(encoder: str, seed: int = 7) -> SingleStreamDiT:
     """encoder: "code" (frozen unpack), "code_free" (trainable code table),
+    "code_v3" (trainable + 2 sinks + 2 zero-init transformer layers),
     or "table" (TagEmbedder direct)."""
     torch.manual_seed(seed)
     dit = SingleStreamDiT(TINY)
-    if encoder in ("code", "code_free"):
+    if encoder in ("code", "code_free", "code_v3"):
         tc = TagCodeEmbedder(VOCAB, TINY.features, n_bits=30,
-                             trainable_codes=(encoder == "code_free"))
+                             trainable_codes=(encoder in ("code_free", "code_v3")),
+                             n_sinks=(2 if encoder == "code_v3" else 0),
+                             encoder_layers=(2 if encoder == "code_v3" else 0),
+                             encoder_heads=8, encoder_mlp_mult=4)
         with torch.no_grad():
             # random 30-bit words (nonzero, distinct enough); id 0 is a real
             # tag now (no anchor row), exactly as utils/tag_codes.py produces.
             words = torch.randint(1, 1 << 30, (VOCAB,), dtype=torch.int64)
             tc.codes = words   # vocab rows, no anchor: id 0 is a real tag now
-            tc.load_codes = tc.load_codes  # no-op keep; codes filled above
-            if encoder == "code_free":
+            if encoder in ("code_free", "code_v3"):
                 bits = ((tc.codes.unsqueeze(-1) >>
                          torch.arange(30, device=tc.codes.device, dtype=torch.int64)) & 1)
-                tc.code_embed.weight.copy_(bits.float().mul_(2.0).sub_(1.0))
+                tc.code_embed.weight[:VOCAB].copy_(bits.float().mul_(2.0).sub_(1.0))
+                # sink rows stay zero (hypercube center)
             tc.bit_embed.weight.normal_(0, 0.05)
             tc.fc1.weight.normal_(0, 0.05)
             tc.fc2.weight.normal_(0, 0.05)
@@ -83,6 +87,16 @@ def build(encoder: str, seed: int = 7) -> SingleStreamDiT:
             # gate stays zero-init: the step-0 no-op property under test
         dit.tagembed = te
     return dit
+
+
+def reserve_sinks(ids: torch.Tensor, msk: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Caller-side sink reservation: the last 2 slots become sentinel ids,
+    always visible. Returns copies (inputs are never mutated)."""
+    ids = ids.clone()
+    msk = msk.clone()
+    ids[:, -2:] = torch.tensor([VOCAB, VOCAB + 1], dtype=ids.dtype, device=ids.device)
+    msk[:, -2:] = True
+    return ids, msk
 
 
 def encoder_of(dit):
@@ -122,9 +136,109 @@ def ok(name: str, cond: bool, detail: str = ""):
         sys.exit(1)
 
 
+def run_v3_suite():
+    """code_v3: trainable codes + 2 sink registers + 2 zero-init transformer
+    layers. The invariants changed by the sinks:
+
+    - v_uncond (everything dark, sinks included) == base, bitwise — restored
+    - cond with sinks != base (the sinks are part of the guidance direction)
+    - content-free invariance: different tag CONTENTS, all content dark but
+      sinks lit, produce bitwise-identical outputs
+    - the new transformer blocks are exact no-ops at init (zero-init
+      out-projections) — outputs match a blocks-less encoder bitwise
+    - sink rows train; masked content rows carry exactly zero grad
+    """
+    kv = build("code_v3")
+    base = build("none")
+    enc = kv.tagcode
+
+    def inputs_all_dark():
+        (img, context, t, pos, mask), (ids, _) = make_inputs(
+            tag_mask=torch.zeros(BATCH, TAGLEN, dtype=torch.bool))
+        return (img, context, t, pos, mask), (ids, _)
+
+    (img0, context0, t0, pos0, mask0), _ = make_inputs(taglen=0)
+
+    # -- 1. uncond (all dark, sinks included) == base, bitwise -------------
+    (imgA, ctxA, tA, posA, maskA), (idsA, _) = inputs_all_dark()
+    with torch.no_grad():
+        o_uncond = kv(imgA, ctxA, tA, posA, maskA,
+                      tag_ids=idsA, tag_mask=torch.zeros(BATCH, TAGLEN, dtype=torch.bool))
+        o_base = base(img0, context0, t0, pos0, mask0)
+    ok("[v3] uncond (all dark incl. sinks) == base (bitwise)", torch.equal(o_uncond, o_base))
+
+    # -- 2. cond with sinks != base ----------------------------------------
+    (img, context, t, pos, mask), (ids, msk) = make_inputs()
+    ids_s, msk_s = reserve_sinks(ids, msk)
+    with torch.no_grad():
+        o_cond = kv(img, context, t, pos, mask, tag_ids=ids_s, tag_mask=msk_s)
+    delta = (o_cond.float() - o_base.float()).abs().max().item()
+    ok("[v3] cond with sinks != base (sinks present)", delta > 0, f"max|delta|={delta:.3e}")
+
+    # -- 3. content-free invariance: content invisible, only sinks lit ------
+    # NOTE the contract: the tag span of the MASK tensor is the visibility
+    # source of truth. The two calls must carry the SAME visible tags (sinks)
+    # and differ ONLY in the dark content slots.
+    msk_dark = torch.zeros(BATCH, TAGLEN, dtype=torch.bool)
+    msk_dark[:, -2:] = True
+    (_, _, _, _, _), (ids_a, _) = make_inputs(tag_mask=msk_dark)
+    ids_b = ids_a.clone()
+    dark = ~msk_dark[0]                        # 1-D column pattern (same all rows)
+    ids_b[:, dark] = torch.randint(0, VOCAB, (int(dark.sum()),), dtype=ids_b.dtype)
+    assert torch.equal(ids_a[:, msk_dark[0]], ids_b[:, msk_dark[0]])
+    with torch.no_grad():
+        o_a = kv(img, context, t, pos, mask, tag_ids=ids_a, tag_mask=msk_dark)
+        o_b = kv(img, context, t, pos, mask, tag_ids=ids_b, tag_mask=msk_dark)
+    ok("[v3] content-free invariance (all content dark, sinks lit)",
+       torch.equal(o_a, o_b))
+
+    # -- 4. transformer blocks are exact no-ops at init ---------------------
+    kv_noblocks = build("code_v3")          # same seed -> identical weights
+    kv_noblocks.tagcode.encoder_blocks = None
+    with torch.no_grad():
+        o_blk = kv(img, context, t, pos, mask, tag_ids=ids_s, tag_mask=msk_s)
+        o_noblk = kv_noblocks(img, context, t, pos, mask, tag_ids=ids_s, tag_mask=msk_s)
+    ok("[v3] zero-init blocks are exact no-ops at init", torch.equal(o_blk, o_noblk))
+
+    # -- 5. grads: sink rows train, masked content rows do not --------------
+    # The mask TENSOR carries the visibility: content slots dark, sinks lit —
+    # pos/mask AND tag_mask must agree (the mask tensor is the visibility
+    # source of truth in the model).
+    kv.zero_grad(set_to_none=True)
+    msk_sink_lit = torch.zeros(BATCH, TAGLEN, dtype=torch.bool)
+    msk_sink_lit[:, -2:] = True
+    (img5, ctx5, t5, pos5, mask5), (ids5, _) = make_inputs(tag_mask=msk_sink_lit)
+    ids5, msk5 = reserve_sinks(ids5, msk_sink_lit)   # ids AND mask get the sentinels
+    o = kv(img5, ctx5, t5, pos5, mask5, tag_ids=ids5, tag_mask=msk5)
+    o.float().sum().backward()
+    g = enc.code_embed.weight.grad
+    ok("[v3] sink rows receive gradient",
+       g is not None and g[VOCAB:].abs().sum() > 0,
+       f"sink={g[VOCAB:].abs().sum().item():.3e}" if g is not None else "")
+    ok("[v3] masked content rows zero gradient",
+       g is not None and g[:VOCAB].abs().sum() == 0.0)
+
+    # -- 6. permutation invariance over content slots (sinks fixed) --------
+    torch.manual_seed(99)
+    perm = torch.randperm(TAGLEN - 2)          # content slots only
+    (img2, ctx2, t2, pos2, mask2), (ids2, msk2) = make_inputs()
+    ids2_s, msk2_s = reserve_sinks(ids2, msk2)
+    msk2_s = msk2_s.clone()
+    msk2_s[1, -3] = False                      # ragged content slot
+    with torch.no_grad():
+        o1 = kv(img2, ctx2, t2, pos2, mask2, tag_ids=ids2_s, tag_mask=msk2_s)
+        o2 = kv(img2, ctx2, t2, pos2, mask2,
+                tag_ids=torch.cat([ids2_s[:, :TAGLEN - 2][:, perm], ids2_s[:, TAGLEN - 2:]], dim=1),
+                tag_mask=torch.cat([msk2_s[:, :TAGLEN - 2][:, perm], msk2_s[:, TAGLEN - 2:]], dim=1))
+    ok("[v3] content permutation invariance (sinks fixed)",
+       torch.allclose(o1, o2, atol=1e-5, rtol=1e-4),
+       f"max|delta|={(o1 - o2).abs().max().item():.3e}")
+
+
 def main():
     for enc_kind in ("code", "code_free", "table"):
         run_suite(enc_kind)
+    run_v3_suite()
     # code_free init equivalence: at the ±1 init the interpolated path must
     # match the frozen sign-lookup path to float noise. Copy the frozen
     # weights over first — the extra code_embed ctor consumes RNG, so the two

@@ -31,9 +31,46 @@ import numpy as np
 import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 
 from .mmdit import RMSNorm
+
+
+class _TagTransformerBlock(nn.Module):
+    """Pre-norm transformer block, NO positional embedding (bag of words).
+
+    Zero-init out-projections (attn wo + mlp down): the block contributes
+    EXACTLY zero at init, so an encoder trained without it — or a resume from
+    one — reproduces its output bit-for-bit and the block fades itself in.
+    Key-mask only (every position queries; pads/drops can't be attended to).
+    """
+
+    def __init__(self, features: int, heads: int, mlp_mult: int):
+        super().__init__()
+        assert features % heads == 0, f"features {features} %% heads {heads}"
+        self.heads = heads
+        self.head_dim = features // heads
+        self.norm1 = RMSNorm(features)
+        self.qkv = nn.Linear(features, features * 3, bias=False)
+        self.wo = nn.Linear(features, features, bias=False)
+        nn.init.zeros_(self.wo.weight)
+        self.norm2 = RMSNorm(features)
+        hidden = features * mlp_mult
+        self.fc1 = nn.Linear(features, hidden, bias=False)
+        self.fc2 = nn.Linear(hidden, features, bias=False)
+        nn.init.zeros_(self.fc2.weight)
+
+    def forward(self, h: Tensor, key_mask: Tensor) -> Tensor:
+        B, T, Fea = h.shape
+        qkv = self.qkv(self.norm1(h))
+        q, k, v = (qkv.view(B, T, 3, self.heads, self.head_dim)
+                   .permute(2, 0, 3, 1, 4).unbind(0))       # [B, H, T, D] x3
+        amask = key_mask[:, None, None, :]                   # [B, 1, 1, T] bool: True = attends
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=amask)
+        h = h + self.wo(attn.transpose(1, 2).reshape(B, T, Fea))
+        h = h + self.fc2(F.gelu(self.fc1(self.norm2(h))))
+        return h
 
 
 class TagCodeEmbedder(nn.Module):
@@ -47,12 +84,15 @@ class TagCodeEmbedder(nn.Module):
     """
 
     def __init__(self, vocab_size: int, features: int, n_bits: int = 30,
-                 trainable_codes: bool = False):
+                 trainable_codes: bool = False, n_sinks: int = 0,
+                 encoder_layers: int = 0, encoder_heads: int = 48,
+                 encoder_mlp_mult: int = 4):
         super().__init__()
         self.vocab_size = vocab_size
         self.features = features
         self.n_bits = n_bits
         self.trainable_codes = trainable_codes
+        self.n_sinks = int(n_sinks)
         buf = torch.zeros(vocab_size, dtype=torch.int64)
         self.register_buffer("codes", buf, persistent=True)
         self.register_buffer("code_fingerprint", torch.zeros(16, dtype=torch.uint8),
@@ -67,8 +107,23 @@ class TagCodeEmbedder(nn.Module):
             # ±1 binary pattern (filled by load_codes) and trained freely —
             # tags can leave the hypercube corners / unit sphere entirely
             # instead of being pinned to unpack(codes) forever. Filled in
-            # load_codes once the code words are known.
-            self.code_embed = nn.Embedding(vocab_size, n_bits)
+            # load_codes once the code words are known. Rows [vocab:] are the
+            # sink registers (init zero = hypercube center, filled by callers
+            # reserving the last n_sinks slots of every tag span).
+            self.code_embed = nn.Embedding(vocab_size + self.n_sinks, n_bits)
+        # Optional bag-of-words transformer over the tag/sink tokens (no
+        # positional embedding — all tags share one RoPE marker in the DiT and
+        # the pairs this layer learns are order-free). Pre-norm blocks with
+        # ZERO-INIT out-projections: every block is an exact no-op at init, so
+        # an encoder trained without them (or a resume from one) reproduces
+        # its output bit-for-bit and the layers fade themselves in.
+        if trainable_codes and encoder_layers > 0:
+            self.encoder_blocks = nn.ModuleList([
+                _TagTransformerBlock(features, encoder_heads, encoder_mlp_mult)
+                for _ in range(encoder_layers)
+            ])
+        else:
+            self.encoder_blocks = None
         # Per-token gradient attenuation (see enable_grad_attenuation):
         # _grad_scale is None or {"weights": [vocab] float32, "warmup": int,
         # "start": int}; _atten_ramp in [0, 1] interpolates the effective
@@ -108,13 +163,26 @@ class TagCodeEmbedder(nn.Module):
         if self.trainable_codes:
             # Init the free code table at the exact ±1 binary pattern (NOT the
             # 1/sqrt(n)-scaled unpack: the interpolation below only cares about
-            # sign, and ±1 makes it reduce to the frozen path at init).
+            # sign, and ±1 makes it reduce to the frozen path at init). Rows
+            # [vocab:] (sinks) are ZEROED — the hypercube center, the neutral
+            # "no content" point, maximally far from every corner.
             bits = ((self.codes.unsqueeze(-1) >>
                      torch.arange(self.n_bits, device=self.codes.device,
                                   dtype=torch.int64)) & 1)
             with torch.no_grad():
-                self.code_embed.weight.copy_(bits.float().mul_(2.0).sub_(1.0))
+                self.code_embed.weight[:self.vocab_size].copy_(
+                    bits.float().mul_(2.0).sub_(1.0))
+                self.code_embed.weight[self.vocab_size:].zero_()
             self._code_embed_ready = True
+
+    def sink_ids(self, device=None) -> Tensor:
+        """The n_sinks sentinel row ids (callers reserve the last n_sinks
+        slots of every tag span with these; the model never emits them)."""
+        return torch.arange(self.vocab_size,
+                            self.vocab_size + self.n_sinks,
+                            dtype=torch.int64,
+                            device=device if device is not None
+                            else self.code_embed.weight.device)
 
     @staticmethod
     def _unpack(code_word: Tensor) -> Tensor:
@@ -131,7 +199,8 @@ class TagCodeEmbedder(nn.Module):
         block, which the caller must also drop from the attention mask (the
         existing prepare()/DiT plumbing does).
         """
-        ids = tag_ids.clamp(0, len(self.codes) - 1)
+        ids = tag_ids.clamp(0, (self.code_embed.weight.shape[0] if self.trainable_codes
+                                else len(self.codes)) - 1)
         if self.trainable_codes:
             # Continuous codes through the per-bit dictionary: with
             # w = (1 + x)/2, h = w @ E1 + (1-w) @ E0 reduces EXACTLY to the
@@ -150,8 +219,15 @@ class TagCodeEmbedder(nn.Module):
             h = self.bit_embed(idx.clamp(0, 2 * self.n_bits - 1)).sum(-2)  # [B, T, F]
         h = h * self.norm_in(h)
         h2 = self.fc2(torch.nn.functional.gelu(self.fc1(h)))
-        out = self.norm_out(h + h2)
-        return out * tag_mask.unsqueeze(-1).to(out.dtype)
+        h = self.norm_out(h + h2)
+        if self.encoder_blocks is not None:
+            # Bag-of-words self-attention over tags + sinks: key mask = the
+            # tag mask (pads/drops can't be keys; sinks, reserved by the
+            # caller with mask=True, can). Zero-init blocks: exact no-ops
+            # until trained.
+            for blk in self.encoder_blocks:
+                h = blk(h, tag_mask)
+        return h * tag_mask.unsqueeze(-1).to(h.dtype)
 
     # -- per-token gradient attenuation -------------------------------------
 

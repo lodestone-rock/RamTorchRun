@@ -3872,3 +3872,51 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   k2-tags-code2. Collapse metric now: tag-tag cosine of code_embed rows at
   ckpt 500/1000 (+17500/+18000) — does the FREE input stay distinct where
   the pinned one homogenized.
+
+## 2026-10-02 (cont.) — code v4: sink registers + 2-layer bag-of-words transformer
+
+- User design (plan-mode session): (1) two SINK REGISTERS — code_embed grows
+  to [vocab+2, 30]; slots 126/127 of every tag span are sentinel ids
+  (vocab/vocab+1, ZERO init = hypercube center) reserved by the
+  trainer/sampler after dropout/uncond masking: ALWAYS lit on cond rows,
+  fully dark on uncond rows -> v_uncond stays BITWISE base (the old
+  all-masked==base no-op contract survives where it matters — the CFG
+  negative). The tag channel is never fully off in cond (kills the
+  gate-never-opened failure mode permanently). (2) the tag encoder becomes a
+  2-layer bag-of-words transformer (_TagTransformerBlock in tag_code.py):
+  pre-norm attn + 4x MLP, NO positional embedding (tag pairing is
+  order-free), 48 heads, ZERO-INIT wo/down -> exact no-ops at init, so the
+  resume from code2-20000 reproduces its encoder output bit-for-bit and the
+  layers fade in. ~906M new params (fp32 master + Lion momentum ~7.2GB,
+  ~72GB/GPU). (3) T stays 128 — sinks live INSIDE the span (user: "keep it
+  128 but just unmask 2"), dataloader/mmdit/prepare untouched.
+- check_tag_kv rewritten for the new invariants: 13 (code) + 26 (code_free)
+  + 15 (table) + 7 (v3) checks, ALL PASS. v3: uncond all-dark == base
+  bitwise; cond with sinks != base; content-free invariance (different
+  content ids, all dark, sinks lit -> bitwise equal); zero-init blocks are
+  exact no-ops at init (outputs == blocks-less encoder bitwise); sink rows
+  graded / masked content rows exactly zero grad; content permutation
+  invariance with sinks fixed (1.9e-7).
+- BUGS found by the checks (all fixed in-session):
+  (1) forward's safety clamp `ids.clamp(0, len(codes)-1)` silently folded
+  the sentinel ids into the last REAL tag row — sink rows were never
+  indexed. Clamp now targets code_embed size when trainable_codes.
+  (2) load_codes left sink rows at nn.Embedding's N(0,1) default — spec says
+  ZERO; now zeroed explicitly.
+  (3) _TagTransformerBlock.forward shadowed `F` (features) over torch.nn.
+  functional — NameError.
+  (4) check-side traps: the tag span of the MASK TENSOR is the visibility
+  source of truth (reserving sinks in tag_mask while passing an all-dark
+  mask tensor = everything dark, grad legitimately zero); and a
+  content-free invariance test must keep the VISIBLE slots identical
+  between the two calls (ids_b randomized only in dark slots).
+- code_embed resume fixup in the trainer: a pre-sinks checkpoint carries
+  [vocab] rows, the new table [vocab+2] — _apply_state_dict skips the
+  mismatched key, so the trainer copies the [:vocab] overlap manually after
+  setup (sink rows fresh zero).
+- Run LAUNCHED: tmux k2-tags-code3, config train_tags_code3.json, resume
+  from runs/k2-tags-code2-256/ckpts/tagslora_step_20000_ckpt.safetensors
+  (code2 stopped there; offset 20000), run dir runs/k2-tags-code3-256.
+  lr 1e-4, attenuation full ramp, save/preview 500 @ 1/GPU, 16 workers.
+  tagcode-only trainable ~989M (76M encoder + 6.8M code table growth
+  + 906M transformer).

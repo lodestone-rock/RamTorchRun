@@ -47,19 +47,31 @@ class TagEmbedder(nn.Module):
         tag_dim: int = 512,
         vocab_name: str = "",
         init_std: float = 0.02,
+        direct: bool = False,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.tag_dim = tag_dim
+        self.direct = direct
         self.embed = nn.Embedding(vocab_size, tag_dim)
-        self.norm = RMSNorm(tag_dim)
-        self.proj = nn.Linear(tag_dim, features, bias=False)
+        if direct:
+            # Direct mode: the table IS the DiT-width output (tag_dim must
+            # equal features). A zero-init per-channel gate stands in for the
+            # projection's zero-init: a freshly-built embedder contributes
+            # EXACTLY zero (step-0 no-op) and the gate learns how far to open.
+            assert tag_dim == features, (
+                f"direct=True needs tag_dim == features, got {tag_dim} vs {features}"
+            )
+            self.gate = nn.Parameter(torch.zeros(features))
+        else:
+            self.norm = RMSNorm(tag_dim)
+            self.proj = nn.Linear(tag_dim, features, bias=False)
+            # Zero output projection: every tag token starts as the zero vector, so
+            # a freshly-built embedder reproduces the base model's behaviour on the
+            # first step instead of injecting noise into a pretrained DiT.
+            nn.init.zeros_(self.proj.weight)
 
         nn.init.normal_(self.embed.weight, mean=0.0, std=init_std)
-        # Zero output projection: every tag token starts as the zero vector, so
-        # a freshly-built embedder reproduces the base model's behaviour on the
-        # first step instead of injecting noise into a pretrained DiT.
-        nn.init.zeros_(self.proj.weight)
 
         # Identity of the vocabulary these ids index, so a checkpoint cannot be
         # loaded against a renumbered table without complaint.
@@ -71,6 +83,13 @@ class TagEmbedder(nn.Module):
             ),
             persistent=True,
         )
+        # Per-token gradient attenuation (optional; same contract as
+        # TagCodeEmbedder). _grad_scale None or {"weights": [vocab] fp32,
+        # "warmup", "start"}; _atten_ramp in [0, 1]. The hook lives on the
+        # encoder OUTPUT — the single point where all blocks' kv fan-in grads
+        # aggregate — so one scale covers embed rows + gate per token.
+        self._grad_scale = None
+        self._atten_ramp = 0.0
 
     def extra_repr(self) -> str:
         return (f"vocab_size={self.vocab_size}, tag_dim={self.tag_dim}, "
@@ -85,8 +104,62 @@ class TagEmbedder(nn.Module):
         query writing into a position the head chunk slices away.
         """
         x = self.embed(tag_ids)
-        x = self.proj(self.norm(x))
+        if self.direct:
+            x = x * self.gate
+        else:
+            x = self.proj(self.norm(x))
         return x * tag_mask.unsqueeze(-1).to(x.dtype)
+
+    # -- per-token gradient attenuation -------------------------------------
+    # Same contract as TagCodeEmbedder: identity forward, per-token scale of
+    # dL/d(out) applied where all blocks' kv fan-in gradients aggregate. The
+    # scale reaches embed rows AND the gate (out = gate * embed[ids]).
+
+    def enable_grad_attenuation(self, freq_parquet: str, alpha: float,
+                                low: float, high: float, warmup_steps: int,
+                                start_step: int = 0):
+        """Build the per-tag gradient weight table and arm the ramp.
+
+        w_t = clip((mean_freq / freq_t) ** alpha, low, high) over the
+        corpus-mean tag frequency; effective weight = 1 + ramp * (w_t - 1).
+        freq_parquet: columns (id, freq) over the vocab id space, counted
+        over the ACTUAL training corpus.
+        """
+        import pyarrow.parquet as pq
+
+        t = pq.read_table(freq_parquet, columns=["id", "freq"])
+        ids = t.column("id").to_pylist()
+        freqs = t.column("freq").to_pylist()
+        if len(ids) != self.vocab_size:
+            raise ValueError(
+                f"freq table has {len(ids)} rows, vocab has {self.vocab_size}"
+            )
+        mean_f = sum(freqs) / max(1, len(freqs))
+        w = [max(low, min(high, (mean_f / max(1, f)) ** alpha)) for f in freqs]
+        weights = torch.tensor(w, dtype=torch.float32, device=self.embed.weight.device)
+        self._grad_scale = {"weights": weights, "warmup": int(warmup_steps),
+                            "start": int(start_step), "alpha": alpha,
+                            "low": low, "high": high, "mean_f": mean_f}
+        self._atten_ramp = 0.0
+
+    def set_atten_step(self, global_step: int):
+        """Drive the warmup ramp; call once per optimizer step, every replica."""
+        if self._grad_scale is None:
+            return
+        start, warm = self._grad_scale["start"], self._grad_scale["warmup"]
+        self._atten_ramp = min(1.0, max(0.0, (global_step - start) / max(1, warm)))
+
+    def maybe_attach_output_hook(self, out: Tensor, tag_ids: Tensor):
+        """Scale dL/d(out) per token on the way back through the encoder."""
+        if self._grad_scale is None or not torch.is_grad_enabled():
+            return
+        if not (out.requires_grad and torch.is_tensor(tag_ids)):
+            return
+        weights = self._grad_scale["weights"]
+        w = weights[tag_ids.clamp(0, len(weights) - 1)]      # [B, T]
+        scale = 1.0 + self._atten_ramp * (w - 1.0)
+        out.register_hook(
+            lambda g: g * scale.to(g.dtype).unsqueeze(-1))
 
 
 def check_vocab(embedder: TagEmbedder, vocab_size: int, vocab_name: str):

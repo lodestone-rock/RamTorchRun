@@ -52,21 +52,34 @@ BATCH, LATENT, TXTLEN, TAGLEN = 2, 8, 5, 6
 VOCAB = 64
 
 
-def build(with_tagcode: bool, seed: int = 7) -> SingleStreamDiT:
+def build(encoder: str, seed: int = 7) -> SingleStreamDiT:
+    """encoder: "code" (TagCodeEmbedder) or "table" (TagEmbedder direct)."""
     torch.manual_seed(seed)
     dit = SingleStreamDiT(TINY)
-    if with_tagcode:
+    if encoder == "code":
         tc = TagCodeEmbedder(VOCAB, TINY.features, n_bits=30)
         with torch.no_grad():
-            # random 30-bit words (nonzero, distinct enough); row 0 stays the
-            # zero anchor, exactly as utils/tag_codes.py would produce.
+            # random 30-bit words (nonzero, distinct enough); id 0 is a real
+            # tag now (no anchor row), exactly as utils/tag_codes.py produces.
             words = torch.randint(1, 1 << 30, (VOCAB,), dtype=torch.int64)
-            tc.codes = torch.cat([torch.zeros(1, dtype=torch.int64), words])
+            tc.codes = words   # vocab rows, no anchor: id 0 is a real tag now
             tc.bit_embed.weight.normal_(0, 0.05)
             tc.fc1.weight.normal_(0, 0.05)
             tc.fc2.weight.normal_(0, 0.05)
         dit.tagcode = tc
+    elif encoder == "table":
+        from krea2.model.tag_embed import TagEmbedder
+        te = TagEmbedder(VOCAB, TINY.features, tag_dim=TINY.features,
+                         direct=True)
+        with torch.no_grad():
+            te.embed.weight.normal_(0, 0.05)
+            # gate stays zero-init: the step-0 no-op property under test
+        dit.tagembed = te
     return dit
+
+
+def encoder_of(dit):
+    return dit.tagcode if hasattr(dit, "tagcode") else dit.tagembed
 
 
 def make_inputs(seed: int = 1234, tag_mask: torch.Tensor | None = None,
@@ -103,15 +116,22 @@ def ok(name: str, cond: bool, detail: str = ""):
 
 
 def main():
-    kv = build(with_tagcode=True)
-    base = build(with_tagcode=False)   # same seed -> same weights, no tagcode
+    for enc_kind in ("code", "table"):
+        run_suite(enc_kind)
+
+
+def run_suite(kind: str):
+    kv = build(kind)
+    base = build("none")   # same seed -> same weights, no tag encoder
+    enc = encoder_of(kv)
+    enc_name = f"{kind}"
 
     # ---- 1. untagged kv forward == base, bitwise -------------------------
     (img, context, t, pos, mask), _ = make_inputs(taglen=0)
     with torch.no_grad():
         o_kv = kv(img, context, t, pos, mask, tag_ids=None, tag_mask=None)
         o_base = base(img, context, t, pos, mask)
-    ok("untagged kv == base (bitwise)", torch.equal(o_kv, o_base))
+    ok(f"[{enc_name}] untagged kv == base (bitwise)", torch.equal(o_kv, o_base))
 
     # ---- 2. all-masked tag block: no-op AND zero encoder grad ------------
     msk_all_off = torch.zeros(BATCH, TAGLEN, dtype=torch.bool)
@@ -123,14 +143,16 @@ def main():
         kv.grad_ckpt = gc
         o_kv = kv(img, context, t, pos, mask, tag_ids=ids, tag_mask=msk_all_off)
         o_base = base(img0, context0, t0, pos0, mask0)
-        ok(f"all-masked tags == base, bitwise (grad_ckpt={gc})", torch.equal(o_kv, o_base))
+        ok(f"[{enc_name}] all-masked tags == base, bitwise (grad_ckpt={gc})",
+           torch.equal(o_kv, o_base))
         target = torch.randn_like(o_kv)
         (F.mse_loss(o_kv.float(), target.float()) * 1e6).backward()
-        gsum = sum(p.grad.abs().sum().item() for p in kv.tagcode.parameters() if p.grad is not None)
-        ok(f"all-masked tags -> zero tagcode grad (grad_ckpt={gc})", gsum == 0.0, f"sum={gsum}")
+        gsum = sum(p.grad.abs().sum().item() for p in enc.parameters() if p.grad is not None)
+        ok(f"[{enc_name}] all-masked tags -> zero encoder grad (grad_ckpt={gc})",
+           gsum == 0.0, f"sum={gsum}")
         # base must produce the same loss for the same target
         o_b2 = base(img0, context0, t0, pos0, mask0)
-        ok(f"masked forward matches base loss (grad_ckpt={gc})",
+        ok(f"[{enc_name}] masked forward matches base loss (grad_ckpt={gc})",
            torch.equal((o_kv - target).detach(), (o_b2 - target).detach()))
 
     # ---- 3. permutation invariance ---------------------------------------
@@ -143,11 +165,12 @@ def main():
     with torch.no_grad():
         o1 = kv(img, context, t, pos, mask, tag_ids=ids, tag_mask=msk)
         o2 = kv(img, context, t, pos, mask, tag_ids=ids[:, perm], tag_mask=msk_p)
-    ok("tag permutation invariance", torch.allclose(o1, o2, atol=1e-5, rtol=1e-4),
+    ok(f"[{enc_name}] tag permutation invariance",
+       torch.allclose(o1, o2, atol=1e-5, rtol=1e-4),
        f"max|delta|={(o1 - o2).abs().max().item():.3e} (reduction-order noise)")
 
     # ---- 4. tags stay out of the residual stream --------------------------
-    ok("output span == image tokens only",
+    ok(f"[{enc_name}] output span == image tokens only",
        o1.shape == (BATCH, (LATENT // TINY.patch) ** 2, TINY.patch**2 * TINY.channels),
        f"shape={tuple(o1.shape)}")
 
@@ -157,18 +180,32 @@ def main():
         kv.grad_ckpt = gc
         o = kv(img, context, t, pos, mask, tag_ids=ids, tag_mask=msk)
         o.float().sum().backward()
-        g_bit = kv.tagcode.bit_embed.weight.grad
-        g_fc2 = kv.tagcode.fc2.weight.grad
-        ok(f"tagcode receives gradient (grad_ckpt={gc})",
-           g_bit is not None and g_bit.abs().sum() > 0
-           and g_fc2 is not None and g_fc2.abs().sum() > 0)
+        if kind == "code":
+            g_bit = enc.bit_embed.weight.grad
+            g_fc2 = enc.fc2.weight.grad
+            ok(f"[{enc_name}] tagcode receives gradient (grad_ckpt={gc})",
+               g_bit is not None and g_bit.abs().sum() > 0
+               and g_fc2 is not None and g_fc2.abs().sum() > 0)
+        else:
+            g_gate = enc.gate.grad
+            g_emb = enc.embed.weight.grad
+            # zero-init gate: the GATE receives gradient; the table rows see
+            # gate * grad == 0 until the gate opens (ControlNet zero-init)
+            ok(f"[{enc_name}] gate receives gradient (grad_ckpt={gc})",
+               g_gate is not None and g_gate.abs().sum() > 0)
+            ok(f"[{enc_name}] table rows zero-grad while gate closed (grad_ckpt={gc})",
+               g_emb is None or g_emb.abs().sum() == 0.0)
 
     # ---- 6. tags change the output ----------------------------------------
+    if kind == "table":
+        # gate starts closed: open it, then tags must reach the output
+        with torch.no_grad():
+            enc.gate.fill_(0.05)
     with torch.no_grad():
         o_tag = kv(img, context, t, pos, mask, tag_ids=ids, tag_mask=msk)
         o_notag = kv(img0, context0, t0, pos0, mask0, tag_ids=None, tag_mask=None)
     delta = (o_tag.float() - o_notag.float()).abs().max().item()
-    ok("tagged != untagged forward", delta > 0, f"max|delta|={delta:.3e}")
+    ok(f"[{enc_name}] tagged != untagged forward", delta > 0, f"max|delta|={delta:.3e}")
 
     # ---- 7. uncond-style anchor block (ids present, mask all False) -------
     # The tag span of `mask` is the visibility source of truth; build it False
@@ -180,7 +217,8 @@ def main():
         o_anchor = kv(imgA, contextA, tA, posA, maskA,
                       tag_ids=anchor_ids, tag_mask=torch.zeros(BATCH, TAGLEN, dtype=torch.bool))
         o_base2 = base(imgB, contextB, tB, posB, maskB)
-    ok("anchor-id all-masked block == base (CFG negative path)", torch.equal(o_anchor, o_base2))
+    ok(f"[{enc_name}] anchor-id all-masked block == base (CFG negative path)",
+       torch.equal(o_anchor, o_base2))
 
     print(f"\nAll {CHECKS} checks passed.")
 

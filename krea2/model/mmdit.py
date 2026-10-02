@@ -137,6 +137,9 @@ class SingleMMDiTConfig:
     # 28-block-deep chain. Only the monolithic forward supports "kv" for now;
     # the chunk chain (pipeline trainers) is context-mode.
     tag_mode: str = "context"
+    # TagEmbedder direct mode: tag_dim == features, no norm/proj, output
+    # scaled by a zero-init gate (step-0 exact no-op). See tag_embed.py.
+    tag_direct: bool = False
 
 
 class SimpleModulation(torch.nn.Module):
@@ -505,7 +508,8 @@ class SingleStreamDiT(nn.Module):
             from .tag_embed import TagEmbedder
 
             self.tagembed = TagEmbedder(
-                config.tag_vocab, config.features, config.tag_dim
+                config.tag_vocab, config.features, config.tag_dim,
+                direct=getattr(config, "tag_direct", False),
             )
         self.last = LastLayer(config.features, config.patch, config.channels)
 
@@ -582,6 +586,12 @@ class SingleStreamDiT(nn.Module):
                 pos = torch.cat((pos[:, :txtlen], pos[:, txtlen + taglen :]), dim=1)
                 mask = torch.cat((mask[:, :txtlen], mask[:, txtlen + taglen :]), dim=1)
                 kv_extra = tagtok
+                # Per-token gradient attenuation (optional): hook on the encoder
+                # output — the single point where all blocks' kv fan-in grads
+                # aggregate — scales dL/d(out) per token before it reaches the
+                # encoder. No-op unless enable_grad_attenuation() was called.
+                if hasattr(tagembed, "maybe_attach_output_hook"):
+                    tagembed.maybe_attach_output_hook(tagtok, tag_ids)
                 combined = torch.cat((context, img), dim=1)
             else:
                 txtlen += tagtok.shape[1]

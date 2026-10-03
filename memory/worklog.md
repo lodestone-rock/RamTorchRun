@@ -3986,3 +3986,21 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   param_group lr after each optimizer step (scheduler writes are superseded
   before opt.step() consumes them). Tested live: 1e-4 -> 1.5e-4 armed, grace,
   ramp, complete at step 4514; then dialed back to 1e-4. Run continues.
+
+## 2026-10-03 (cont.) — TAG CHANNEL CONCLUDED; base pipeline training resumed
+
+- Verdict: the kv-proj LoRA did NOT reverse the encoder homogenization.
+  tag_out_cos sits at ~0.998-0.999 since the LoRA resume (out_norm ~476,
+  proj_norm growth slowed 129->164 over ~3k steps — dynamics changed but tag
+  identity still blended). User call: the approach does not scale; the tag
+  channel is retired for now. k2-tags-tfm stopped at step ~8250 (ckpt 8000
+  banked in runs/k2-tags-tfm-256/ckpts).
+- Base training RESUMED: ./restart_oom.sh config_full_epoch.json fullepoch ->
+  tmux k2-lion-v3, pipeline parallel, chunks [7,7,7,9], resumed from ckpts/
+  full_step_30000.safetensors (initial_global_step 30001), full-epoch plan
+  resume data_epoch 0 offset 3799 (anchor 26201, plan_pos 3799/20055), lr
+  5e-6, PYTORCH_ALLOC_CONF=expandable_segments:True, tee train_fullepoch.log.
+  Plain base trainer (no tag channel, krea2/train.py, pipeline 4 GPUs).
+- Tag experiments left in repo for traceability: tag_tfm.py (fresh encoder,
+  checks green), lora_targets include filter, LR dial in train_tags_ddp —
+  all reusable, just parked.

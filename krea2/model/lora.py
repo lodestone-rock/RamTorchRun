@@ -122,6 +122,7 @@ def inject_lora(
     alpha: float | None = None,
     exclude_prefixes: tuple[str, ...] = (),
     extra_roles: tuple[str, ...] = (),
+    include_substrings: tuple[str, ...] = (),
 ) -> dict[str, LoRALinear]:
     """Walk *model* and replace every nn.Linear with a LoRALinear.
 
@@ -132,6 +133,11 @@ def inject_lora(
         exclude_prefixes: Dot-separated module name prefixes to skip.
                           e.g. ``("txtfusion",)`` to leave the text-fusion
                           transformer fully frozen.
+        include_substrings: Optional targeting filter. When non-empty, only
+                          Linears whose dotted name CONTAINS one of the
+                          substrings are replaced (e.g. ``(".wk", ".wv")``
+                          for a K/V-only adapter); everything else keeps
+                          recursing. Empty tuple = every nn.Linear (default).
         extra_roles:      Additional named adapters next to the primary one
                           (e.g. ``("fake",)`` for TDM's fake score). Switch
                           with :func:`set_lora_role`.
@@ -157,6 +163,11 @@ def inject_lora(
 
             # Skip excluded subtrees.
             if any(full_name.startswith(ep) for ep in exclude_prefixes):
+                continue
+
+            # Targeting filter: only replace Linears whose name matches.
+            if include_substrings and not any(s in full_name for s in include_substrings):
+                _replace(child, full_name)   # keep recursing for nested targets
                 continue
 
             if isinstance(child, nn.Linear):

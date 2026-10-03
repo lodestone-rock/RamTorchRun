@@ -7,11 +7,19 @@
   "encoder_config": "qwen3_vl_4b",
   "encoder_model_id": "Qwen/Qwen3-VL-4B-Instruct",
   "ae_model_id": "Qwen/Qwen-Image",
-  "lora_rank": 0,
-  "lora_alpha": 32.0,
+  "lora_rank": 16,
+  "lora_alpha": 16.0,
+  "lora_targets": [
+    ".wk",
+    ".wv"
+  ],
   "lora_exclude_prefixes": [
     "tagtfm"
   ],
+  "lr_dial": {
+    "grace_steps": 50,
+    "ramp_steps": 100
+  },
   "tag_encoder": "tfm",
   "tag_tfm": {
     "d_model": 1024,

@@ -118,7 +118,8 @@ def make_train_factory(cfg: dict, dit_cfg, vocab_size: int, code_path: str,
         if rank:
             inject_lora(d, rank=rank,
                         alpha=float(cfg.get("lora_alpha", rank)),
-                        exclude_prefixes=tuple(cfg.get("lora_exclude_prefixes", ())))
+                        exclude_prefixes=tuple(cfg.get("lora_exclude_prefixes", ())),
+                        include_substrings=tuple(cfg.get("lora_targets", ())))
         # freeze every non-LoRA param, then attach the tag encoder
         for n, p in d.named_parameters():
             p.requires_grad_(False)
@@ -697,6 +698,78 @@ def train(cfg: dict, config_path: str):
         "a photo of a corgi riding a skateboard in a neon-lit city at night",
     ])
 
+    # -- LR dial: live lr tuning through the config file ----------------------
+    # Edit `lr` in the config json while training. On a change: re-read inside
+    # try/except (mangled JSON is warned and IGNORED, never crashes the run),
+    # arm a dial_grace-step window (reverting during the grace = no-op), then
+    # ramp lr linearly to the target over dial_ramp_steps. Applied by
+    # overriding every optimizer's param_group lr right after each optimizer
+    # step (the scheduler's own write for the NEXT step is superseded by the
+    # override we set here, and it never reaches opt.step() before us).
+    dial_grace = int(cfg.get("lr_dial", {}).get("grace_steps", 50))
+    dial_ramp = int(cfg.get("lr_dial", {}).get("ramp_steps", 100))
+    _dial = {"mtime": os.path.getmtime(config_path), "cur": lr, "target": None,
+             "grace_left": 0, "ramping": False, "ramp_from": None, "ramp_left": 0}
+
+    def _dial_set_lr(value):
+        for s in wrapper.schedulers:
+            if s is not None:
+                s.base_lrs = [value] * len(s.base_lrs)
+        for opt_ in wrapper.optimizers:
+            for pg in opt_.param_groups:
+                pg["lr"] = value
+
+    def dial_tick():
+        """Poll the config for an lr change (mtime-gated), run the grace/ramp
+        state machine, and apply the effective lr for the NEXT optimizer
+        step. Returns the lr in effect."""
+        try:
+            m = os.path.getmtime(config_path)
+        except OSError as e:
+            print(f"[lr-dial] config unreadable ({e}); keeping lr={_dial['cur']:g}")
+            return _dial["cur"]
+        if m != _dial["mtime"]:
+            _dial["mtime"] = m
+            try:
+                with open(config_path) as f:
+                    target = float(json.load(f).get("lr", _dial["cur"]))
+            except Exception as e:
+                print(f"[lr-dial] config change unreadable; keeping lr={_dial['cur']:.3e} ({e})")
+                return _dial["cur"]
+            cur = _dial["cur"]
+            if target != cur and target != _dial["target"]:
+                _dial["target"] = target
+                _dial["grace_left"] = dial_grace
+                _dial["ramp_from"] = cur
+                _dial["ramp_left"] = dial_ramp
+                _dial["ramping"] = False
+                print(f"[lr-dial] lr {cur:.4e} -> {target:.4e} armed: grace "
+                      f"{dial_grace} steps, then {dial_ramp}-step ramp")
+            elif target == cur and _dial["target"] is not None:
+                _dial["target"] = None
+                _dial["ramping"] = False
+                print("[lr-dial] lr reverted before it could ramp; cancelled")
+        if _dial["target"] is None:
+            return _dial["cur"]
+        if _dial["grace_left"] > 0:
+            _dial["grace_left"] -= 1
+            if _dial["grace_left"] == 0:
+                _dial["ramping"] = True
+                print(f"[lr-dial] grace over; ramping {_dial['ramp_from']:.4e} "
+                      f"-> {_dial['target']:.4e} over {dial_ramp} steps")
+            return _dial["cur"]
+        if _dial["ramping"]:
+            _dial["ramp_left"] -= 1
+            t = 1.0 - _dial["ramp_left"] / dial_ramp
+            _dial["cur"] = _dial["ramp_from"] + (_dial["target"] - _dial["ramp_from"]) * t
+            if _dial["ramp_left"] <= 0:
+                _dial["cur"] = _dial["target"]
+                _dial["target"] = None
+                _dial["ramping"] = False
+                print(f"[lr-dial] ramp complete: lr={_dial['cur']:.4e}")
+            return _dial["cur"]
+        return _dial["cur"]
+
     torch.manual_seed(master_seed)
     stop = False
     pbar = tqdm(total=max_steps - global_step if max_steps else None, desc="tags-ddp")
@@ -752,8 +825,14 @@ def train(cfg: dict, config_path: str):
             global_step += 1
             pbar.update(1)
 
-            lr_now = (wrapper.scheduler.get_last_lr()[0]
-                      if wrapper.scheduler is not None else lr)
+            # LR dial: poll the config, run the grace/ramp machine, and apply
+            # the effective lr for the NEXT optimizer step.
+            _dial_lr = dial_tick()
+            if _dial["target"] is not None or _dial["ramping"]:
+                _dial_set_lr(_dial["cur"])
+            lr_now = _dial["cur"] if _dial["target"] is not None or _dial["ramping"] else (
+                wrapper.scheduler.get_last_lr()[0]
+                if wrapper.scheduler is not None else lr)
             pbar.set_postfix(loss=f"{loss_val:.4f}", lr=f"{lr_now:.2e}", step=global_step, res=resolution)
             wr.writerow([global_step, f"{loss_val:.6f}", lr_now, f"{time.time()-t0:.1f}"])
             if global_step % 50 == 0:

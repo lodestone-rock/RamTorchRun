@@ -783,7 +783,7 @@ def train(cfg: dict, config_path: str):
                     tfm0 = wrapper.models[0].tagtfm
                     dev0 = tfm0.embed.weight.device
                     with torch.no_grad():
-                        pids = _probe_ids.to(dev0)
+                        pids = _probe_ids[:, None].repeat(1, 128).to(dev0)
                         pmsk = torch.zeros_like(pids, dtype=torch.bool)
                         pmsk[:, 0] = True
                         pout = tfm0(pids, pmsk)[:, 0]

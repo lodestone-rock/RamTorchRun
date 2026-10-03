@@ -3920,3 +3920,43 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   lr 1e-4, attenuation full ramp, save/preview 500 @ 1/GPU, 16 workers.
   tagcode-only trainable ~989M (76M encoder + 6.8M code table growth
   + 906M transformer).
+
+## 2026-10-03 — code3 verdict + tag-TFM fresh start (runs/k2-tags-tfm-256)
+
+- code3 CONCLUDED as a failure: after 5200 steps the 2-layer tag encoder
+  COLLAPSED into an input-agnostic amplifier. Probe at ckpt 25000: every
+  output token (any content tags, or sinks only) is the same ~16k-norm vector,
+  cos >= 0.9996 between different tag sets and text-only; per-tag differences
+  ~1e-6 of the carrier. The blocks (zero-init fade-in via Lion) converged on
+  broadcasting a constant 16k carrier ("tags present" bias) that drowns tag
+  identity. The old collapse metric watched code_embed INPUT rows (still
+  distinct) — the collapse lived at the OUTPUT. Also found: the two sink
+  registers are exact clones forever (zero-init + permutation-equivariant +
+  no dropout -> identical grads), i.e. one sink duplicated.
+- Implementation gap found: krea2/model/sampling.py generate() and
+  inference.py never reserve sinks (inference.py also reads tag_embed, not
+  tag_code) — standalone text-only inference would be bitwise base = OOD vs
+  training. Left as-is; superseded by TFM.
+- NEW: krea2/model/tag_tfm.py — TagTFMEmbedder: plain nn.Embedding(vocab,
+  1024) -> 5 bag-of-words layers (pre-norm attn key-mask-only + SwiGLU mult 4,
+  NO positional embedding) -> RMSNorm -> ZERO-INIT Linear(1024->6144). No
+  bit codes, no sinks, no sentinels: all-dark span == bitwise base at ANY
+  state, so text-only cond AND the CFG negative are exactly base. Per-token
+  grad attenuation kept (alpha 0.5, clip [0.5,2.0]), warmup 0 = full from
+  step 0, hook on the 6144 output (covers table+blocks+proj).
+- GOTCHA: SDPA needs a per-query diagonal fallback (fully-masked rows are
+  NaN on the math backend); and the attn mask key/query axes are easy to
+  swap — check_tag_tfm CAUGHT the swapped version (pads were leaking as
+  keys) before launch. check_tag_tfm: 13 checks incl. all-dark==base bitwise
+  at trained scale, pad-grad exactly zero, step-0 no-op, attenuation scaling.
+- New metrics every 50 steps: tag_out_cos (mean pairwise cos of encoder
+  OUTPUTS over a fixed 64-tag probe — the metric that would have caught
+  code3), tag_out_norm, tag_proj_norm (channel-open indicators).
+- Config train_tags_tfm.json: tag_encoder tfm, d_model 1024/5 layers/16
+  heads/swiglu mult 4, tag_drop_prob 0.1, attenuation warmup 0, lr 1e-4
+  Lion (0.9,0.99), fresh run runs/k2-tags-tfm-256, trackio k2-tags-tfm.
+  code3 stopped at ckpt 25000 (~25.2k steps; encoder collapsed — preview text
+  row altered generation via the constant carrier). tag_code.py/tag_embed.py
+  kept for traceability.
+- GOTCHA: tee into runs/<dir>/train.log needs the run dir to exist BEFORE
+  tmux launch (tee starts before the trainer mkdirs) — mkdir first.

@@ -567,7 +567,8 @@ class SingleStreamDiT(nn.Module):
         # The head slices off everything before the image span, so the tag
         # block counts as part of the prefix length.
         txtlen, imglen = context.shape[1], img.shape[1]
-        tagembed = self.tagembed if self.tagembed is not None else getattr(self, "tagcode", None)
+        tagembed = (self.tagembed if self.tagembed is not None
+                    else (getattr(self, "tagcode", None) or getattr(self, "tagtfm", None)))
         tag_mode = getattr(self.config, "tag_mode", "context")
         kv_extra: Tensor | None = None   # kv-mode tag embeddings (never in the stream)
         tag_pos = tag_rows = None

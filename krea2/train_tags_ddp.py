@@ -144,6 +144,23 @@ def make_train_factory(cfg: dict, dit_cfg, vocab_size: int, code_path: str,
             te.embed.weight.requires_grad_(True)
             te.embed.weight._is_row_table = True   # factory filters it out
             te.gate.requires_grad_(True)
+        elif encoder_kind == "tfm":
+            # Fresh tag transformer: plain table -> 5 bag-of-words layers at
+            # d_model -> zero-init up-projection to the DiT width. No bit
+            # codes, no sinks; all-dark rows are bitwise base at ANY state.
+            from krea2.model.tag_tfm import TagTFMEmbedder
+            tcfg = cfg.get("tag_tfm", {})
+            tf = TagTFMEmbedder(
+                vocab_size, d.config.features,
+                d_model=int(tcfg.get("d_model", 1024)),
+                layers=int(tcfg.get("layers", 5)),
+                heads=int(tcfg.get("heads", 16)),
+                swiglu_mult=int(tcfg.get("swiglu_mult", 4)),
+                vocab_name=os.path.basename(cfg.get("tag_code", {}).get("vocab_path", "")),
+            )
+            d.tagtfm = tf
+            for p in tf.parameters():
+                p.requires_grad_(True)
         else:
             tcfg = cfg.get("tag_code", {})
             tc = TagCodeEmbedder(vocab_size, d.config.features,
@@ -415,6 +432,8 @@ def train(cfg: dict, config_path: str):
                 table_ref0 = table_param
         elif hasattr(m, "tagcode"):
             m.tagcode = m.tagcode.float()
+        elif hasattr(m, "tagtfm"):
+            m.tagtfm = m.tagtfm.float()
         trainable_ps = [p for p in m.parameters() if p.requires_grad]
         bad = [p for p in trainable_ps
                if p.dtype != torch.float32 and p is not table_param]
@@ -477,7 +496,8 @@ def train(cfg: dict, config_path: str):
     if atten_cfg:
         for g in range(n_gpus):
             m = wrapper.models[g]
-            enc = getattr(m, "tagcode", None) or getattr(m, "tagembed", None)
+            enc = (getattr(m, "tagcode", None) or getattr(m, "tagembed", None)
+                   or getattr(m, "tagtfm", None))
             if enc is not None:
                 enc.enable_grad_attenuation(
                     atten_cfg["freq_parquet"],
@@ -495,6 +515,8 @@ def train(cfg: dict, config_path: str):
     trainable = sum(p.numel() for p in wrapper.model.parameters() if p.requires_grad)
     if encoder_kind == "table":
         trainable_label = "tag table (direct) + gate; RowLion row-sparse"
+    elif encoder_kind == "tfm":
+        trainable_label = "tag transformer (frozen backbone)"
     else:
         trainable_label = ("LoRA + tag-code" if int(cfg.get("lora_rank", 0) or 0)
                            else "tag-code only (frozen backbone)")
@@ -517,6 +539,11 @@ def train(cfg: dict, config_path: str):
                              "base": os.path.basename(cfg["full_checkpoint"])})
         print(f"  trackio: project {cfg['trackio_project']} (local storage)")
     grad_norms = {}   # gpu_id -> {"total", "bit", "mlp", "scales"}, written by fb_fn
+    # Fixed output-collapse probe: 64 vocab ids spread across the table, one
+    # lit per row. If the encoder collapses to a constant carrier (the code3
+    # failure mode), the mean pairwise cosine of these OUTPUT tokens -> 1.0
+    # while the input rows stay distinct — this is the metric that was missing.
+    _probe_ids = torch.linspace(0, max(0, vocab_size - 1), 64).round().long()
 
     x1_res = (minres // (compression * patch)) ** 2
     x2_res = (maxres // (compression * patch)) ** 2
@@ -588,13 +615,19 @@ def train(cfg: dict, config_path: str):
         entry["total"] = float(torch.norm(torch.stack(
             [g.norm() for g in grads]))) if grads else 0.0
         tc = getattr(model, "tagcode", None)
+        def _gn(t):
+            return t.grad.norm().item() if t.grad is not None else 0.0
         if tc is not None:
-            def _gn(t):
-                return t.grad.norm().item() if t.grad is not None else 0.0
             entry["bit"] = _gn(tc.bit_embed.weight)
             entry["mlp"] = float(torch.tensor([_gn(tc.fc1.weight), _gn(tc.fc2.weight)]).norm())
             entry["scales"] = float(torch.tensor(
                 [_gn(tc.norm_in.scale), _gn(tc.norm_out.scale)]).norm())
+        tfm = getattr(model, "tagtfm", None)
+        if tfm is not None:
+            entry["tab"] = _gn(tfm.embed.weight)
+            entry["up"] = _gn(tfm.proj.weight)
+            entry["blk"] = float(torch.tensor(
+                [_gn(b.wo.weight) for b in tfm.blocks]).norm())
         grad_norms[gpu_id] = entry
         return loss.detach().item()
 
@@ -657,7 +690,7 @@ def train(cfg: dict, config_path: str):
         # state_dict keys -> params: lora / tagcode / tagembed are the
         # trainable set; also keep the persistent code/fingerprint buffers.
         return ("lora_A" in key or "lora_B" in key or "tagcode" in key
-                or "tagembed" in key)
+                or "tagembed" in key or "tagtfm" in key)
 
     prompts = cfg.get("preview_prompts", [
         "1girl, solo, long hair, looking at viewer, blush, smile, outdoors",
@@ -699,7 +732,7 @@ def train(cfg: dict, config_path: str):
             t_step0 = time.time()
             if atten_cfg:
                 for m in wrapper.models:
-                    for enc in ("tagcode", "tagembed"):
+                    for enc in ("tagcode", "tagembed", "tagtfm"):
                         tc = getattr(m, enc, None)
                         if tc is not None:
                             tc.set_atten_step(global_step)
@@ -727,7 +760,7 @@ def train(cfg: dict, config_path: str):
                 csv_file.flush()
             if trackio_run:
                 metrics = {"loss": loss_val, "lr": lr_now}
-                for key in ("total", "bit", "mlp", "scales",
+                for key in ("total", "bit", "mlp", "scales", "tab", "up", "blk",
                             "t_cond", "t_vae", "t_prep", "t_fwd", "t_bwd"):
                     vals = [e[key] for e in grad_norms.values() if key in e]
                     if vals:
@@ -736,9 +769,30 @@ def train(cfg: dict, config_path: str):
                 metrics["gap"] = loop_timings.get("gap", 0.0)
                 metrics["step_total"] = loop_timings.get("step_total", 0.0)
                 if atten_cfg:
-                    metrics["atten_ramp"] = float(getattr(
-                        wrapper.models[0].tagcode if hasattr(wrapper.models[0], "tagcode")
-                        else wrapper.models[0].tagembed, "_atten_ramp", 0.0))
+                    _m0 = wrapper.models[0]
+                    _enc = (getattr(_m0, "tagcode", None)
+                            or getattr(_m0, "tagembed", None)
+                            or getattr(_m0, "tagtfm", None))
+                    metrics["atten_ramp"] = float(getattr(_enc, "_atten_ramp", 0.0))
+                if global_step % 50 == 0 and hasattr(wrapper.models[0], "tagtfm"):
+                    # Output-side collapse probe: 64 fixed tags, one lit per
+                    # row; mean pairwise cosine of the ENCODER OUTPUTS (the
+                    # code3 run's collapse lived here, invisible to the
+                    # input-side row metric). tag_out_norm/tag_proj_norm are
+                    # the channel-open indicators.
+                    tfm0 = wrapper.models[0].tagtfm
+                    dev0 = tfm0.embed.weight.device
+                    with torch.no_grad():
+                        pids = _probe_ids.to(dev0)
+                        pmsk = torch.zeros_like(pids, dtype=torch.bool)
+                        pmsk[:, 0] = True
+                        pout = tfm0(pids, pmsk)[:, 0]
+                        pe = F.normalize(pout, dim=-1)
+                        pc = pe @ pe.T
+                        _eye = torch.eye(pout.shape[0], dtype=torch.bool, device=dev0)
+                        metrics["tag_out_cos"] = float(pc[~_eye].mean())
+                        metrics["tag_out_norm"] = float(pout.norm(dim=-1).mean())
+                        metrics["tag_proj_norm"] = float(tfm0.proj.weight.norm())
                 if row_lion is not None and global_step % 50 == 0:
                     metrics["rows_trained"] = row_lion.rows_trained()
                 t_tj = time.time()

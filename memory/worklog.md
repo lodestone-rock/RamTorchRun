@@ -3960,3 +3960,29 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   kept for traceability.
 - GOTCHA: tee into runs/<dir>/train.log needs the run dir to exist BEFORE
   tmux launch (tee starts before the trainer mkdirs) — mkdir first.
+
+## 2026-10-03 (cont.) — tfm v2: kv-proj LoRA + live LR dial
+
+- Table dissection at ckpt 3750: the INPUT table is healthy (mean pairwise
+  cos 0.022, max 0.667, no merged pairs in a 400-sample; top-1 singular
+  energy 11.7%, top-10 40% — a shared direction forming but not rank-1; row
+  norms bimodal: median 0.66 = init, top ~10% at ~8-12 = frequently-trained
+  tags). The homogenization (tag_out_cos -> 0.99) is made by the ENCODER
+  layers, not the table — same as code3 but plateauing at ~0.99-0.999.
+- User hypothesis: the frozen kv projections (tags enter every block as
+  kv_extra through wk/wv, all sharing one RoPE marker) make the frozen
+  backbone prefer a constant kv blob. Countermeasure: LoRA on the K/V
+  projections ONLY. This DiT has separate wq/wk/wv Linears (no fused qkv),
+  so the mapping is clean.
+- inject_lora gained include_substrings (targeting filter); trainer passes
+  cfg["lora_targets"]. tfm run: lora_rank 16, alpha 16, targets (.wk,.wv) —
+  64 Linears (32 blocks x wk+wv), +7.5M params (311.5M trainable). Resumed
+  from ckpt 4250; LoRA keys absent from the ckpt -> adapters start at zero
+  (exact no-op at resume).
+- LR dial (lr_dial.grace_steps 50 / ramp_steps 100): the trainer polls the
+  config json mtime every step; mangled JSON is warned and ignored (never
+  crashes); a changed `lr` arms a 50-step grace (revert during grace
+  cancels) then ramps lr linearly over 100 steps by overriding optimizer
+  param_group lr after each optimizer step (scheduler writes are superseded
+  before opt.step() consumes them). Tested live: 1e-4 -> 1.5e-4 armed, grace,
+  ramp, complete at step 4514; then dialed back to 1e-4. Run continues.

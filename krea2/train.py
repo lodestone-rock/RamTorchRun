@@ -751,10 +751,30 @@ def train(cfg: dict, config_path: str):
         )
         print(f"  Optimizer: {summary}; Muon scaling={muon_options['adjust_lr_fn']!r}, "
               f"lr={lr:g}, AdamW lr={muon_options['adamw_lr']:g}.")
-    elif optimizer_impl == "lion":
-        opt = Lion(trainable, **lion_options)
-        print(f"  Optimizer: Lion (unfused, tensor-local); lr={lr:g}, "
-              f"weight_decay={weight_decay:g}, betas={lion_options['betas']}.")
+    elif optimizer_impl == "sgd":
+        opt = torch.optim.SGD(trainable, lr=lr, weight_decay=weight_decay)
+        print(f"  Optimizer: SGD (no state); lr={lr:g}, weight_decay={weight_decay:g}.")
+    elif optimizer_impl in ("lion", "lion8", "lion8paged"):
+        if optimizer_impl == "lion8":
+            import bitsandbytes as bnb
+            opt = bnb.optim.Lion8bit(
+                trainable, lr=lr, betas=lion_options["betas"],
+                weight_decay=weight_decay,
+            )
+            print(f"  Optimizer: bitsandbytes Lion8bit (8-bit GPU states); "
+                  f"lr={lr:g}, weight_decay={weight_decay:g}, betas={lion_options['betas']}.")
+        elif optimizer_impl == "lion8paged":
+            import bitsandbytes as bnb
+            opt = bnb.optim.PagedLion8bit(
+                trainable, lr=lr, betas=lion_options["betas"],
+                weight_decay=weight_decay,
+            )
+            print(f"  Optimizer: bitsandbytes PagedLion8bit (8-bit host-paged states); "
+                  f"lr={lr:g}, weight_decay={weight_decay:g}, betas={lion_options['betas']}.")
+        else:
+            opt = Lion(trainable, **lion_options)
+            print(f"  Optimizer: Lion (unfused, tensor-local); lr={lr:g}, "
+                  f"weight_decay={weight_decay:g}, betas={lion_options['betas']}.")
     elif optimizer_impl == "offload-adamw":
         opt = build_offload_adamw(
             dit_chunks, counts, devices,
@@ -907,6 +927,19 @@ def train(cfg: dict, config_path: str):
     if os.path.getsize(csv_path) == 0:
         csv_writer.writerow(["step", "loss", "lr", "time"])
     t0 = time.time()
+
+    # Trackio monitoring (local storage by default; pass trackio_space_id to
+    # sync to an HF Space instead). Loss/lr every step, preview grid at eval.
+    trackio_run = bool(cfg.get("trackio_project"))
+    if trackio_run:
+        import trackio
+        trackio.init(project=cfg["trackio_project"],
+                     name=cfg.get("trackio_run") or os.path.basename(cfg["ckpt_path"].rstrip("/")),
+                     config={"lr": lr, "resolution": cfg.get("resolution", 256),
+                             "parallelism": str(parallelism),
+                             "n_gpus": len(devices),
+                             "base": os.path.basename(cfg["full_checkpoint"])})
+        print(f"  trackio: project {cfg['trackio_project']} (local storage)")
 
     # Where a step goes. Under offload the optimizer and the grad flush are
     # host/PCIe work that can dwarf fwd+bwd, which is exactly the choice
@@ -1110,6 +1143,8 @@ def train(cfg: dict, config_path: str):
                 global_step, f"{loss_val:.6f}", f"{lr_now:.2e}",
                 f"{time.time() - t0:.1f}",
             ])
+            if trackio_run:
+                trackio.log({"loss": loss_val, "lr": lr_now}, step=global_step)
             if global_step % log_every == 0:
                 csv_file.flush()
 
@@ -1151,6 +1186,9 @@ def train(cfg: dict, config_path: str):
                     from torchvision.utils import save_image
                     save_image(grid, img_path)
                 print(f"[preview] Saved {img_path}")
+                if trackio_run:
+                    trackio.log({"preview": trackio.Image(img_path)},
+                                step=global_step)
                 if benchmark_path:
                     for dev in devices:
                         torch.cuda.synchronize(dev)

@@ -4004,3 +4004,23 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
 - Tag experiments left in repo for traceability: tag_tfm.py (fresh encoder,
   checks green), lora_targets include filter, LR dial in train_tags_ddp —
   all reusable, just parked.
+
+## 2026-10-05 — base pipeline crash: watchdog + trackio
+
+- Crash #2: cuDNN mha_graph.execute failure inside the pipeline inference
+  (dit_pipe.infer at the PREVIEW path), step ~32750. Same stage-1 inference
+  failure class as the Sep 28 fullepoch crash. No circumvention; resume is
+  the strategy. Last ckpt full_step_32600 (save every 200).
+- trackio added to the base trainer (krea2/train.py): loss/lr per step +
+  preview grid at eval, guarded by cfg.trackio_project (project k2-lion,
+  local storage). GOTCHA: train.py has no n_gpus variable -> len(devices).
+- WATCHDOG ACTIVE: tmux k2-lion-watchdog runs watchdog_lion_v3.sh (5-min
+  poll; if the trainer process is gone, restart via restart_oom.sh -> newest
+  ckpt + plan resume). PAUSE_WATCHDOG removed (it was suppressing the
+  watchdog during the tag runs). Watchdog verified live: detected the dead
+  trainer and relaunched k2-lion-v3 twice (first boot died on my NameError
+  in the trackio init; second boot resumed from ckpt 32600 clean).
+- Caveat: preview intervals are the crash source (cuDNN mha_graph.execute
+  failure in the pipeline inference path). Each crash loses up to 200 steps
+  (save_every 200); the watchdog restarts within 5 min. If crashes get
+  frequent, the next lever is raising eval_interval or disabling previews.

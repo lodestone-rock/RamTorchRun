@@ -100,6 +100,10 @@ krea2/                    # Krea-2 ~12B MMDiT + Qwen-Image VAE + Qwen3-VL encode
   train.py                #   THE trainer: offload / pipeline / pipeline-offload, LoRA or full
   train_tdm.py            #   TDM few-step distillation (role-based LoRA)
   train_mass_lora.py      #   L per-concept LoRAs at once (stacked banks + grouped bmm)
+  train_e2e_qwen.py       #   E2E "pseudo-VAE", DDP: LoRA on DiT + Qwen3-VL (LM+vision),
+                          #   alternating caption (image->scene_graph JSON) /
+                          #   diffusion (DiT on Qwen(JSON), grad into Qwen) steps;
+                          #   model/qwen_e2e.py + tools/check_e2e_qwen.py
   train_utils.py          #   K2 helpers (VAE encode/decode, timesteps, SDPA pinning)
                           #   + TagTrainer: the whole tag-embedding policy
   inference.py            #   single-GPU / --pipeline / --offload (combinable), --tags

@@ -1,0 +1,115 @@
+{
+  "_comment": "End-to-end Qwen3-VL + K2 DiT 'pseudo-VAE' (krea2/train_e2e_qwen.py). Alternating objectives per step: caption (Qwen-VL(image) -> scene_graph JSON, KIE prompt) and diffusion (DiT conditioned on Qwen(JSON text only), grad flows into Qwen). LoRA on DiT + Qwen LM + Qwen vision; base Krea-2 raw (the k2-lion lineage is considered overbaked). 256px smoke / quick test.",
+  "seed": 42,
+  "initial_global_step": 0,
+  "full_checkpoint": "/mnt/datapool_u2/lodestone/RamTorchRun/checkpoints/krea2/raw.safetensors",
+  "mmdit_config": "large_wide",
+  "encoder_model_id": "Qwen/Qwen3-VL-4B-Instruct",
+  "ae_model_id": "Qwen/Qwen-Image",
+  "lora_rank": 32,
+  "lora_alpha": 32.0,
+  "lora_exclude_prefixes": [
+    "txtfusion.projector"
+  ],
+  "qwen_lora_rank": 32,
+  "qwen_lora_alpha": 32.0,
+  "qwen_lora_targets": [
+    "model.language_model.",
+    "model.visual."
+  ],
+  "objective_cycle": [
+    "caption",
+    "diffusion"
+  ],
+  "max_text_len": 1024,
+  "caption_max_pixels": 262144,
+  "caption_min_pixels": 65536,
+  "resolution": 256,
+  "batch_size": 16,
+  "n_gpus": 4,
+  "optimizer": "lion",
+  "lion": {
+    "betas": [
+      0.9,
+      0.99
+    ]
+  },
+  "lr_dit": 5e-05,
+  "lr_qwen": 2e-05,
+  "weight_decay": 0.0,
+  "warmup": 100,
+  "max_grad_norm": 1.0,
+  "lr_dial": {
+    "grace_steps": 50,
+    "ramp_steps": 100
+  },
+  "uncond_ratio": 0.1,
+  "mu_y1": 0.5,
+  "mu_y2": 1.15,
+  "mu_sigma": 1.0,
+  "minres": 256,
+  "maxres": 1280,
+  "eval_interval": 250,
+  "save_every_n_steps": 250,
+  "save_final": true,
+  "preview_res": 512,
+  "preview_steps": 28,
+  "preview_cfg_scale": 4.5,
+  "preview_samples_per_gpu": 1,
+  "preview_max_new_tokens": 1536,
+  "max_steps": 0,
+  "ckpt_path": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-e2e-qwen-256",
+  "preview_path": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-e2e-qwen-256/previews",
+  "trackio_project": "k2-e2e-qwen",
+  "parquet_dataloader": {
+    "parquet_sources": {
+      "danbooru": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=danbooru",
+        "n_samples": null
+      },
+      "deviantart": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=deviantart",
+        "n_samples": null
+      },
+      "e621": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=e621",
+        "n_samples": null
+      },
+      "midjourney": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=midjourney",
+        "n_samples": null
+      },
+      "reddit": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=reddit",
+        "n_samples": null
+      }
+    },
+    "caption_columns": {
+      "scene_graph": {
+        "weight": 1.0,
+        "is_tag_based": false
+      }
+    },
+    "filename_column": "file_path",
+    "width_column": "image_width",
+    "height_column": "image_height",
+    "loss_weight_column": null,
+    "image_folder_path": "",
+    "base_resolution": [
+      256
+    ],
+    "base_resolution_weights": [
+      1.0
+    ],
+    "ratio_cutoff": 2.0,
+    "resolution_step": 64,
+    "offset": 0,
+    "num_workers": 16,
+    "prefetch_factor": 8,
+    "s3_image_source": {
+      "endpoint_url": "http://localhost:9000",
+      "credential_file": "/mnt/datapool_u2/lodestone/RamTorchRun/credential/local-rustfs-readonly.json",
+      "strip_prefix": "/mnt/nas_buckets/"
+    }
+  }
+}

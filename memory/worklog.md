@@ -4024,3 +4024,46 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   failure in the pipeline inference path). Each crash loses up to 200 steps
   (save_every 200); the watchdog restarts within 5 min. If crashes get
   frequent, the next lever is raising eval_interval or disabling previews.
+
+## 2026-10-06 — E2E Qwen3-VL + DiT "pseudo-VAE" trainer; base run stopped
+
+- NEW krea2/train_e2e_qwen.py (+ model/qwen_e2e.py, configs/train_e2e_qwen.json,
+  tools/check_e2e_qwen.py). Encoder = Qwen-VL(image) -> scene_graph JSON;
+  decoder = DiT(noise, Qwen(JSON text only), t). Objectives ALTERNATE per
+  optimizer step (objective_cycle, default caption/diffusion 1:1). LoRA rank 32
+  on the DiT (txtfusion.projector excluded), Qwen LM and Qwen vision tower
+  (incl. merger + deepstack mergers); lm_head untouched (tied). 117M DiT +
+  66M LM + 14.5M vision trainable. One E2EModel(dit, qwen) module under
+  MultiGPUWrapper ZeRO-1; two Lion param groups (lr_dit 5e-5, lr_qwen 2e-5),
+  live lr dial for both. On caption steps the DiT grads are None — reduce_grads
+  and Lion both skip None, so no special casing.
+- Caption prompt = Qwen's native KIE format ("Extract the key-value information
+  in the format: {SCENE_GRAPH_SCHEMA}. Output only the JSON."), user turn after
+  the image; labels = answer + <|im_end|> only; lm_head runs on labelled rows
+  only. Targets re-serialized one-line in schema key order (json.dumps default
+  separators); the diffusion text uses the same string inside the unchanged
+  Qwen3VLConditioner template, padded to batch-longest (max_text_len 1024).
+- encode_text runs qwen.model (no 151k logits), grad-enabled; check_e2e_qwen
+  proves it equals the real Qwen3VLConditioner BITWISE (tiny 36-layer Qwen,
+  real tokenizer/processor, monkeypatched from_pretrained), with and without
+  zero-init LoRA. Also: diffusion grads reach LM LoRA (layers 0-34) + DiT,
+  vision None; caption grads reach vision + LM, DiT None; label span exact;
+  lm_head tied. CAVEAT: hidden_states[35] = output of decoder layer 34, so LM
+  layer 35 learns from captioning only. Schema scan 5000 rows: 0 bad JSON, no
+  missing keys; artist is null in 41.5% (fine).
+- Base: checkpoints/krea2/raw.safetensors (user: the k2-lion lineage is
+  overbaked, to be whitened separately). 256px.
+- GOTCHAS: Qwen pretty-prints its JSON — the preview re-serializes generated
+  JSON before conditioning the DiT (raw text kept in previews/step_N.json).
+  LoRA masters are fp32 -> every Qwen/DiT call is under autocast bf16.
+  Tokenizers run in the main thread only (not thread-safe across workers).
+  Resume re-reads adapters at fp32 (the wrapper loads them pre-bf16-cast) and
+  fast-forwards the warmup; Lion momentum restarts at zero.
+- Smoke (b8/GPU, 256px, previews every 3): losses caption ~1.5, diffusion
+  ~0.18-0.20; peak 48-53 GB; ~8-10 s/step warm; previews render (rows:
+  DiT(Qwen(GT JSON)) | DiT(Qwen(generated JSON)) = image->JSON->image | GT);
+  resume from step-6 final loaded 1238/1238 adapter keys, continued at step 7.
+- k2-lion base run STOPPED at step ~34300 (watchdog killed first); newest ckpt
+  full_step_34200 (~100 steps lost, accepted: run considered overbaked).
+- LAUNCHED: tmux k2-e2e-qwen, batch 16/GPU (70-80 GB/GPU), ~13 s/step,
+  run dir runs/k2-e2e-qwen-256, trackio k2-e2e-qwen, save/preview every 250.

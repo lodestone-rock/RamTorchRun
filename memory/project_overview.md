@@ -54,7 +54,22 @@ one chunk per transformer block — and the hardware strategy is a config key
 
 Adding an execution mode means adding a flag, never a second trainer.
 
-## Current state (2026-10-03)
+## Current state (2026-10-06)
+
+- **E2E Qwen3-VL + DiT "pseudo-VAE" LIVE (2026-10-06)**: `krea2/train_e2e_qwen.py`,
+  tmux k2-e2e-qwen, config `krea2/configs/train_e2e_qwen.json`, run dir
+  runs/k2-e2e-qwen-256, trackio k2-e2e-qwen. LoRA (rank 32) on the DiT + Qwen
+  LM + Qwen vision, base `checkpoints/krea2/raw.safetensors`, 256px, DDP via
+  MultiGPUWrapper. Objectives alternate per step: caption (Qwen-VL(image) ->
+  scene_graph JSON, Qwen KIE prompt) / diffusion (DiT on Qwen(JSON text only),
+  grad flows into Qwen). CPU invariants: `krea2/tools/check_e2e_qwen.py`.
+- **k2-lion base run STOPPED (2026-10-06)** at step ~34300 to free the GPUs;
+  newest ckpt runs/k2-lion/1024-resume-25600-v3/ckpts/full_step_34200.
+  User considers the lineage overbaked (to be whitened / delta-reduced toward
+  an earlier checkpoint). The watchdog was killed with it; resume, if ever,
+  through restart_oom.sh.
+
+## Previous state (2026-10-03)
 
 - **Tag-embedding channel experiments CONCLUDED (2026-10-03)**: every encoder
   variant (table, bit-codes, trainable codes, sinks+transformer, fresh
@@ -65,7 +80,7 @@ Adding an execution mode means adding a flag, never a second trainer.
   ckpt: runs/k2-tags-tfm-256/ckpts/tagslora_step_8000_ckpt.safetensors.
   Code parked for traceability/reuse: tag_code.py, tag_embed.py, tag_tfm.py,
   lora_targets include filter, LR dial in train_tags_ddp.py, check_tag_tfm.
-- **k2-lion base training LIVE**: tmux k2-lion-v3, pipeline parallel
+- **k2-lion base training** (stopped 2026-10-06, see above): tmux k2-lion-v3, pipeline parallel
   (chunks [7,7,7,9]), resumed from runs/k2-lion/1024-resume-25600-v3/ckpts/
   full_step_30000.safetensors (initial_global_step 30001), full-epoch data
   plan (data_epoch 0, offset 3799, anchor 26201, plan ~20k steps), lr 5e-6,

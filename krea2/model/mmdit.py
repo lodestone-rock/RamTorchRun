@@ -56,11 +56,15 @@ def ropeapply(xq: Tensor, xk: Tensor, freqs: Tensor) -> tuple[Tensor, Tensor]:
 #   torch.backends.cuda.enable_cudnn_sdp(True)            # math as fallback
 #   torch.backends.cuda.enable_math_sdp(True)             # (VAE head_dim 512)
 _sdpa_ctx_enabled = True
+_sdpa_backend = SDPBackend.CUDNN_ATTENTION
 
 
-def set_sdpa_ctx(enabled: bool):
-    global _sdpa_ctx_enabled
+def set_sdpa_ctx(enabled: bool, backend: SDPBackend = SDPBackend.CUDNN_ATTENTION):
+    """torch.compile ignores the global enable_*_sdp flags (it traced flash
+    with flash disabled); a context inside the traced call is honored."""
+    global _sdpa_ctx_enabled, _sdpa_backend
     _sdpa_ctx_enabled = enabled
+    _sdpa_backend = backend
 
 
 def attention(
@@ -72,7 +76,7 @@ def attention(
     gqa: bool = False,
 ) -> Tensor:
     if _sdpa_ctx_enabled:
-        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+        with sdpa_kernel(_sdpa_backend):
             x = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=mask, scale=scale, enable_gqa=gqa
             )
@@ -546,7 +550,10 @@ class SingleStreamDiT(nn.Module):
         tag tokens are inserted into the sequence between the text prefix and
         the image tokens; with "kv" they are stripped back out and injected as
         keys/values only in every block (never in the residual stream).
+        mask=None means every token is valid: no 256-padding and unmasked
+        attention, which is exact and lets SDPA take its fastest kernel.
         """
+        unmasked = mask is None
         img = self.first(img)
         per_token_t = t.dim() == 2
         if per_token_t:
@@ -559,7 +566,7 @@ class SingleStreamDiT(nn.Module):
         )  # [B, 1, D]
         tvec = None if per_token_t else self.tproj(t_emb)  # [B, 1, 6D]
 
-        txtmask = _mask(mask[:, : context.shape[1]])
+        txtmask = None if unmasked else _mask(mask[:, : context.shape[1]])
 
         context = self.txtfusion(context, mask=txtmask)
         context = self.txtmlp(context)
@@ -573,6 +580,8 @@ class SingleStreamDiT(nn.Module):
         kv_extra: Tensor | None = None   # kv-mode tag embeddings (never in the stream)
         tag_pos = tag_rows = None
         if tag_ids is not None and tagembed is not None:
+            if unmasked:
+                raise ValueError("tag tokens need an explicit mask")
             tagtok = tagembed(tag_ids, tag_mask)
             if tag_mode == "kv":
                 # KV-only injection ("pseudo cross-attention"): the tag encoder's
@@ -602,7 +611,7 @@ class SingleStreamDiT(nn.Module):
 
         # Pad combined sequence to a multiple of 256 to stabilize compiled kernel shapes.
         fulllen = combined.shape[1]
-        _padlen = (-fulllen) % 256
+        _padlen = 0 if unmasked else (-fulllen) % 256
         if _padlen > 0:
             combined = F.pad(combined, (0, 0, 0, _padlen))
             mask = F.pad(mask, (0, _padlen), value=False)
@@ -626,6 +635,8 @@ class SingleStreamDiT(nn.Module):
 
         local_attention = getattr(self, "local_attention", None)
         if local_attention is not None:
+            if unmasked:
+                raise ValueError("local_attention needs an explicit mask")
             if kv_extra is not None:
                 raise NotImplementedError(
                     "local_attention is incompatible with tag_mode='kv'"
@@ -641,7 +652,7 @@ class SingleStreamDiT(nn.Module):
             mask = mask.unsqueeze(1).unsqueeze(3) * kv_rows.unsqueeze(1).unsqueeze(2)
             freqs = self.posemb(torch.cat((pos, tag_pos), dim=1))
         else:
-            mask = _mask(mask)
+            mask = None if unmasked else _mask(mask)
 
             freqs = self.posemb(pos)
 

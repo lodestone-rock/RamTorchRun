@@ -102,6 +102,72 @@ def transformer_blocks(chunks: Sequence[nn.Module], target: str) -> list[tuple[s
     return selected
 
 
+def _sm120_inductor_options(**extra) -> dict:
+    # Torch 2.10's mixed-order RMSNorm backward fusion explicitly forces
+    # persistent kernels, BYPASSING persistent_reductions=False. At text
+    # width 2560 it needs 180312 bytes of shared memory on sm120 (101376
+    # available). Disable that fusion too; retain compiled tiled reductions
+    # and native RMSNorm math rather than falling back to eager execution.
+    return {"triton.persistent_reductions": False,
+            "triton.mix_order_reduction": False, **extra}
+
+
+_PLAIN_MODES = {
+    "default": {"triton.cudagraphs": False},
+    "max-autotune-no-cudagraphs": {"triton.cudagraphs": False, "max_autotune": True},
+    "reduce-overhead": {"triton.cudagraphs": True},
+    "max-autotune": {"triton.cudagraphs": True, "max_autotune": True},
+}
+
+
+def compile_plain_dit_blocks(dit: nn.Module, options: Mapping | bool) -> tuple[str, ...]:
+    """Compile a monolithic DiT's transformer blocks for single-threaded use.
+
+    For the plain (no Pipeline) one-GPU engine. ``options`` is true or
+    ``{"mode": "default" | "max-autotune-no-cudagraphs" | "reduce-overhead" |
+    "max-autotune", "dynamic": null | bool, "fullgraph": bool,
+    "scope": "blocks" | "model"}``. "reduce-overhead" and "max-autotune"
+    record Inductor CUDA graphs per concrete shape; the caller must call
+    ``torch.compiler.cudagraph_mark_step_begin()`` before every step.
+    """
+    raw = {} if options is True else dict(options)
+    unknown = raw.keys() - {"mode", "dynamic", "fullgraph", "scope"}
+    if unknown:
+        raise ValueError(f"unknown compile options: {sorted(unknown)}")
+    mode = raw.get("mode", "default")
+    if mode not in _PLAIN_MODES:
+        raise ValueError(f"compile.mode must be one of {sorted(_PLAIN_MODES)}")
+    scope = raw.get("scope", "blocks")
+    if scope not in ("blocks", "model"):
+        raise ValueError("compile.scope must be 'blocks' or 'model'")
+    kwargs = dict(backend="inductor", dynamic=raw.get("dynamic"),
+                  fullgraph=bool(raw.get("fullgraph", False)),
+                  options=_sm120_inductor_options(**_PLAIN_MODES[mode]))
+    if scope == "model":
+        # One graph for the whole forward (and one for backward): per-call
+        # host overhead is paid twice per step instead of per block.
+        if hasattr(dit, "_krea_compile_options"):
+            raise ValueError("model already compiled")
+        dit.forward = torch.compile(dit.forward, **kwargs)
+        dit._krea_compile_options = dict(raw, mode=mode)
+        print(f"  Compile dit (plain): whole model, mode={mode} "
+              f"dynamic={kwargs['dynamic']} fullgraph={kwargs['fullgraph']}; lazy.")
+        return ("<model>",)
+    selected = [(f"txtfusion.layerwise_blocks.{i}", b)
+                for i, b in enumerate(dit.txtfusion.layerwise_blocks)]
+    selected += [(f"txtfusion.refiner_blocks.{i}", b)
+                 for i, b in enumerate(dit.txtfusion.refiner_blocks)]
+    selected += [(f"blocks.{i}", b) for i, b in enumerate(dit.blocks)]
+    for name, block in selected:
+        if hasattr(block, "_krea_compile_options"):
+            raise ValueError(f"block already compiled: {name}")
+        block.forward = torch.compile(block.forward, **kwargs)
+        block._krea_compile_options = dict(raw, mode=mode)
+    print(f"  Compile dit (plain): {len(selected)} transformer blocks, mode={mode} "
+          f"dynamic={kwargs['dynamic']} fullgraph={kwargs['fullgraph']}; lazy.")
+    return tuple(name for name, _ in selected)
+
+
 def _thread_safe_compiled_forward(forward, kwargs):
     # FX make_fx temporarily patches Module.__call__/__getattr__ and a process-
     # global tracing flag. Dynamo's own lock is acquired AFTER checking that
@@ -151,14 +217,7 @@ def compile_transformer_blocks(
         # torch.compile rejects specifying mode AND options. Default mode is
         # implicit when supplying options; pin cudagraphs off even if a process
         # has changed the global Inductor default elsewhere.
-        # Torch 2.10's mixed-order RMSNorm backward fusion explicitly forces
-        # persistent kernels, BYPASSING persistent_reductions=False. At text
-        # width 2560 it needs 180312 bytes of shared memory on sm120 (101376
-        # available). Disable that fusion too; retain compiled tiled reductions
-        # and native RMSNorm math rather than falling back to eager execution.
-        kwargs["options"] = {"triton.cudagraphs": False,
-                             "triton.persistent_reductions": False,
-                             "triton.mix_order_reduction": False}
+        kwargs["options"] = _sm120_inductor_options(**{"triton.cudagraphs": False})
     else:
         kwargs["mode"] = options["mode"]
     for _, block in selected:

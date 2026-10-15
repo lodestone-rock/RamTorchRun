@@ -158,6 +158,21 @@ def drop_grad_accumulators(pipe):
             st.grad_acc = {}
 
 
+def drop_frozen_params(pipe):
+    """Keep only ``requires_grad`` parameters on RESIDENT stages.
+
+    `Stage` differentiates w.r.t. ``list(module.parameters())``, so a stage
+    holding any frozen parameter (adapter-only training) fails in
+    ``autograd.grad`` with "One of the differentiated Tensors does not require
+    grad". Pruning also frees those parameters' accumulators.
+    """
+    for st in pipe.stages:
+        if isinstance(st, OffloadStage):
+            raise ValueError("drop_frozen_params supports resident stages only")
+        st.params = [p for p in st.params if p.requires_grad]
+        st.grad_acc = {p: acc for p, acc in st.grad_acc.items() if p.requires_grad}
+
+
 class no_grad_accumulators:
     """Context manager that stops `Stage.__init__` allocating accumulators.
 

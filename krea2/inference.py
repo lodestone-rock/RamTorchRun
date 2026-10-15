@@ -81,6 +81,7 @@ from safetensors.torch import load_file
 
 from krea2.model.autoencoder import QwenAutoencoder
 from krea2.model.configs import ENCODER_CONFIGS, MMDIT_CONFIGS
+from krea2.model.convrot import is_quantized_checkpoint, swap_quantized_linears
 from krea2.model.encoder import Qwen3VLConditioner
 from krea2.model.lora import LoRALinear, inject_lora
 from krea2.model.mmdit import SingleStreamDiT
@@ -138,18 +139,44 @@ class TagPrompt:
         self.matcher = TagMatcher(self.vocab)
         self.explicit = args.tags or ""
         self.auto = not args.no_auto_tags
+        self.concept_parser = getattr(args, "parse_concept_markers", False)
         print(f"[infer] Tag conditioning: {len(self.vocab):,} tags from "
               f"{self.vocab_path} (auto-extract={'on' if self.auto else 'off'}"
-              + (f", explicit={self.explicit!r}" if self.explicit else "") + ")")
+              + (f", explicit={self.explicit!r}" if self.explicit else "")
+              + (", concept-markers=on" if self.concept_parser else "")
+              + ")")
 
     def encode(self, prompts: list[str]):
-        """-> (tag_ids [B, T], tag_mask [B, T]) or (None, None)."""
+        """-> (tag_ids [B, T], tag_mask [B, T]) or (None, None).
+
+        With ``--parse-concept-markers``, ``<concept:NAME>`` markers are first
+        stripped from every prompt (the text encoder must never see them) and
+        each recognized NAME contributes its vocab id as the FIRST tag —
+        priority over auto-extracted tags so truncation can never drop the
+        concept token the prompt explicitly asked for.
+        """
         if not self.enabled:
             return None, None
+        clean = list(prompts)
+        if self.concept_parser:
+            from krea2.model.concept_marker import parse_concept_markers
+            clean, marker_names = [], []
+            for p in prompts:
+                text, names, _unknown = parse_concept_markers(p)
+                clean.append(text)
+                marker_names.append(names)
         ids = torch.zeros(len(prompts), self.max_tags, dtype=torch.long)
         mask = torch.zeros(len(prompts), self.max_tags, dtype=torch.bool)
-        for i, p in enumerate(prompts):
+        for i, p in enumerate(clean):
             hits = []
+            if self.concept_parser:
+                for name in marker_names[i]:
+                    tid = self.vocab.ids.get(name)
+                    if tid is not None and tid not in hits:
+                        hits.append(tid)
+                    elif tid is None:
+                        print(f"[infer] [warn] <concept:{name}> not in vocab "
+                              f"{self.vocab_path}; ignoring.")
             if self.explicit:
                 hits += self.matcher.match(self.explicit, free_text=False)
             if self.auto:
@@ -356,8 +383,21 @@ def sample_pipeline(
     tag_ids=None,
     tag_mask=None,
     trace: "TraceCapture | None" = None,
+    streaming: bool = False,
 ):
-    """Pipeline-parallel mirror of krea2.model.sampling.sample (same seeds -> same noise)."""
+    """Pipeline-parallel mirror of krea2.model.sampling.sample (same seeds -> same noise).
+
+    ``streaming=True`` runs the denoising loop through RamTorch's
+    ``Pipeline.infer_loop``: stage workers stay resident across timesteps and
+    round t+1 flows in behind round t's tail, instead of one full drain/refill
+    barrier per Euler step (two with CFG). Requires per-microbatch-independent
+    updates — true here, because each microbatch carries its own
+    ``[uncond_i, cond_i]`` CFG pair (text lengths are equalized by zero-padding
+    the shorter caption block, which is masked inert). Outputs match the
+    barriered path up to kernel-level numerics from the padded batch shape.
+    Under ``trace``, the whole loop lands in one span (per-step spans and the
+    early-stop-on-capture behavior are streaming-incompatible).
+    """
     from PIL import Image
     from einops import rearrange
 
@@ -402,28 +442,142 @@ def sample_pipeline(
 
     head_chunk.set_seq(txt.shape[1], x.shape[1], taglen=taglen)
 
-    img = x
-    for i, (tcurr, tprev) in enumerate(zip(ts[:-1], ts[1:])):
-        with (trace.iteration(i) if trace else nullcontext()):
-            t = torch.full((n,), tcurr, dtype=img.dtype, device=img.device)
-            cond_in = (img, txt, t, pos, mask)
-            if taglen:
-                cond_in += (tag_ids, tag_mask)
-            with (trace.span("cond") if trace else nullcontext()):
-                cond = dit_pipe.infer(cond_in, n_microbatches=n).to(device)
+    if streaming:
+        if cfg:
+            L = max(txt.shape[1], untxt.shape[1])
+        else:
+            L = txt.shape[1]
+            txt_s = txt
+        # The joint text+image sequence grows by the padded text tokens. To
+        # keep numerics identical to the barriered path, real text/img rows
+        # keep their original values byte-for-byte (in particular the image
+        # rope positions — re-deriving pos at L shifts them and changes
+        # outputs materially); padded rows are masked off, so their values
+        # are inert.
+        def _pad_text_block(tokens, block_mask, pos_table, length):
+            have = tokens.shape[1]
+            if have == length:
+                return tokens, block_mask, pos_table
+            pad = length - have
+            tokens = torch.cat(
+                [tokens, torch.zeros(n, pad, *tokens.shape[2:], device=tokens.device, dtype=tokens.dtype)],
+                dim=1,
+            )
+            block_mask = torch.cat(
+                [block_mask[:, :have],
+                 torch.zeros(n, pad, dtype=block_mask.dtype, device=block_mask.device),
+                 block_mask[:, have:]],
+                dim=1,
+            )
+            pos_table = torch.cat(
+                [pos_table[:, :have],
+                 pos_table[:, have - 1:have].expand(n, pad, *pos_table.shape[2:]),
+                 pos_table[:, have:]],
+                dim=1,
+            )
+            return tokens, block_mask, pos_table
+
+        if cfg:
+            txt_s, txtmask_s, pos = _pad_text_block(txt, txtmask, pos, L)
+            untxt_s, untxtmask_s, unpos = _pad_text_block(untxt, untxtmask, unpos, L)
+            # joint masks = padded text block + unchanged image block
+            mask = torch.cat([txtmask_s, mask[:, txt.shape[1]:]], dim=1)
+            unmask = torch.cat([untxtmask_s, unmask[:, untxt.shape[1]:]], dim=1)
+        head_chunk.set_seq(L, x.shape[1], taglen=taglen)
+
+        def _bundle(i, img_i, t_val):
+            # CFG layout: row 0 = uncond, row 1 = cond (update_fn relies on it).
             if cfg:
-                uncond_in = (img, untxt, t, unpos, unmask)
+                parts = (
+                    torch.cat([img_i, img_i], dim=0),
+                    torch.cat([untxt_s[i:i + 1], txt_s[i:i + 1]], dim=0),
+                    torch.full((2,), t_val, dtype=img_i.dtype, device=img_i.device),
+                    torch.cat([unpos[i:i + 1], pos[i:i + 1]], dim=0),
+                    torch.cat([unmask[i:i + 1], mask[i:i + 1]], dim=0),
+                )
                 if taglen:
-                    uncond_in += (tag_ids, untag_mask)
-                with (trace.span("uncond") if trace else nullcontext()):
-                    uncond = dit_pipe.infer(uncond_in, n_microbatches=n).to(device)
-                v = cond + guidance * (cond - uncond)
+                    parts += (
+                        tag_ids[i:i + 1].repeat(2, 1),
+                        torch.cat([untag_mask[i:i + 1], tag_mask[i:i + 1]], dim=0),
+                    )
+                return parts
+            parts = (img_i, txt_s[i:i + 1],
+                     torch.full((1,), t_val, dtype=img_i.dtype, device=img_i.device),
+                     pos[i:i + 1], mask[i:i + 1])
+            if taglen:
+                parts += (tag_ids[i:i + 1], tag_mask[i:i + 1])
+            return parts
+
+        img_state = [x[i:i + 1].contiguous() for i in range(n)]
+        _dbg = os.environ.get("CHECK_DEBUG")
+        _dbg_log = []
+
+        def _update_fn(out_mb, mb_index, step_index):
+            if _dbg:
+                out_mb = out_mb.to(device, non_blocking=False)
+                _dbg_log.append((int(step_index), int(mb_index),
+                                 out_mb[1:2].float().clone(), out_mb[0:1].float().clone()))
+            tcurr, tprev = ts[step_index], ts[step_index + 1]
+            img_cur = img_state[mb_index]
+            # Streamed outputs arrive on the last stage's device — move them
+            # to the driver device where the scheduler state lives.
+            if cfg:
+                uncond_i, cond_i = out_mb[0:1], out_mb[1:2]
+                v = cond_i + guidance * (cond_i - uncond_i)
             else:
-                v = cond
-            img = img + (tprev - tcurr) * v.to(img.dtype)
-        if trace and trace.done:
-            print("[profile] capture window closed — stopping early.")
-            return []
+                v = out_mb
+            v = v.to(device=img_cur.device, dtype=img_cur.dtype)
+            img_next = (img_cur + (tprev - tcurr) * v).contiguous()
+            img_state[mb_index] = img_next
+            return _bundle(mb_index, img_next, float(tprev))
+
+        nested = tuple(_bundle(i, img_state[i], float(ts[0])) for i in range(n))
+        if _dbg:
+            torch.save(nested[0], f"/tmp/opencode/dbg_stream_in0_{guidance}.pt")
+        # infer_loop(steps=N) runs N model rounds but integrates only N-1 of
+        # them (update_fn fires for rounds 0..N-2); Euler needs one update per
+        # ts pair, so pass len(ts) — the extra final round's output is unused.
+        with (trace.span("denoise_stream") if trace else nullcontext()):
+            dit_pipe.infer_loop(nested, steps=len(ts),
+                                update_fn=_update_fn, n_microbatches=n)
+        if _dbg:
+            torch.save(_dbg_log, f"/tmp/opencode/dbg_stream_{guidance}.pt")
+            _dbg_log = []
+        # Euler state after the last update — infer_loop's return is the final
+        # round's raw model output, which the Euler loop never integrates.
+        img = torch.cat(img_state, dim=0)
+    else:
+        img = x
+        for i, (tcurr, tprev) in enumerate(zip(ts[:-1], ts[1:])):
+            with (trace.iteration(i) if trace else nullcontext()):
+                t = torch.full((n,), tcurr, dtype=img.dtype, device=img.device)
+                cond_in = (img, txt, t, pos, mask)
+                if taglen:
+                    cond_in += (tag_ids, tag_mask)
+                with (trace.span("cond") if trace else nullcontext()):
+                    cond = dit_pipe.infer(cond_in, n_microbatches=n).to(device)
+                if os.environ.get("CHECK_DEBUG"):
+                    os.makedirs("/tmp/opencode", exist_ok=True)
+                    if i == 0:
+                        torch.save(cond_in, f"/tmp/opencode/dbg_barrier_condin_{guidance}.pt")
+                    torch.save(cond.float().cpu(), f"/tmp/opencode/dbg_barrier_cond_{i}.pt")
+                if cfg:
+                    uncond_in = (img, untxt, t, unpos, unmask)
+                    if taglen:
+                        uncond_in += (tag_ids, untag_mask)
+                    with (trace.span("uncond") if trace else nullcontext()):
+                        uncond = dit_pipe.infer(uncond_in, n_microbatches=n).to(device)
+                    if os.environ.get("CHECK_DEBUG"):
+                        if i == 0:
+                            torch.save(uncond_in, f"/tmp/opencode/dbg_barrier_uncondin_{guidance}.pt")
+                        torch.save(uncond.float().cpu(), f"/tmp/opencode/dbg_barrier_uncond_{i}.pt")
+                    v = cond + guidance * (cond - uncond)
+                else:
+                    v = cond
+                img = img + (tprev - tcurr) * v.to(img.dtype)
+            if trace and trace.done:
+                print("[profile] capture window closed — stopping early.")
+                return []
 
     latent = rearrange(
         img,
@@ -605,6 +759,9 @@ def main() -> int:
                     help="Sampling steps (default: config preview_steps, fallback 28).")
     ap.add_argument("--guidance", type=float, default=None,
                     help="CFG scale (default: config preview_cfg_scale, fallback 4.5).")
+    ap.add_argument("--streaming", action="store_true",
+                    help="pipeline inference: overlap denoising steps via "
+                         "Pipeline.infer_loop (no drain/refill per step)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--batch-size", type=int, default=4,
                     help="Prompts per sampling batch (default 4). Lower if OOM.")
@@ -619,6 +776,9 @@ def main() -> int:
                          "also injected, so tag-style prompts work unchanged.")
     ap.add_argument("--tag-vocab", default=None,
                     help="Override the config's tag_embed.vocab_path.")
+    ap.add_argument("--parse-concept-markers", action="store_true",
+                    help="Strip <concept:NAME> markers from prompts and inject "
+                         "NAME's embedding as a DiT token (concept-LoRA runs).")
     ap.add_argument("--lora-checkpoint", default=None,
                     help="Override config lora_checkpoint (handy for A/B without editing JSON).")
     ap.add_argument("--lora-rank", type=int, default=None,
@@ -823,6 +983,18 @@ def main() -> int:
                     MMDIT_CONFIGS[dit_cfg_name].heads, args.local_full_heads)
         except (OSError, ValueError) as exc:
             ap.error(str(exc))
+    quantized = bool(mmdit_ckpt) and is_quantized_checkpoint(mmdit_ckpt)
+    if quantized:
+        if args.pipeline or args.offload:
+            ap.error("a ConvRot W8A8 checkpoint runs single-GPU only (~13.5 GB int8 DiT); "
+                     "drop --pipeline/--offload")
+        if args.sparse_checkpoint:
+            ap.error("--sparse-checkpoint needs the bf16 base; merge it before quantizing")
+        if not args.no_lora:
+            if args.lora_checkpoint or cfg.get("lora_checkpoint"):
+                ap.error("LoRA on a W8A8 base is unsupported: merge the LoRA, then quantize "
+                         "(or pass --no-lora)")
+            args.no_lora = True
     manifest_seeds = any(m is not None and "seed" in m for m in prompt_meta)
     if manifest_seeds and args.batch_size != 1:
         ap.error("Manifest seeds currently require --batch-size 1 to preserve per-image RNG")
@@ -884,7 +1056,13 @@ def main() -> int:
               file=sys.stderr)
         return 1
     print(f"[infer]   loading base weights: {mmdit_ckpt}")
-    if args.offload:
+    if quantized:
+        with safe_open(mmdit_ckpt, framework="pt", device="cpu") as f:
+            n_q = swap_quantized_linears(dit, f.keys())
+        print(f"[infer]   ConvRot W8A8 checkpoint: {n_q} int8 linear(s) "
+              f"(online rotation + per-token int8 GEMM)")
+        dit.load_state_dict(load_file(mmdit_ckpt), strict=True, assign=True)
+    elif args.offload:
         # Per-tensor load with immediate bf16 cast: a 51 GB fp32 checkpoint
         # only ever costs ~26 GB of host RAM (matters with several shard
         # processes loading concurrently).
@@ -1033,10 +1211,11 @@ def main() -> int:
     bs = max(1, args.batch_size)
 
     trace = None
+    streaming_profile = bool(args.profile) and args.pipeline and args.streaming
     if args.profile:
         if not (args.pipeline or args.offload):
             ap.error("--profile requires --offload or --pipeline")
-        if steps < args.profile_warmup + args.profile_steps:
+        if not streaming_profile and steps < args.profile_warmup + args.profile_steps:
             ap.error(f"--steps {steps} is too few for --profile-warmup "
                      f"{args.profile_warmup} + --profile-steps {args.profile_steps}")
         if args.pipeline:
@@ -1045,8 +1224,10 @@ def main() -> int:
             engines = [offload_model] if args.offload else []
         trace = TraceCapture(
             args.profile,
-            warmup=args.profile_warmup,
-            active=args.profile_steps,
+            # Streaming: the window is the WHOLE loop (persistent workers span
+            # rounds), so one iteration context with warmup=0/active=1.
+            warmup=0 if streaming_profile else args.profile_warmup,
+            active=1 if streaming_profile else args.profile_steps,
             offload_models=engines,
             devices=(pipe_devices if args.pipeline else [device]),
         )
@@ -1078,13 +1259,15 @@ def main() -> int:
         # vae_decode / preview) makes the decode path dtype-consistent.
         with torch.autocast(device.type, dtype):
             if args.pipeline:
-                images = sample_pipeline(
-                    dit_pipe, head_chunk, enc_pipe, tokenizer, ae, patch,
-                    chunk,
-                    negative_prompts=[args.negative_prompt] * len(chunk),
-                    trace=trace,
-                    **common,
-                )
+                with (trace.iteration(0) if (streaming_profile and trace is not None) else nullcontext()):
+                    images = sample_pipeline(
+                        dit_pipe, head_chunk, enc_pipe, tokenizer, ae, patch,
+                        chunk,
+                        negative_prompts=[args.negative_prompt] * len(chunk),
+                        trace=None if streaming_profile else trace,
+                        streaming=args.streaming,
+                        **common,
+                    )
             elif args.offload:
                 images = sample_offload(
                     offload_model, head_chunk, ae, patch,

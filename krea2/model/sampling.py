@@ -134,6 +134,8 @@ def sample(
     taglen = 0
     untag_mask = None
     if tag_ids is not None:
+        tag_ids = tag_ids.to(device)
+        tag_mask = tag_mask.to(device)
         taglen = tag_ids.shape[1]
         untag_mask = torch.zeros_like(tag_mask)   # negative drops tags too
 

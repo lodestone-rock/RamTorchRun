@@ -30,7 +30,8 @@ def helpers(decode):
     module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[
         ast.alias(name="annotations")], level=0), *nodes], type_ignores=[])
     env = dict(torch=torch, rearrange=rearrange, prepare=prepare,
-               k2_timesteps=timesteps, vae_decode=decode)
+               k2_timesteps=timesteps, vae_decode=decode,
+               inference_no_grad=lambda pipe: __import__('contextlib').nullcontext())
     exec(compile(ast.fix_missing_locations(module), "krea2/train.py", "exec"), env)
     return env
 

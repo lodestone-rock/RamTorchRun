@@ -42,7 +42,7 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint as _ckpt
+from krea2.checkpointing import checkpoint_block
 
 from .mmdit import SingleStreamDiT, _mask, temb
 
@@ -130,9 +130,7 @@ class DiTBlockChunk(nn.Module):
         freqs = freqs.detach()
         for blk in self.blocks:
             if torch.is_grad_enabled() and self.grad_ckpt:
-                combined = _ckpt.checkpoint(
-                    blk, combined, tvec, freqs, attn_mask, use_reentrant=False
-                )
+                combined = checkpoint_block(blk, combined, tvec, freqs, attn_mask)
             else:
                 combined = blk(combined, tvec, freqs, attn_mask)
         # tvec/t_emb pass through unchanged — the identity keeps their gradient

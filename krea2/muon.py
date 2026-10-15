@@ -41,8 +41,9 @@ def validate_muon_config(cfg: dict) -> dict | None:
     options, or None for the unchanged AdamW paths. No CUDA calls or tensors.
     """
     impl = cfg.get("optimizer", "adamw")
-    if impl not in ("adamw", "offload-adamw", "muon", "lion"):
-        raise ValueError(f"optimizer must be 'adamw', 'offload-adamw', 'muon' or 'lion', got {impl!r}")
+    if impl not in ("adamw", "offload-adamw", "muon", "lion", "lion8", "lion8paged", "sgd"):
+        raise ValueError(f"optimizer must be 'adamw', 'offload-adamw', 'muon', 'lion', "
+                         f"'lion8', 'lion8paged' or 'sgd', got {impl!r}")
     if impl != "muon":
         if "muon" in cfg:
             raise ValueError("the muon config block requires optimizer='muon'")

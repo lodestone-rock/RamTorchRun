@@ -290,6 +290,100 @@ class BankAdamW:
                 st["exp_avg_sq"].index_copy_(0, idx, v.to(self.state_dtype))
 
 
+class BankLion(BankAdamW):
+    """Lion restricted to a bank's active slot rows; same slot bookkeeping as BankAdamW.
+
+    Update (Chen et al. 2023, same as `krea2/lion.py`): decoupled decay, then
+    ``w -= lr * sign(b1*m + (1-b1)*g)``, then ``m = b2*m + (1-b2)*g``. One
+    momentum buffer, no bias correction; per-slot warmup still applies. Every
+    coordinate moves by exactly lr per step, so lr is NOT interchangeable with
+    an AdamW lr.
+    """
+
+    def __init__(self, params, n_slots: int, *, lr: float = 1e-5,
+                 betas: tuple[float, float] = (0.9, 0.99), weight_decay: float = 0.0,
+                 warmup: int = 0, warmup_start_factor: float = 1e-5,
+                 state_dtype: torch.dtype = torch.float32,
+                 state_device: str | torch.device | None = None):
+        super().__init__(params, n_slots, lr=lr, betas=betas, weight_decay=weight_decay,
+                         warmup=warmup, warmup_start_factor=warmup_start_factor,
+                         state_dtype=state_dtype, state_device=state_device)
+        for st in self.state.values():
+            del st["exp_avg_sq"]
+
+    def state_bytes(self) -> int:
+        return sum(st["exp_avg"].numel() * st["exp_avg"].element_size()
+                   for st in self.state.values())
+
+    @torch.no_grad()
+    def step(self, active_slots=None):
+        active = (
+            tuple(range(self.n_slots))
+            if active_slots is None
+            else tuple(int(s) for s in active_slots)
+        )
+        if len(set(active)) != len(active):
+            raise ValueError(f"duplicate slot ids in {active}")
+        for s in active:
+            if not 0 <= s < self.n_slots:
+                raise ValueError(f"slot {s} out of range (n_slots={self.n_slots})")
+            self.slot_steps[s] += 1
+
+        self._coef_cache.clear()
+        b1, b2 = self.betas
+
+        for p in self.params:
+            if p.grad is None:
+                continue
+            st = self.state[p]
+            idx = self._index(active, p.device)
+            lr, _, _ = self._coefs(active, p.device)
+            lr_v = lr.view((-1,) + (1,) * (p.dim() - 1))
+
+            if idx is None:
+                g = p.grad.float()
+                w = p.data.float()
+            else:
+                g = p.grad.index_select(0, idx).float()
+                w = p.data.index_select(0, idx).float()
+
+            host_idx = self._index(active, torch.device("cpu")) if self.offloaded else None
+            if self.offloaded:
+                m_host, _ = self._staging(p, len(active))
+                if host_idx is None:
+                    m_host.copy_(st["exp_avg"])
+                else:
+                    torch.index_select(st["exp_avg"], 0, host_idx, out=m_host)
+                m = m_host.to(p.device, non_blocking=True).float()
+            elif idx is None:
+                m = st["exp_avg"].float()
+            else:
+                m = st["exp_avg"].index_select(0, idx).float()
+
+            if self.weight_decay:
+                w.mul_(1.0 - lr_v * self.weight_decay)
+            w.sub_((m * b1).add_(g, alpha=1.0 - b1).sign_().mul_(lr_v))
+            m.mul_(b2).add_(g, alpha=1.0 - b2)
+
+            if idx is None:
+                if w is not p.data:
+                    p.data.copy_(w.to(p.dtype))
+            else:
+                p.data.index_copy_(0, idx, w.to(p.dtype))
+
+            if self.offloaded:
+                m_host.copy_(m.to(self.state_dtype))
+                if host_idx is None:
+                    st["exp_avg"].copy_(m_host)
+                else:
+                    st["exp_avg"].index_copy_(0, host_idx, m_host)
+            elif idx is None:
+                if m is not st["exp_avg"]:
+                    st["exp_avg"].copy_(m.to(self.state_dtype))
+            else:
+                st["exp_avg"].index_copy_(0, idx, m.to(self.state_dtype))
+
+
 @torch.no_grad()
 def clip_bank_grads_per_slot(
     params, max_norm: float, active_slots=None, eps: float = 1e-6

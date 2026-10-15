@@ -88,7 +88,7 @@ from krea2.model.chunks import (
     set_dit_grad_ckpt,
 )
 
-from utils.bank_optimizer import BankAdamW, bank_bytes_report, clip_bank_grads_per_slot
+from utils.bank_optimizer import BankAdamW, BankLion, bank_bytes_report, clip_bank_grads_per_slot
 from utils.ramtorch_helpers import (
     allow_tuple_infer,
     drop_grad_accumulators,
@@ -441,6 +441,7 @@ def train(cfg: dict, config_path: str):
         height_column=parquet_cfg.get("height_column", "image_height"),
         loss_weight_column=parquet_cfg.get("loss_weight_column", None),
         image_folder_path=parquet_cfg.get("image_folder_path", ""),
+        s3_image_source=parquet_cfg.get("s3_image_source"),
         base_res=parquet_cfg.get("base_resolution", [512]),
         base_res_weights=parquet_cfg.get("base_resolution_weights", None),
         ratio_cutoff=parquet_cfg.get("ratio_cutoff", 2.0),
@@ -600,9 +601,13 @@ def train(cfg: dict, config_path: str):
         for p in dit.parameters():
             nn.init.normal_(p.data, std=0.02)
 
-    if sparse and cfg.get("sparse_checkpoint"):
+    # Also honoured under peft_method=lora: a fresh bank (B=0) is an exact no-op,
+    # so evaluation can score a sparse delta without the sparse path's dense
+    # full-model gradient accumulators.
+    if cfg.get("sparse_checkpoint"):
+        from krea2.model.sparse_peft import apply_adapter
         dit = dit.to(dtype)
-        sparse_peft.apply_adapter(dit, cfg["sparse_checkpoint"])
+        apply_adapter(dit, cfg["sparse_checkpoint"])
     inject_adapter(
         dit, n_slots=n_slots, rank=lora_rank, alpha=lora_alpha,
         exclude_prefixes=bank_exclude_prefixes,
@@ -712,11 +717,19 @@ def train(cfg: dict, config_path: str):
     tags.build_optimizer(dit, warmup=warmup_steps, own_dense=True)
     optimizer_cls = BankAdamW
     optimizer_args = {}
+    betas = (0.9, 0.95)
+    if cfg.get("optimizer", "adamw") == "lion":
+        if sparse:
+            raise ValueError("optimizer='lion' is implemented for LoRA banks only")
+        optimizer_cls = BankLion
+        betas = tuple(cfg.get("lion", {}).get("betas", (0.9, 0.99)))
+    elif cfg.get("optimizer", "adamw") != "adamw":
+        raise ValueError("mass-LoRA optimizer must be 'adamw' or 'lion'")
     if sparse:
         optimizer_cls = sparse_peft.SparseAdam
         optimizer_args = dict(n_microbatches=n_mb, max_grad_norm=max_grad_norm)
     opt = optimizer_cls(
-        dit if sparse else bank_params, n_slots=n_slots, lr=lr, betas=(0.9, 0.95),
+        dit if sparse else bank_params, n_slots=n_slots, lr=lr, betas=betas,
         weight_decay=weight_decay, warmup=warmup_steps, state_dtype=state_dtype,
         state_device=bank_state_device, **optimizer_args,
     )

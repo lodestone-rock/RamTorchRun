@@ -48,7 +48,8 @@ from krea2.model.lora_bank import (
 from krea2.model.mmdit import SingleMMDiTConfig, SingleStreamDiT, set_sdpa_ctx
 from krea2.model.sampling import prepare
 from krea2.tools.export_lora_bank import slice_slot
-from utils.bank_optimizer import BankAdamW, clip_bank_grads_per_slot
+from krea2.lion import Lion
+from utils.bank_optimizer import BankAdamW, BankLion, clip_bank_grads_per_slot
 from utils.checkpoint import _classify_keys
 
 set_sdpa_ctx(False)  # sdpa_kernel(CUDNN) has no CPU backend
@@ -345,6 +346,31 @@ def main():
           all(host_opt.state[p]["exp_avg"].device.type == "cpu"
               for p in host_params),
           f"offloaded={host_opt.offloaded}")
+
+    print("\n-- BankLion --")
+    torch.manual_seed(7)
+    lp = [nn.Parameter(torch.randn(N_SLOTS, 4, 5)), nn.Parameter(torch.randn(N_SLOTS, 6, 4))]
+    hp = [nn.Parameter(p.detach().clone()) for p in lp]
+    lion_rows = [nn.Parameter(p.detach()[list(ACTIVE)].clone()) for p in lp]
+    bank_lion = BankLion(lp, N_SLOTS, lr=1e-2, betas=(0.9, 0.99), weight_decay=0.1)
+    host_lion = BankLion(hp, N_SLOTS, lr=1e-2, betas=(0.9, 0.99), weight_decay=0.1,
+                         state_device="cpu")
+    ref_lion = Lion(lion_rows, lr=1e-2, betas=(0.9, 0.99), weight_decay=0.1)
+    frozen = [p.detach()[[s for s in range(N_SLOTS) if s not in ACTIVE]].clone() for p in lp]
+    for _ in range(5):
+        grads = [torch.randn_like(p) for p in lp]
+        for p, h, r, g in zip(lp, hp, lion_rows, grads):
+            p.grad, h.grad, r.grad = g.clone(), g.clone(), g[list(ACTIVE)].clone()
+        bank_lion.step(ACTIVE)
+        host_lion.step(ACTIVE)
+        ref_lion.step()
+    d = max((p.detach()[list(ACTIVE)] - r.detach()).abs().max().item() for p, r in zip(lp, lion_rows))
+    check("BankLion active rows == krea2.lion.Lion on those rows", d == 0.0, f"d={d:.3e}")
+    idle = [s for s in range(N_SLOTS) if s not in ACTIVE]
+    check("BankLion leaves inactive slots bit-identical",
+          all(torch.equal(p.detach()[idle], f) for p, f in zip(lp, frozen)))
+    check("BankLion state_device='cpu' is bit-identical",
+          all(torch.equal(p, h) for p, h in zip(lp, hp)))
 
     print("\n-- export round-trip + checkpoint key convention --")
     sd = {k: v.clone() for k, v in bank_state_dict(bank_model).items()}

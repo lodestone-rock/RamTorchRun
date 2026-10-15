@@ -1,5 +1,5 @@
 {
-  "_comment": "Tag-CODE v4: trainable codes + 2-layer bag-of-words transformer + cond-only sink registers. (1) code_embed grows to [vocab+2, 30] \u2014 rows 126/127 of every tag span are SINK registers (sentinel ids vocab/vocab+1, zero-init = hypercube center), reserved by the trainer/sampler, always lit on cond rows, fully masked on uncond rows so v_uncond stays bitwise base. (2) encoder grows 2 pre-norm transformer layers (attn+mlp, NO positional embedding \u2014 bag of words; 48 heads; 4x MLP) with ZERO-INIT out-projections: exact no-ops at init, so the resume from code2's step-20000 tagcode (trained 3000 steps of free codes at lr 1e-4) reproduces its encoder output bit-for-bit and the layers fade in. Tag-pairing ('blue'+'eyes') is what the layers buy. Attenuation full ramp (start_step 0), lr 1e-4, save/preview 500 @ 1 sample/GPU, 16 workers. code_embed rows 0..vocab-1 copied from the 20000 ckpt (shape-mismatch fixup), sink rows fresh. Trackio k2-tags-tc.",
+  "_comment": "Tag-CODE v4: trainable codes + 2-layer bag-of-words transformer + cond-only sink registers. (1) code_embed grows to [vocab+2, 30] \u2014 rows 126/127 of every tag span are SINK registers (sentinel ids vocab/vocab+1, zero-init = hypercube center), reserved by the trainer/sampler, always lit on cond rows, fully masked on uncond rows so v_uncond stays bitwise base. (2) encoder grows 2 pre-norm transformer layers (attn+mlp, NO positional embedding \u2014 bag of words; 48 heads; 4x MLP) with ZERO-INIT out-projections: exact no-ops at init, so the resume from code2's step-20000 tagcode (trained 3000 steps of free codes at lr 1e-4) reproduces its encoder output bit-for-bit and the layers fade in. Tag-pairing ('blue'+'eyes') is what the layers buy. Attenuation full ramp (start_step 0), lr 1e-4, save/preview 500 @ 1 sample/GPU, 16 workers. code_embed rows 0..vocab-1 copied from the 20000 ckpt (shape-mismatch fixup), sink rows fresh. Trackio k2-tags-tc. RESTART-2: 20500 was already toast (0.81 mean over its last 100 pre-ckpt steps) \u2014 reverted to code2's CLEAN 20000, lr 5e-5, offset 20000. RESTART-3: save AND preview every 250 (unstable zone \u2014 minmax by watching previews + loss), lr 5e-5 (the 1e-4 push clobbered the halved value; re-fixed). Resume code2 clean 20000, offset 20000. RESTART-4: lr 5e-5 -> 2.5e-5 (quarter of 1e-4) \u2014 grad norm spikes already visible at 5e-5.",
   "seed": 42,
   "initial_global_step": 0,
   "full_checkpoint": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-lion/1024-resume-25600-v3/ckpts/full_step_30000.safetensors",
@@ -43,7 +43,7 @@
       0.99
     ]
   },
-  "lr": 0.0001,
+  "lr": 2.5e-05,
   "weight_decay": 0.0,
   "warmup": 100,
   "max_grad_norm": 1.0,
@@ -53,8 +53,8 @@
   "mu_sigma": 1.0,
   "minres": 256,
   "maxres": 1280,
-  "eval_interval": 500,
-  "save_every_n_steps": 500,
+  "eval_interval": 250,
+  "save_every_n_steps": 250,
   "save_final": true,
   "preview_steps": 28,
   "max_steps": 0,

@@ -1,5 +1,5 @@
 {
-  "_comment": "Tag-TABLE run: plain embedding table (227,961 x 6144 DIRECT = 1.40B params, zero-init per-channel gate = step-0 exact no-op) injected as per-block keys/values (tag_mode=kv), replacing the bit-code TagCodeEmbedder whose projector collapsed all tags to one vector in every loss-only regime (worklog 2026-10-01). Trainable = table rows + gate; backbone FROZEN bf16 (lora_rank 0). Optimizer: NEW utils/row_lion.py \u2014 row-sparse Lion over table rows (touched rows = nonzero grad; untouched rows skipped ENTIRELY \u2014 dense Lion's sign(momentum) would drift 99.9% of rows every step), per-row warmup 100, fp32 master+momentum on the ZeRO-1 owner GPU; gate rides the wrapper's dense Lion. Sync: wrapper reduce_grads (table grad summed on owner) -> RowLion.step -> optimizer_step (broadcasts bf16 table, ~2.8GB/step). Per-tag grad attenuation KEPT ON (gentle alpha 0.5, clip [0.5,2], warmup 1000 \u2014 the homogenization dynamic applies to a plain table too). lr 2e-5 constant. Mask-out dropout (solo/id-0 fix) carries over. Data/seed/cadence = tc2: v3 5 sources, 256px batch 8/GPU, preview+save every 1000, trackio k2-tags-tc (rows_trained metric added). Preview cadence 500 (was 1000) at 1 sample/GPU = 4 columns per grid (user request: more frequent, cheaper previews); checkpoints stay at 1000.",
+  "_comment": "Tag-TABLE run: plain embedding table (227,961 x 6144 DIRECT = 1.40B params, zero-init per-channel gate = step-0 exact no-op) injected as per-block keys/values (tag_mode=kv), replacing the bit-code TagCodeEmbedder whose projector collapsed all tags to one vector in every loss-only regime (worklog 2026-10-01). Trainable = table rows + gate; backbone FROZEN bf16 (lora_rank 0). Optimizer: NEW utils/row_lion.py \u2014 row-sparse Lion over table rows (touched rows = nonzero grad; untouched rows skipped ENTIRELY \u2014 dense Lion's sign(momentum) would drift 99.9% of rows every step), per-row warmup 100, fp32 master+momentum on the ZeRO-1 owner GPU; gate rides the wrapper's dense Lion. Sync: wrapper reduce_grads (table grad summed on owner) -> RowLion.step -> optimizer_step (broadcasts bf16 table, ~2.8GB/step). Per-tag grad attenuation KEPT ON (gentle alpha 0.5, clip [0.5,2], warmup 1000 \u2014 the homogenization dynamic applies to a plain table too). lr 2e-5 constant. Mask-out dropout (solo/id-0 fix) carries over. Data/seed/cadence = tc2: v3 5 sources, 256px batch 8/GPU, preview+save every 1000, trackio k2-tags-tc (rows_trained metric added). Preview cadence 500 (was 1000) at 1 sample/GPU = 4 columns per grid (user request: more frequent, cheaper previews); checkpoints stay at 1000. RESTART: save 1000->500 (8.4GB ckpts: bf16 table + fp32 RowLion master + row_steps; housekeep prunes to 4 newest), num_workers 8->16 (headroom; gap instrumentation shows the loader is not the constraint \u2014 the ~2s/step delta vs tc2 is RowLion table sync: 2.8GB grad reduce + 2.8GB bf16 broadcast per step over PCIe).",
   "seed": 42,
   "initial_global_step": 0,
   "full_checkpoint": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-lion/1024-resume-25600-v3/ckpts/full_step_30000.safetensors",
@@ -48,7 +48,7 @@
   "minres": 256,
   "maxres": 1280,
   "eval_interval": 500,
-  "save_every_n_steps": 1000,
+  "save_every_n_steps": 500,
   "save_final": true,
   "preview_steps": 28,
   "max_steps": 0,
@@ -116,7 +116,7 @@
     "shuffle_tags": true,
     "tag_drop_percentage": 0.0,
     "offset": 0,
-    "num_workers": 2,
+    "num_workers": 16,
     "prefetch_factor": 2,
     "s3_image_source": {
       "endpoint_url": "http://localhost:9000",

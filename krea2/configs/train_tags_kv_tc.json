@@ -1,0 +1,122 @@
+{
+  "_comment": "Tag-KV run v2: NO LoRA \u2014 frozen backbone (v3 full_step_30000), ONLY the TagCodeEmbedder (76M) trains, LR 2e-5 (1/5th of the collapsed run's 1e-4 \u2014 the 28-block gradient sum plus Lion scale-free sign updates homogenized all tags to one vector by ckpt1000: tag-tag cos 0.487 init -> 1.0000; see worklog 2026-10-01). lora_rank 0 gates inject_lora off in the trainer. Trackio monitoring (HF, local storage): loss + pre-clip grad norms (total / bit_embed / mlp / norm scales) every step, preview grid at eval steps; view with .venv/bin/python -m trackio.show k2-tags-tc. Same data/seed/cadence as the collapsed run (trainer_samples_v3 5 sources, tag_column tags, per-tag 10% dropout, uncond 0.1, 256px batch 8/GPU, preview+save every 1000). RESTART at ckpt 6000: num_workers 2->8 / prefetch 2->8 (loader was the bottleneck: 186/5849 steps stalled >6s every ~25 steps, ~30% wall time; wrapper is clean, executor.map joins per step by design). offset 0->6000 so the plan continues where the stopped run left off (plan is deterministic in seed; worker count does not consume plan RNG \u2014 only per-row tag-shuffle order re-rolls, augmentation noise). RESTART-2 at ckpt 7000: instrumented fb_fn/main-loop phase timings (t_cond/t_vae/t_prep/t_fwd/t_bwd + gap/step_total/trackio) logged to trackio to localize the periodic ~60s GPU-idle stalls (workers idle, loader exonerated, dashboard exonerated, main process spikes to 270% CPU at stall onset).",
+  "seed": 42,
+  "initial_global_step": 0,
+  "full_checkpoint": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-lion/1024-resume-25600-v3/ckpts/full_step_30000.safetensors",
+  "mmdit_config": "large_wide",
+  "encoder_config": "qwen3_vl_4b",
+  "encoder_model_id": "Qwen/Qwen3-VL-4B-Instruct",
+  "ae_model_id": "Qwen/Qwen-Image",
+  "lora_rank": 0,
+  "lora_alpha": 32.0,
+  "lora_exclude_prefixes": [
+    "tagcode"
+  ],
+  "tag_code": {
+    "code_path": "checkpoints/tag_vocab/codes_v2_30b.parquet",
+    "vocab_path": "checkpoints/tag_vocab/tags_v2.parquet",
+    "n_bits": 30,
+    "max_tags": 128,
+    "tag_drop_prob": 0.1
+  },
+  "resolution": 256,
+  "batch_size": 8,
+  "grad_accum": 1,
+  "n_gpus": 4,
+  "optimizer": "lion",
+  "lion": {
+    "betas": [
+      0.9,
+      0.99
+    ]
+  },
+  "lr": 2e-05,
+  "weight_decay": 0.0,
+  "warmup": 100,
+  "max_grad_norm": 1.0,
+  "uncond_ratio": 0.1,
+  "mu_y1": 0.5,
+  "mu_y2": 1.15,
+  "mu_sigma": 1.0,
+  "minres": 256,
+  "maxres": 1280,
+  "eval_interval": 1000,
+  "save_every_n_steps": 1000,
+  "save_final": true,
+  "preview_steps": 28,
+  "max_steps": 0,
+  "ckpt_path": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-tags-kv-tc-256",
+  "preview_path": "/mnt/datapool_u2/lodestone/RamTorchRun/runs/k2-tags-kv-tc-256/previews",
+  "parquet_dataloader": {
+    "parquet_sources": {
+      "danbooru": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=danbooru",
+        "n_samples": null
+      },
+      "deviantart": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=deviantart",
+        "n_samples": null
+      },
+      "e621": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=e621",
+        "n_samples": null
+      },
+      "midjourney": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=midjourney",
+        "n_samples": null
+      },
+      "reddit": {
+        "path": "/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3/source=reddit",
+        "n_samples": null
+      }
+    },
+    "caption_columns": {
+      "tags": {
+        "weight": 1.0,
+        "is_tag_based": true
+      },
+      "midjourney_style_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "brief_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "10_word_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "long_caption": {
+        "weight": 1.0,
+        "is_tag_based": false
+      }
+    },
+    "tag_column": "tags",
+    "filename_column": "file_path",
+    "width_column": "image_width",
+    "height_column": "image_height",
+    "loss_weight_column": null,
+    "image_folder_path": "",
+    "base_resolution": [
+      256
+    ],
+    "base_resolution_weights": [
+      1.0
+    ],
+    "ratio_cutoff": 2.0,
+    "resolution_step": 64,
+    "shuffle_tags": true,
+    "tag_drop_percentage": 0.0,
+    "offset": 7000,
+    "num_workers": 8,
+    "prefetch_factor": 8,
+    "s3_image_source": {
+      "endpoint_url": "http://localhost:9000",
+      "credential_file": "/mnt/datapool_u2/lodestone/RamTorchRun/credential/local-rustfs-readonly.json",
+      "strip_prefix": "/mnt/nas_buckets/"
+    }
+  },
+  "tag_mode": "kv",
+  "trackio_project": "k2-tags-tc"
+}

@@ -97,6 +97,10 @@ krea2/                    # Krea-2 ~12B MMDiT + Qwen-Image VAE + Qwen3-VL encode
   model/                  #   MMDiT, VAE, text encoder, LoRA, sampling
   model/chunks.py         #   flat dicing: build_dit_chunks / build_encoder_chunks
   model/tag_embed.py      #   TagEmbedder: per-tag table -> extra DiT tokens
+  model/convrot.py        #   ConvRot W8A8: regular-Hadamard INT8 linear, ComfyUI
+                          #   int8_tensorwise format (tools/quantize_convrot_w8a8.py
+                          #   writes it, tools/check_convrot.py guards it,
+                          #   tools/compare_convrot_w8a8.py measures it)
   train.py                #   THE trainer: offload / pipeline / pipeline-offload, LoRA or full
   train_tdm.py            #   TDM few-step distillation (role-based LoRA)
   train_mass_lora.py      #   L per-concept LoRAs at once (stacked banks + grouped bmm)
@@ -104,6 +108,9 @@ krea2/                    # Krea-2 ~12B MMDiT + Qwen-Image VAE + Qwen3-VL encode
                           #   alternating caption (image->scene_graph JSON) /
                           #   diffusion (DiT on Qwen(JSON), grad into Qwen) steps;
                           #   model/qwen_e2e.py + tools/check_e2e_qwen.py
+  train_concept_lora.py   #   ONE concept: cached dataset, concept token, Lion
+                          #   + warmup/constant/COOLDOWN. launcher + CPU check
+                          #   in tools/launch_concept_lora.py, model/marker parser
   train_utils.py          #   K2 helpers (VAE encode/decode, timesteps, SDPA pinning)
                           #   + TagTrainer: the whole tag-embedding policy
   inference.py            #   single-GPU / --pipeline / --offload (combinable), --tags
@@ -132,6 +139,11 @@ utils/
   bank_optimizer.py       # SHARED: BankAdamW — AdamW over a LoRA bank's ACTIVE slots only
   row_optimizer.py        # SHARED: RowAdamW — AdamW over an embedding's TOUCHED rows only
   tag_vocab.py            # SHARED: tag normalizer, versioned vocab builder, TagMatcher
+experiments/              # standalone analysis probes (not per-model): merge math
+  merge_core.py           #   extracted from x0-pred/merge_lora_bank.py (port, no import)
+  merge_lora_bank.py      #   the bank-merge CLI, thin over merge_core
+  merge_scaling.py        #   n-sweep: why normmatch survives 500+ pooled LoRAs
+  synthetic_coherence.py  #   controlled validation of the coherence theory
 checkpoints/              # weights (gitignored, see its README)
 memory/                   # agent context files (tracked)
 runs/, profiles/          # training artifacts / profiler traces (gitignored)

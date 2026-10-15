@@ -4067,3 +4067,292 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   full_step_34200 (~100 steps lost, accepted: run considered overbaked).
 - LAUNCHED: tmux k2-e2e-qwen, batch 16/GPU (70-80 GB/GPU), ~13 s/step,
   run dir runs/k2-e2e-qwen-256, trackio k2-e2e-qwen, save/preview every 250.
+
+## 2026-10-07 — ConvRot W8A8 (INT8) quantization of the K2 DiT
+
+- NEW krea2/model/convrot.py: ConvRot (arXiv 2512.03673) group-256 regular
+  Hadamard (H4 kron powers) + per-row INT8 weights / per-token INT8
+  activations, ConvRotLinearW8A8 (online rotate, torch._int_mm, rescale).
+  Storage = stock ComfyUI `int8_tensorwise` (>= 0.27): weight I8, weight_scale
+  F32 [out,1], comfy_quant U8 JSON marker; header _quantization_metadata.
+  Same layout as Clybius/Kroma-Quantizations `kroma-v0.3.1-turbo-opd-W8A8`.
+  Math is a PORT of comfy-kitchen 0.2.37 (not a dependency); verified
+  bit-identical vs its eager int8_linear (max diff 0.0) and _build_hadamard.
+- NEW tools/quantize_convrot_w8a8.py (224 blocks.* linears, MSE-clip scale as
+  Comfy-Org quant_int8_convrot.py; txtfusion + fp32 heads pass through in
+  source dtype), tools/check_convrot.py (CPU invariants + _int_mm parity),
+  tools/compare_convrot_w8a8.py (BF16 vs W8A8 velocity error, same-seed grid,
+  PSNR, s/img, peak VRAM). inference.py auto-detects `.comfy_quant` keys and
+  swaps linears on the meta model; single-GPU only, no LoRA (merge first).
+- Ran on opd_base_candidate: 224 layers, relerr mean 0.894% (max 1.434%,
+  late attn.wo), cos >= 0.99990; 14.14 GB (fp32 tproj/tmlp/txtmlp kept fp32;
+  Clybius downcasts those to F16). GPU 3 (~5 GB peak next to training): 128 s
+  of quant; CPU took ~21 s/layer (80-step clip search) — use a GPU.
+- GOTCHAS: f32 cosine over ~1e8 elements reported cos > 1 — metrics now f64.
+  weight_scale is excluded from `.to(dtype)` via _apply (bf16 scale = ~0.4%
+  per-channel error). CPU forward needs set_sdpa_ctx(False) (cudnn pin).
+- Header vs Clybius file: identical 878 keys, identical 224-layer quant map,
+  identical I8/scale/marker tensors; only diff = 34 passthroughs F32 (ours)
+  vs F16 (theirs).
+- Eval on RunPod L40S (compare_convrot_w8a8.py, 4 prompts, 1024px, 28 steps,
+  CFG 4.5; results in runs/convrot_w8a8_eval/): velocity relerr 0.82% (t=0.1),
+  0.97% (t=0.5), 3.0% (t=0.9), cos >= 0.9993. Same-seed images keep the
+  composition, only fine detail drifts (PSNR 15-20 dB). Peak VRAM 30.6 -> 18.5
+  GB. SLOWER: 61.0 vs 47.8 s/img — the eager rotate + quantize + f32 rescale
+  around torch._int_mm costs more than the int8 GEMM saves; a fused
+  (Triton / torch.compile) quant path is the follow-up if speed matters.
+- RunPod transfer: single-stream ssh ~8 MB/s; 16 parallel dd byte-range
+  streams ~100 MB/s, but sshd drops some concurrent connects — verify per-chunk
+  md5 and re-push (helpers were logs/par_push.sh, logs/par_fix.sh).
+- Local (Blackwell) and pod (L40S) W8A8 outputs are NOT byte-identical
+  (md5 differs) despite identical per-layer error stats: GPU fp32 matmul
+  rounding in the rotation flips a few int8 roundings. Both are valid.
+
+## 2026-10-08 — pixel_dmad_turbo_kroma_v1_update100 is the merged LoRA run
+
+- Downloaded lodestones/rt-sweep-models/pixel_dmad_turbo_kroma_v1_update100
+  -> checkpoints/krea2/sweep/. NEW krea2/tools/delta_spectrum.py (per-linear
+  svdvals of ft - base, cliff location, energy in top-k, TSV + plot).
+- vs opd_base_candidate: ONLY nn.Linear weights changed; every norm scale,
+  qknorm, bias, mod.lin, last.modulation bit-identical (LoRA signature).
+- fp32 linears (no bf16 rounding floor): txtmlp.1/.3, tmlp.2, tproj.1 dW is
+  EXACTLY rank 128 — singular values fall ~2500x at index 128 to the fp32
+  noise floor. => merged rank-128 LoRA trained on opd_base_candidate.
+- bf16 block linears are useless for this: ||dW||/||W|| ~1e-4, i.e. single-ulp
+  flips on 3-10% of elements; rounding noise buries the cliff. Use fp32
+  tensors / frozen-param identity instead. GPU svdvals of all 257 bf16
+  linears took ~20 min — delta_spectrum.py now defaults to the 2 fp32
+  txtmlp linears (+ --limit), ~30 s. Not tmlp/tproj alone: timestep input is
+  near-constant, dW ~rank 1, the biggest drop is at index 1.
+- NEW krea2/tools/extract_lora.py: svd(ft - base) top-r -> Krea/diffusers
+  LoRA (`transformer.<diffusers path>.lora_{A,B}.weight`, fp32, no alpha,
+  key set identical to krea/Krea-2-LoRA-darkbrush; native->diffusers name map
+  in to_krea()). Extracted rank 128 in 74 s on GPU 0 ->
+  checkpoints/krea2/sweep/pixel_dmad_turbo_kroma_v1_update100_lora128.safetensors
+  (1.87 GB, 264 layers). Weight residual: fp32 layers 0.01%, bf16 layers ~77%
+  (bf16 rounding noise of the merge, NOT missed signal). Functional check
+  (CPU fp32, real prompt, 256px, t=0.3/0.7): base+LoRA vs merged update
+  cos 1.0000, norm ratio 0.999, leftover 0.3-0.7% of the update.
+
+## 2026-10-13 — dare_spectrum.py: top-k magnitude control
+
+- New --keep-frac (default 0.10): keep the top-10% |x| entries (no rescale —
+  magnitude selection is energy-aware, the 1/(1-p) trick has no analog)
+  beside Bernoulli keep-10% at the same sparsity. figure_single is now 2x4:
+  kept-set image, radial power (kept set + its error floor), per-band
+  retained-power ratio on a log twinx (don't clip it — it exceeds 1 by 50x),
+  and an RMS-normalized error panel.
+- Measured surprise on both probe images: top-10% magnitudes carry only
+  22-46% of ||x||^2; retained power/band is 0.26-0.62 at LOW bands
+  (composition lives in many small entries, not outliers) and 50-80x at
+  HIGH bands (the kept set is a sparse dot grid = flat spectrum). Top-k
+  fails OPPOSITE to random: it wounds the mergeable low bands while random
+  nukes the high bands and is unbiased low. First draft of the text assumed
+  "top-k keeps every band" — the numbers refuted it; docstring/takeaway now
+  tell the measured story.
+- Top-10% approximation err RMS is 0.70-0.88x signal RMS yet looks fine to
+  the eye — the same large-fan-in averaging argument that rescues DARE.
+- experiments/README.md Files section now lists dare_spectrum.py.
+
+## 2026-10-14 — Chunie sparse vs LoRA rerun on trainer_samples_v3 @512
+
+- New launcher `krea2/compare_chunie_peft_v3.py` (copy-adapted from
+  `compare_chunie_peft.py`), output `runs/k2-chunie-peft-v3-512/`. Same base
+  (fullft_step_49600), rank 8/alpha 8 LoRA vs matched-budget sparse with
+  inflight calibration (10 steps, shared mask). 512px, resolution_step 64,
+  captions tags/mj (w2) + 10_word/long_caption (w1), 1000 updates, warmup 20,
+  LR grid 1e-4 / 5e-5 (prior pilot picked LoRA 1e-4, sparse 2e-5). GPU0
+  calibration then sparse 1e-4, GPU1 sparse 5e-5, GPU2/3 LoRA 1e-4/5e-5.
+  Held-out loss on 4 validation images (32 batches), 512px render grids.
+- `train_mass_lora.py` now forwards `parquet_dataloader.s3_image_source` to
+  the dataset (it was silently dropped); v3 images live only on rustfs.
+- Data gotchas: v3 e621 has 50 chunie rows but only 24 unique images (each
+  appears twice) and 2 rows carry bare `e621/xx/yy/<md5>` paths with no
+  prefix/extension that neither disk nor S3 resolves. Launcher drops those and
+  dedupes by image sha256 -> 20 train / 4 validation.
+- Step-250 mid-run eval: `compare_chunie_peft_v3.py --eval-step N` (own lock,
+  runs on the LoRA GPUs 2/3 beside training). Sparse eval through the sparse
+  trainer path OOMs beside a trainer (Stage allocates dense 12B grad accums
+  before release_accumulators -> ~56 GB). Fix: `train_mass_lora.py` now
+  applies `sparse_checkpoint` under any peft_method; the launcher scores the
+  sparse delta via an empty LoRA bank (B=0, exact no-op), ~37 GB peak.
+  Step-250 validation loss: LoRA 1e-4 .15796, sparse 1e-4 .15824,
+  LoRA 5e-5 .15920, sparse 5e-5 .15830 (spread ~= noise; 4 images x 32 batches).
+- Step-750 validation loss: LoRA 1e-4 .16387, sparse 1e-4 .16126,
+  LoRA 5e-5 .16057, sparse 5e-5 .15880. All rose from step 250 (20 train
+  images -> overfitting); sparse rose less than LoRA at each LR. Renders show a
+  much stronger chunie style (darker, painterly, rim light) than at 250.
+- LoRA-only LR sweep (`--lora-sweep`), 1000 steps, compounding +20% from the
+  1e-4 baseline: 1.2e-4 / 1.44e-4 / 1.728e-4 / 2.0736e-4 on GPU0-3, held-out
+  loss + 512px renders at steps 250/500/750/1000, `renders/lora_sweep_stepN.png`.
+  Step-1000 results of the first comparison: LoRA 1e-4 .16586, LoRA 5e-5
+  .16244, sparse 1e-4 .16319, sparse 5e-5 .15997 (all still rising).
+- Gotcha: four trainers mmap-loading the 51 GB fp32 base under host-memory
+  pressure (GLM GGUF pins, ~186 GB tmpfs in /tmp/glm53flash) thrashed for
+  ~20 min at ~130 MB/s. Killed the stale pin_model.py processes (user OK'd);
+  a sequential `dd` prewarm (1.1 GB/s, 45 s) unblocked them. Prewarm the
+  checkpoint before launching 4 concurrent loads.
+- `--eval-all-step N` evaluates every arm's bank_step_N round-robin on GPUs
+  0-3 (folder/render names match the sweep's own, so its tail reuses them).
+  `krea2/tools/plot_chunie_sweep.py` plots paired training-loss deltas vs
+  LoRA 1e-4 + held-out loss. Step-500 held-out: LoRA 5e-5 .15898, 1e-4
+  .16149, 1.2e-4 .16122, 1.44e-4 .16267, 1.73e-4 .16288, 2.07e-4 .16347;
+  sparse 5e-5 .15924, 1e-4 .16010. 2.07e-4@500 ~= 1e-4@750 (.16387).
+- LoRA sweep complete. Held-out @250/500/750/1000: 1.2e-4 .1578/.1612/.1649/
+  .1666; 1.44e-4 .1580/.1627/.1654/.1681; 1.73e-4 .1585/.1629/.1661/.1699;
+  2.07e-4 .1588/.1635/.1665/.1711 (1e-4: .1580/.1615/.1639/.1659). No
+  instability up to 2.07e-4; held-out loss maps to ~1.33-1.5x fewer steps at
+  2x LR (2.07e-4@750 ~= 1e-4@1000), not 2x. Renders `renders/lora_sweep_stepN.png`.
+- Added `BankLion` (utils/bank_optimizer.py): Lion over a bank's ACTIVE slot
+  rows, subclass of BankAdamW (per-slot steps/warmup, host-offloaded state,
+  momentum only). `train_mass_lora.py` takes `optimizer: "lion"` +
+  `lion.betas` (default [0.9, 0.99]) for LoRA banks; sparse stays SparseAdam.
+  `check_lora_bank.py` gained a BankLion section (bit-exact vs krea2.lion.Lion
+  on active rows, inactive slots untouched, cpu-state parity) -- ALL PASS.
+- Lion sweep launched (`--lora-sweep ... --optimizer lion`), same 4 LRs as the
+  AdamW sweep, runs under `lora_lion/`, renders `renders/lora_lion_sweep_stepN.png`.
+  Inputs verified paired with the AdamW runs (first-step losses identical).
+  Caveat: Lion moves every coordinate by lr each step, so the same nominal lr
+  is far more aggressive than AdamW's.
+- `--eval-all-step N --family F` restricts the mid-run eval to one run folder;
+  `evaluate_checkpoint` now takes the folder family (lora/lora_lion/sparse)
+  and maps it to the adapter type (labels match the sweep's, so it reuses).
+- Lion step-250 held-out: 1.2e-4 .16117, 1.44e-4 .16224, 1.73e-4 .16164,
+  2.07e-4 .16218 (~= AdamW 1e-4 @500). Paired train-loss delta vs AdamW 1e-4
+  at ~step 480: -0.011 to -0.016 (AdamW 2.07e-4 reached -0.008 by 1000).
+  The four Lion LRs are bunched: LR matters far less than the optimizer here.
+
+## 2026-10-14 — Fast batch-1 LoRA trainer (`train_concept_lora.py` engine=plain)
+
+- `train_concept_lora.py` rewritten around `engine: plain|pipeline` (default
+  plain): whole 12B DiT on one GPU, direct forward, no grad ckpt, GPU-resident
+  cache, AdamW|Lion, `lora_only`, `lora_exclude_prefixes`, fp32 adapter
+  masters, `bench_steps`/`profile_steps` (Perfetto `.json.gz` + key_averages).
+  Config `krea2/configs/train_fast_lora_chunie.json` (chunie, 512, rank 8,
+  S3 images, v3 caption bands, 8 shuffled tag variants).
+- Cache format 2: text hiddens store only tokenizer-valid rows (the old cache
+  kept 512 rows with valid_len=512, so padding was attended as text -- bug).
+- `SingleStreamDiT.forward(mask=None)`: no 256-pad, unmasked attention; exact
+  at batch 1. `compile_plain_dit_blocks` (krea2/compile.py), sm120 inductor
+  options. `drop_frozen_params` (utils/ramtorch_helpers.py) for pipeline +
+  lora_only. `tools/lora_to_bank.py` converts to a 1-slot bank for the eval
+  harness. `check_concept_lora.py` sections 5-9 ALL PASS.
+- 512px batch-1 s/step (peak GiB): pipeline_ckpt 3.43 (25.6); eager masked
+  cuDNN 0.864 (43); eager unmasked cuDNN 1.51; eager unmasked flash 0.375
+  (42.3); compiled default dynamic 1.05; max-autotune-no-cudagraphs blocks
+  dynamic 0.333 (37.2, shipped); model scope 0.334. GPU busy ~279 ms of 333.
+- Gotchas: cuDNN SDPA rebuilds its plan per new seq len (~60 ms host/call;
+  caption length changes every step) -> flash first, and
+  `enable_cudnn_sdp(False)` when compiled because Dynamo bakes the cuDNN
+  choice in. Static compile hits the recompile limit -> dynamic. CUDA-graph
+  modes segfault in torch 2.10 (CPU `cpp_fused_0` kernel in the compiled
+  backward reads GPU tensors) -- abandoned.
+- Parity (`tools/check_fast_lora_parity.py`) vs an fp32 ground truth (fp32
+  weights, math SDPA): every bf16 engine is ~0.9-1.6x relative grad error,
+  dominated by tmlp/first/txtfusion adapters whose grads sum over all 28
+  blocks; pipeline == eager cuDNN bit-for-bit-ish (7e-3). Compiled flash is
+  the closest to fp32 in all 4 runs (0.81-0.94), eager flash the noisiest
+  (1.58-1.84, WARN only). Loss offset ~0.85% for all bf16 engines. Gotcha:
+  inject_lora draws lora_A from the global RNG -- seed before it.
+- Smoke: 200 steps at 0.338 s/step, loss 0.0866,
+  `runs/k2-chunie-fast-lora/smoke/ckpts/`. Perfetto trace of the shipped
+  config: `runs/k2-chunie-fast-lora/perfetto/autotune/ckpts/profile_step240.json.gz`.
+- Flash attention removed from `train_concept_lora.py` (user: known issues).
+  `attention: cudnn|math` (default math in the chunie config); flash is
+  disabled globally and the backend is pinned inside `mmdit.attention` via
+  `set_sdpa_ctx(True, backend)` -- gotcha: torch.compile IGNORES the global
+  `enable_flash_sdp(False)` flag and kept tracing flash, so the earlier
+  "compiled cuDNN/math = 0.333" numbers were flash. Mem-efficient SDPA has no
+  GQA kernel. Real no-flash numbers (512, b1): eager cuDNN 0.865, eager math
+  0.548 (55.7 GiB), compiled cuDNN 0.798 (per-shape plan rebuild), compiled
+  math 0.408 s/step (47.8 GiB) -- shipped.
+- Parity: compiled math is the most accurate engine measured: loss within
+  1.4e-5 of fp32 (all others ~8.3e-4 off), grad rel err 0.59 vs pipeline 1.04.
+  Eager math is the worst (2.13): bf16 scores at block 0's ~3e4 logits
+  (bf16 step 128). WARN only (no-compile fallback).
+- Two trainers sharing one GPU: 0.732 s/step each = 2.73 steps/s vs 3.0
+  solo (time-slicing, no overlap); not worth it without MPS.
+- Flash restored (user: PyTorch's built-in flash is fine; the blowups are
+  Dao's external flash_attn, inference-tuned). `attention: flash|cudnn|math`,
+  default flash; chunie config back on flash. Pinned flash, compiled:
+  0.334 s/step, 37.2 GiB. Parity (seed 0): compiled flash 0.88 grad err,
+  loss -8.3e-4 vs fp32; compiled math 0.59 / -1.4e-5 if accuracy matters
+  more than 22% speed. PARITY PASSED.
+- Fast-LoRA coarse LR sweep (chunie, 512, batch 1, 1000 steps, AdamW, flash,
+  same seed): `runs/k2-chunie-fast-lora/lr_sweep/lr_*`, 6.3 min/run at
+  0.334-0.341 s/step. Converted with lora_to_bank into
+  `runs/k2-chunie-peft-v3-512/fast_lora/lr_*/ckpts/bank_step_N` and scored
+  with `compare_chunie_peft_v3.py --eval-all-step N --family fast_lora`
+  (renders `renders/fast_lora_stepN.png`). Held-out @250/500/750/1000:
+  5e-5 .1606/.1594/.1590/.1597; 1e-4 .1604/.1591/.1599/.1608;
+  5e-4 .1592/.1606/.1611/.1638; 1e-3 .1598/.1608/.1628/.1662.
+  Train loss (paired) 1e-3 ~= 5e-4 < 1e-4 < 5e-5; no instability at 1e-3.
+  Held-out rises with style strength (as in the old sweep: old batch-4
+  1e-4 reached .1659 at 1000 steps = 4000 samples); 1e-3 @1000 batch-1
+  steps lands at the same held-out loss and visibly strong chunie style.
+- Cooldown ablation, lr 1e-3, 1000 steps (no optimizer state is saved --
+  concept_step_N is weights-only -- so reran from scratch, same seed):
+  `runs/k2-chunie-fast-lora/cooldown_ablation/cd{200,150,100,50}`. Held-out
+  @1000: cd200 .16483, cd150 .16471, cd100 .16674, cd50 .16634. No-cooldown
+  1e-3 repeated 3x: .16622 / .16584 / .16905 -- run-to-run spread ~.003
+  (same data+noise, step-1 loss identical, but kernel nondeterminism makes
+  runs drift), so all cooldown differences are inside the noise. Grid (full
+  res, jpeg q95): `renders/fast_lora_cooldown_step1000_full.jpg` (base,
+  no-cd, cd200, cd150, cd100, cd50).
+- Schedule ablation, lr 1e-3, warmup 20, 1000 steps: new
+  `cooldown_shape: linear|cosine` in train_concept_lora (cooldown =
+  max_steps - warmup decays right after warmup). Held-out @1000: linear
+  decay after warmup .16192, cosine decay after warmup .16238, linear cd250
+  .16480, cosine cd250 .16440 (constant repeats .1658-.1690). Full decay is
+  the only effect outside the run-to-run noise; renders keep the strong
+  chunie style (`renders/fast_lora_schedules_step1000_full.jpg`). Caveat:
+  held-out rises with style strength, and full decay halves the LR integral.
+  `krea2/tools/plot_fast_lora_runs.py` -> `renders/fast_lora_losses.png`
+  (LR sweep, paired deltas vs constant 1e-3, schedules, held-out bars).
+- Merged the lin_full chunie LoRA (lr 1e-3, linear decay, step 1000) into
+  opd_base_candidate: NEW `krea2/tools/merge_lora.py` (wraps
+  utils/checkpoint.merge_lora_into_base_sd, reports how much of the update
+  survives the cast) -> `checkpoints/opd_base_candidate_chunie_linfull.safetensors`
+  (26 GB; bf16 linears keep ~95% of the update, 4.7% residual; disk now
+  ~78 GB free). Turbo renders, 1024px, 8 steps, guidance 0, mu 1.15, seed
+  5000+i, 4 GPUs via --num-shards: all 24 chunie samples x 4 caption bands
+  + 4 extra prompts = 100 images, merged and opd base control
+  (~3.5 min per model). `runs/k2-chunie-fast-lora/opd_renders/{merged,base}`;
+  NEW `krea2/tools/grid_opd_chunie.py` -> `opd_renders/sheets/` (per sample:
+  original | 4 bands, rows base/merged; extra.jpg; overview.jpg). The LoRA
+  transfers to the turbo base: softer painterly chunie look on the extras.
+- Same for the cos_full LoRA (cosine decay right after warmup) ->
+  `checkpoints/opd_base_candidate_chunie_cosfull.safetensors` (4.3% update
+  residual), renders `opd_renders/merged_cos` (same 100 prompts/seeds).
+  grid_opd_chunie.py now takes `--models ... --out ...`; 3-row sheets
+  base / linear / cosine in `opd_renders/sheets_lin_vs_cos/`.
+- Artist LoRA mass run. NEW `krea2/tools/launch_artist_loras.py`:
+  `build-list` ranks trainer_samples_v3 artists by summed fav_count (>= 8
+  images, minus the DENY non-artist tags), writes
+  `runs/k2-artist-loras/<src>/artists.json` + one parquet per artist under
+  `<src>/data/`. Reads `samples.parquet` ONLY: the source dirs also hold a
+  stale `samples.parquet.bak-*` that pyarrow.dataset silently unions in.
+  e621 rows with bare `e621/xx/yy/<md5>` paths (254k, half of e621) exist on
+  S3 with a dropped extension: resolved by head_object .png/.jpg/.jpeg
+  (246k found, GIFs left out; cache `<src>/resolved_paths.json`). Lists:
+  e621 10,338 artists, danbooru 9,726. `run --queue e621:0,1 --queue
+  danbooru:2,3`: one thread per GPU, one train_concept_lora subprocess per
+  artist in fav order; resumable (`<src>/<slug>/ckpts/result.json` = done,
+  else wiped and retried), failures -> `<src>/failures.jsonl` (rerun with
+  --retry-failed), per-artist cache deleted after success, pauses below
+  --min-free-gb (100), status + ETA in `runs/k2-artist-loras/launcher.log`.
+  Per-artist config: chunie fast config + lr 1e-3, 1000 steps, warmup 20,
+  linear decay 980, bf16 final checkpoint only (59 MB), 5 bands
+  (tags 2, mj 2, 10-word 1, long 1, scene_graph 1).
+- train_concept_lora flags (all default off): `artist_at_rewrite` (bands
+  whose "[drawn|art|...] by X" phrase becomes "@X"; scene_graph keeps its
+  "artist": "X"), `caption_transforms` ({"scene_graph": "oneline_json"} =
+  qwen_e2e.serialize_scene_graph, one line), `encoder_max_length` (1024 for
+  the run; DiT text length stays per-caption dynamic), `min_images` (writes
+  result.json status=skipped), `save_dtype` bf16; cache stage timings.
+  One-line scene_graph is 290-505 tokens (cutesexyrobutts), never near 1024.
+- Smoke (2 danbooru artists): 0.34-0.35 s/step steady, 6.6-7.1 min train;
+  warm-cache startup ~2 min (cache build ~50 s, DiT load ~25 s, compile
+  ~45 s); the first runs paid ~8 min on a cold page cache. bf16 ckpt merges
+  via merge_lora (4.9% cast residual). Full queue launched 2026-10-14 22:18;
+  ~20k LoRAs x ~8 min / 4 GPUs = ~4 weeks. Resume: rerun the same command.

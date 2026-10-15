@@ -4356,3 +4356,35 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   ~45 s); the first runs paid ~8 min on a cold page cache. bf16 ckpt merges
   via merge_lora (4.9% cast residual). Full queue launched 2026-10-14 22:18;
   ~20k LoRAs x ~8 min / 4 GPUs = ~4 weeks. Resume: rerun the same command.
+- ComfyUI export: NEW `krea2/tools/lora_to_comfy.py` (files or run dirs ->
+  `<artist>.safetensors`). Our checkpoints' bare native keys
+  (`blocks.0.attn.wq.lora_A`) match nothing in ComfyUI's Krea2 LoRA map (0
+  patches). Default `--format diffusers` writes the krea/Krea-2-LoRA-*
+  (darkbrush) layout `transformer.<diffusers path>.lora_{A,B}.weight`
+  (names via extract_lora.to_krea == upstream comfy.utils.krea2_to_diffusers);
+  `--format native` writes `diffusion_model.<native>.lora_{A,B}.weight`.
+  alpha/rank folded into lora_B (no .alpha keys; ComfyUI scale 1); trigger in
+  metadata. Checked against upstream's key map: 263/263 layers matched, shapes
+  equal; key set = darkbrush minus text_fusion.projector (we exclude it).
+  The local /mnt/datapool_u2/lodestone/ComfyUI checkout predates Krea2 support.
+- Artist LoRA launcher paused 2026-10-15 03:47 (SIGTERM; 154 done, 0 failed)
+  for a chunie render: cd200 LoRA (lr 1e-3, constant then linear cooldown
+  over the last 200 steps) merged into opd_base_candidate ->
+  `checkpoints/opd_base_candidate_chunie_cd200.safetensors` (2.3% update
+  residual: the larger un-decayed update survives the bf16 cast better).
+  Same 100 turbo prompts/seeds -> `opd_renders/merged_cd200`; 4-row sheets
+  base / lin_full / cos_full / cd200 in `opd_renders/sheets_lin_cos_cd200/`.
+- Artist LoRAs restarted with the cd200 schedule (user preferred the cd200
+  chunie merge): launch_artist_loras `run --cooldown N` (default 200; lr 1e-3,
+  warmup 20, constant, linear decay over the last 200 of 1000 steps). Non-full
+  schedules write to `<src>/cd<N>/<slug>` (+ failures.jsonl there); the 156
+  full-decay LoRAs stay in `<src>/<slug>` for comparison (rerun with
+  `--cooldown 980` to continue that tree). Launched 2026-10-15 04:05 from the
+  top of both fav-ranked lists.
+- Artist LoRAs restarted at rank 32 (user: rank 8 too small for complex
+  styles). launch_artist_loras `run --rank R --alpha A` (default 32, alpha =
+  rank -> scale 1); variant dir `<src>/cd200_r32/<slug>`. Stopped the cd200 r8
+  run at 112 done (kept in `<src>/cd200/`). r32: 0.356 s/step steady (r8
+  ~0.35), peak 38-46 GiB, ~8.7 min/LoRA, bf16 ckpt 235 MB (r8 59 MB) -> all
+  ~20k artists ~4.7 TB vs 1.2 TB free; launcher pauses at the 100 GB floor
+  after ~4.5k artists. Launched 2026-10-15 08:23.

@@ -8,7 +8,9 @@ build-list: rank every artist in trainer_samples_v3/source=<src> by summed
 run: one worker thread per GPU pulls the next artist from its source's queue
     and runs ``krea2/train_concept_lora.py`` as a subprocess. Resumable: a run
     directory with ckpts/result.json (trained or skipped) is done; one without it is
-    wiped and retried. Failed artists go to <src>/failures.jsonl and are only
+    wiped and retried. Runs live in <src>/<slug> for decay-right-after-warmup
+    and <src>/cd<N>/<slug> for --cooldown N (default 200), so schedules never
+    overwrite each other. Failed artists go to failures.jsonl there and are only
     retried with --retry-failed. The per-artist cache is deleted after success.
 
     uv run python krea2/tools/launch_artist_loras.py build-list
@@ -172,6 +174,19 @@ def build_list(args):
 class Launcher:
     def __init__(self, args):
         self.args = args
+        full_decay = args.steps - args.warmup
+        if args.cooldown is None:
+            args.cooldown = full_decay
+        if not 0 <= args.cooldown <= full_decay:
+            raise SystemExit(f"--cooldown must be in [0, {full_decay}]")
+        if args.alpha is None:
+            args.alpha = float(args.rank)
+        # Full decay at rank 8 keeps the original layout (<src>/<slug>); any
+        # other schedule/rank gets its own tree so all sets of LoRAs coexist.
+        parts = ([] if args.cooldown == full_decay else [f"cd{args.cooldown}"]) + \
+                ([] if (args.rank, args.alpha) == (8, 8.0) else
+                 [f"r{args.rank}" + ("" if args.alpha == args.rank else f"a{args.alpha:g}")])
+        self.variant = "_".join(parts)
         self.lock = threading.Lock()
         self.children: set[subprocess.Popen] = set()
         self.stopping = False
@@ -198,11 +213,14 @@ class Launcher:
                                "failed": 0, "minutes": []}
         self.log_path = os.path.join(OUT, "launcher.log")
 
+    def _var_dir(self, src):
+        return os.path.join(OUT, src, self.variant)
+
     def _run_dir(self, src, e):
-        return os.path.join(OUT, src, e["slug"])
+        return os.path.join(self._var_dir(src), e["slug"])
 
     def _failed(self, src) -> set[str]:
-        path = os.path.join(OUT, src, "failures.jsonl")
+        path = os.path.join(self._var_dir(src), "failures.jsonl")
         if not os.path.exists(path):
             return set()
         return {json.loads(l)["slug"] for l in open(path) if l.strip()}
@@ -242,7 +260,9 @@ class Launcher:
             lr=self.args.lr,
             max_steps=self.args.steps,
             warmup=self.args.warmup,
-            cooldown=self.args.steps - self.args.warmup,
+            cooldown=self.args.cooldown,
+            lora_rank=self.args.rank,
+            lora_alpha=self.args.alpha,
             cooldown_shape="linear",
             save_every_n_steps=0,
             save_dtype="bf16",
@@ -307,7 +327,7 @@ class Launcher:
         tail = open(os.path.join(run_dir, "train.log"), errors="replace").read()[-2000:]
         with self.lock:
             self.stats[src]["failed"] += 1
-            with open(os.path.join(OUT, src, "failures.jsonl"), "a") as f:
+            with open(os.path.join(self._var_dir(src), "failures.jsonl"), "a") as f:
                 f.write(json.dumps({"artist": e["artist"], "slug": e["slug"], "gpu": gpu,
                                     "returncode": rc, "time": time.time(),
                                     "log_tail": tail}) + "\n")
@@ -333,7 +353,9 @@ class Launcher:
         signal.signal(signal.SIGTERM, self.stop)
         signal.signal(signal.SIGINT, self.stop)
         for src, s in self.stats.items():
-            self.log(f"[launcher] {src}: {s['queued']} queued on GPUs {self.gpus[src]}, "
+            self.log(f"[launcher] {src} (cooldown {self.args.cooldown}, rank {self.args.rank} "
+                     f"alpha {self.args.alpha:g}, "
+                     f"dir {self._var_dir(src)}): {s['queued']} queued on GPUs {self.gpus[src]}, "
                      f"{s['done_before']} already done, {s['total']} total.")
         threads = [threading.Thread(target=self.worker, args=(src, gpu), daemon=True)
                    for src, gpus in self.gpus.items() for gpu in gpus]
@@ -360,6 +382,11 @@ def main():
     r.add_argument("--lr", type=float, default=1e-3)
     r.add_argument("--steps", type=int, default=1000)
     r.add_argument("--warmup", type=int, default=20)
+    r.add_argument("--cooldown", type=int, default=200,
+                   help="linear decay over the last N steps; steps - warmup = decay right "
+                        "after warmup (the original <src>/<slug> tree), otherwise <src>/cd<N>/")
+    r.add_argument("--rank", type=int, default=32)
+    r.add_argument("--alpha", type=float, help="default: = rank (adapter scale 1)")
     r.add_argument("--min-images", type=int, default=8)
     r.add_argument("--encoder-max-length", type=int, default=1024)
     args = ap.parse_args()

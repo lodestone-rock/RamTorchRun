@@ -1,0 +1,111 @@
+{
+  "_comment": "4-step DMAD of MOSS-Image-SFT on top of the data-space DMD v2 update-7400 LoRA at 0.7 used in v space (the 8-step Euler teacher, CFG 1). Teacher = stock MOSS + that LoRA as a frozen fp32 always-on branch, sampled online (8 Euler steps, shift 5); student = a new rank-128 LoRA on top, re-noise sampler at moss_sigmas(4, 5). Disc = 'disc' LoRA role + teacher/real heads on the final-block image tokens; real = trainer_samples_v3 images fetched by url with captions drawn from 5 bands. Recipe from krea2 turbo-kroma DMAD 4-step v2. Exports lora_4step.safetensors = 0.7 teacher + student as one rank-256 kohya LoRA (apply at 1.0).",
+  "seed": 44,
+  "model_path": "checkpoints/moss-image-sft",
+  "teacher_lora": {
+    "path": "runs/moss-dataspace-dmd-8step-v2/exports/update-007400-generator.safetensors",
+    "strength": 0.7,
+    "alpha": 128.0
+  },
+  "data": {
+    "files": [
+      "trainer_samples_v3/source=*/samples.parquet"
+    ],
+    "bands": [
+      {
+        "column": "scene_graph",
+        "format": "compact_json",
+        "weight": 2.0
+      },
+      {
+        "column": "long_caption",
+        "format": "raw",
+        "weight": 1.0
+      },
+      {
+        "column": "brief_summary",
+        "format": "raw",
+        "weight": 1.0
+      },
+      {
+        "column": "10_word_summary",
+        "format": "raw",
+        "weight": 1.0
+      },
+      {
+        "column": "tags",
+        "format": "raw",
+        "weight": 1.0
+      }
+    ],
+    "holdout": 16,
+    "filters": {
+      "caption_status": "ok"
+    },
+    "url_column": "url",
+    "min_side": 768,
+    "workers": 16,
+    "prefetch": 32
+  },
+  "width": 1024,
+  "height": 1024,
+  "shift": 5.0,
+  "teacher_steps": 8,
+  "student_steps": 4,
+  "lora_rank": 128,
+  "lora_alpha": 128.0,
+  "head_hidden": 1024,
+  "lr": 2.5e-06,
+  "disc_lr": 4e-05,
+  "betas": [
+    0.0,
+    0.99
+  ],
+  "weight_decay": 0.0,
+  "max_grad_norm": 1.0,
+  "warmup": 0,
+  "disc_warmup": 0,
+  "lambda_teacher": 1.0,
+  "lambda_real": 1.0,
+  "gap": {
+    "bands": 10,
+    "beta": 0.99,
+    "tau": 2.0,
+    "floor": 0.0001
+  },
+  "disc_u_range": [
+    0.001,
+    0.999
+  ],
+  "ema_sigma_rel": 0.1,
+  "batch_size": 1,
+  "grad_accum": 4,
+  "max_seconds": 1000000000.0,
+  "grad_checkpoint": true,
+  "output_dir": "runs/moss-dmad-4step-v1",
+  "max_updates": 4800,
+  "eval_interval": 50,
+  "save_interval": 50,
+  "milestone_interval": 200,
+  "keep_checkpoints": 4,
+  "validation_prompts": [
+    "A red fox sitting in fresh snow at dawn, soft golden light, shallow depth of field",
+    "A cozy bookstore cafe interior on a rainy evening, warm lamps, people reading",
+    "An astronaut riding a horse across a desert under a purple sky, cinematic",
+    "A bowl of ramen with a soft-boiled egg, steam rising, top-down food photography",
+    "Portrait of an elderly fisherman with a weathered face, overcast harbor background",
+    "A neon sign that says \"OPEN 24 HOURS\" above a diner door at night",
+    "{\"artist\":null,\"characters\":[],\"species\":[],\"subject_count\":0,\"subjects\":[],\"setting\":\"Deep outer space\",\"background\":\"Dark cosmic void with reddish-orange nebula gas, stars, and radiant light streaks\",\"lighting\":\"Intense central orange and yellow radial glow emitting outwards\",\"objects\":[\"central glowing fiery star sphere\",\"intersecting elliptical golden energy orbital rings\",\"miniature orbiting planets and spherical bodies\",\"radiating light streaks and particle sparks\",\"nebula clouds\"],\"text_in_image\":[],\"watermarks\":[],\"perspective\":\"Centered frontal view\",\"style\":\"Sci-fi digital art illustration\",\"nsfw_level\":\"general\"}",
+    "{\"artist\":null,\"characters\":[],\"species\":[],\"subject_count\":0,\"subjects\":[],\"setting\":\"Modern cantilevered villa built into a rocky sandstone cliff face surrounded by wilderness\",\"background\":\"Towering vertical sandstone cliff face with hanging ivy and a tree-lined ridge\",\"lighting\":\"Warm late-afternoon golden sunlight with soft ambient shadows and glowing rim light\",\"objects\":[\"concrete house\",\"glass window walls\",\"cantilevered terrace\",\"orange outdoor dining table\",\"orange dining chairs\",\"orange lounge armchair\",\"bed with bedding\",\"sandstone cliff\",\"eucalyptus trees\",\"bushes\",\"glass railing\"],\"text_in_image\":[],\"watermarks\":[],\"perspective\":\"Wide eye-level exterior architectural view\",\"style\":\"Photorealistic 3D architectural rendering\",\"nsfw_level\":\"general\"}"
+  ],
+  "validation_seeds": [
+    1000,
+    1001,
+    1002,
+    1003,
+    1004,
+    1005,
+    1006,
+    1007
+  ]
+}

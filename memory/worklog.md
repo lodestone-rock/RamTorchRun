@@ -4388,3 +4388,41 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   ~0.35), peak 38-46 GiB, ~8.7 min/LoRA, bf16 ckpt 235 MB (r8 59 MB) -> all
   ~20k artists ~4.7 TB vs 1.2 TB free; launcher pauses at the 100 GB floor
   after ~4.5k artists. Launched 2026-10-15 08:23.
+
+## 2026-10-17 — moss/ imported from another machine (moss.zip), wired + smoked
+
+- Unzipped `moss/` (MOSS-Image-SFT 5B: data-space DMD trainer
+  `train_dataspace_dmd.py`, DMAD `train_dmad.py`, tools, configs). torchrun +
+  manual grad all-reduce (`train_utils.clip_step`), NOT RamTorch Pipeline.
+- Deps that were missing here: `dataloaders/caption_stream.py` and
+  `dataloaders/caption_image_stream.py` (user's originals, moved in from repo
+  root); `dataloaders/real_image_stream.py` was still missing, so
+  `fetch_image(url, w, h, min_side, timeout, retries) -> (pixels|None, reason)`
+  is a local stand-in (sRGB, alpha on white, min_side reject, cover + centre
+  crop, [-1,1]). Replace with the original if it differs.
+- Weights: `hf download OpenMOSS-Team/MOSS-Image-SFT --local-dir
+  checkpoints/moss-image-sft` (26 GB, the path all configs use).
+- Data: configs read `trainer_samples_v3/source=*/samples.parquet` relative to
+  the repo root -> gitignored symlink `trainer_samples_v3` ->
+  `/mnt/datapool_u2/lodestone/mass_caption_v2/out/trainer_samples_v3`
+  (514,467 caption_status=ok rows after holdout 16/file).
+- Verified: check_dataspace (incl. release parity, bit-exact) and check_dmad
+  pass on CPU; GPU smoke `dataspace_dmd_8step_smoke.json` (1 rank, GPU 2):
+  6 updates exit 0, peak 38 GiB, ~10 s fake-only / ~24 s gen updates at 1024;
+  resume from update 3 reproduces updates 4-6; `sample_dataspace.py` renders
+  the export. Previews: teacher clean, generator = blurry t=1 mean (expected
+  at 2 gen updates).
+- Gotchas: ~30% of real-image URLs 404 in the Backblaze bucket (all e621 so
+  far; no extension variant exists) -> CaptionImageStream skips/counts them
+  (`fetch_failed`), DMAD wastes fetches. Not present here: v1/v2 run dirs
+  (v2 `init_generator`, DMAD `teacher_lora` = v2 update-7400 export),
+  `checkpoints/clip-vit-large-patch14` + `runs/k2-turbo-unet-eval-parti100/
+  prompts.json` (eval_prompts.py), `/mnt/local_disk/mhanif_runs` (release.sh,
+  hf_upload_watchdog.sh staging).
+- rustfs works for the real-image stream: set `data.url_column: "file_path"`.
+  `fetch_image` maps the three stored file_path forms (`/mnt/nas_buckets/e621/
+  aa/bb/h.png`, `e621/aa/bb/h`, `nas_buckets/deviantart/aa/bb/id`) to rustfs
+  bucket/key and probes extensions when missing. The extensionless e621 half
+  (254k rows) is exactly the set that 404s on Backblaze; on rustfs all 5
+  sources fetch 24/24, ~17 img/s @1024 on 16 workers. The read-only key cannot
+  ListBuckets (AccessDenied) - GetObject only. DMAD configs still use `url`.

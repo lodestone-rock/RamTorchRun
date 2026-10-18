@@ -14,6 +14,9 @@ previews/
 runs/
 *.safetensors
 
+# Caption parquet data (symlink to mass_caption_v2/out/trainer_samples_v3; moss/ configs use the relative path)
+/trainer_samples_v3
+
 # HF cache if placed locally
 hf_cache/
 

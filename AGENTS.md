@@ -125,7 +125,13 @@ radiance/                 # Radiance x0 patch-16, 9.5B: Chroma in PIXEL space, N
   model/chunks.py         #   64 chunks; the relay CHANGES SHAPE at the NeRF head
   tools/                  #   + check_txt_pos_ids.py — scores a checkpoint's own
                           #     loss to settle the text-RoPE convention
+moss/                     # MOSS-Image-SFT 5B (Qwen3.5-9B encoder, FLUX.2 VAE), torchrun DDP:
+                          #   train_dataspace_dmd.py (data-space DMD, role LoRA, t=1 folded
+                          #   into the time pathway), train_dmad.py; tools/check_dataspace.py
+                          #   + check_dmad.py (CPU); weights checkpoints/moss-image-sft
 dataloaders/              # SHARED: parquet image+caption dataset, aspect-ratio bucketing
+                          #   + caption_stream.py / caption_image_stream.py (moss streams;
+                          #     configs expect a trainer_samples_v3 symlink in the repo root)
                           #   + tag_column: tag ids DECOUPLED from the caption
                           #   + mass_lora_dataloader.py: slot-packed step plans,
                           #     caption band drawn PER VISIT, not per row

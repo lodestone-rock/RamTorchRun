@@ -88,6 +88,26 @@ also means the plan is only reproducible while RNG *consumption* in the row loop
 is unchanged: adding or removing a per-row `rng` call re-rolls the plan, which
 invalidates the `parquet_dataloader.offset` trick for resuming mid-plan.
 
+`moss/train_sft.py` adds a batched forward to `model/transformer.py` (right-padded
+text, bool key mask, per-sample RoPE; `seq_pad` pads the whole sequence to a
+multiple so torch.compile sees few static shapes). Run
+`moss/tools/check_batched_forward.py` after touching the forward, and
+`moss/tools/check_sft_recipe.py` after touching `utils/muon.py`, the optimizer
+partition, `sample_t` or the EMA. Under compile, keep
+`torch._inductor.config.triton.mix_order_reduction = False` (torch 2.10's fused
+RMSNorm backward overruns shared memory at ~4.6k+ tokens per micro-batch).
+
+On this box (4x 96 GB PCIe, two sockets, no NVLink) run it with `parallelism:
+"zero"` (`utils/zero_sharding.py`, ramtorch `MultiGPUWrapper`'s ZeRO-1 ported to
+torchrun): each parameter is owned whole by one rank, which alone holds its
+Muon/AdamW state and EMA shadow; grads are reduced to owners once per update,
+owners step and broadcast. Run `moss/tools/check_zero_sync.py` after touching
+it. Two traps: ZeRO checkpoints must use `flatten_optimizer_state_dict=True`
+(`ZERO_STATE_OPTIONS`) or the list-indexed `param_groups` keys collide across
+ranks; and NCCL must get `NCCL_P2P_LEVEL=SYS` (train_sft sets it) — its default
+stages cross-socket traffic through host memory at ~3.4 GB/s instead of ~18
+(`moss/tools/probe_comms.py`).
+
 ## Repo map
 
 Three model folders, all the same shape:
@@ -129,6 +149,22 @@ moss/                     # MOSS-Image-SFT 5B (Qwen3.5-9B encoder, FLUX.2 VAE), 
                           #   train_dataspace_dmd.py (data-space DMD, role LoRA, t=1 folded
                           #   into the time pathway), train_dmad.py; tools/check_dataspace.py
                           #   + check_dmad.py (CPU); weights checkpoints/moss-image-sft
+  train_sft.py            #   full SFT, flow matching; parallelism fsdp | ddp | zero; flags: batched
+                          #     forward (padded text + key mask, seq_pad -> static shapes),
+                          #     compile (static, blocks only), sdpa cudnn, grad_checkpoint N,
+                          #     optimizer adamw | muon (report's hybrid Muon-AdamW, utils/muon.py),
+                          #     timestep kind moss_final, EMA (export = EMA); ParquetTextImageDataset
+                          #     (+ min_pixels, rustfs file_path); milestones export a release-layout
+                          #     bf16 transformer/. configs/sft_kromoss_v1*.json: continue
+                          #     lodestones/Kromoss (checkpoints/kromoss) under zero on 4 GPUs
+  tools/                  #   + check_batched_forward.py / check_sft_recipe.py (CPU, SFT trainer)
+                          #   + check_zero_sync.py (CPU gloo: zero == one process, DCP resume,
+                          #     reshard to a new world) / probe_comms.py (NCCL timings, torchrun)
+                          #   + probe_sft_throughput.py (1 GPU: batch x ckpt x compile x sdpa)
+                          #   + plot_sft_loss.py, checkpoint_watchdog.py (prunes old trainer state)
+                          #   + export_comfy.py: release transformer/ -> ComfyUI single file
+                          #     (fused proj.qkv; == Comfy-Org's file on the SFT release)
+                          #   + eval_prompts.py: --transformer, per-NFE --cfg, --shard/--shards
 dataloaders/              # SHARED: parquet image+caption dataset, aspect-ratio bucketing
                           #   + caption_stream.py / caption_image_stream.py (moss streams;
                           #     configs expect a trainer_samples_v3 symlink in the repo root)
@@ -140,6 +176,10 @@ dataloaders/              # SHARED: parquet image+caption dataset, aspect-ratio 
                           #     no model/GPU/decode; --fast streams 20M rows in ~1min
 utils/
   checkpoint.py           # SHARED: LoRA checkpoint load / merge helpers
+  muon.py                 # SHARED: Muon (Nesterov, quintic Newton-Schulz, RMS-matched lr, fused-matrix splits,
+                          #   optional bf16 momentum)
+  zero_sharding.py        # SHARED: ZeroSync — ZeRO-1 over torchrun ranks (whole-tensor owners,
+                          #   reduce-to-owner, global | local clip, broadcast, EMA swap)
   profiling.py            # SHARED: Perfetto trace capture over a sampling loop
   ramtorch_helpers.py     # SHARED: grad flush / accumulator plumbing for Pipeline
   bank_optimizer.py       # SHARED: BankAdamW — AdamW over a LoRA bank's ACTIVE slots only

@@ -81,13 +81,13 @@ def renoise(model, noise, sigmas, contexts, generator):
 
 
 def render(args, records, folder, jobs):
-    """``jobs``: (column, lora strength or None, nfe) per image."""
+    """``jobs``: (column, lora strength or None, nfe, cfg) per image."""
     from safetensors.torch import load_file
-    todo = [r for r in records if not all((folder / f"{r['index']:02d}-{c}.png").exists() for c, _, _ in jobs)]
+    todo = [r for r in records if not all((folder / f"{r['index']:02d}-{c}.png").exists() for c, *_ in jobs)]
     if not todo:
         return
     device = torch.device("cuda")
-    model = load_transformer(Path(args.model) / "transformer", device)
+    model = load_transformer(Path(args.transformer or Path(args.model) / "transformer"), device)
     inject_lora(model, args.rank, args.alpha, LORA_TARGET)
     state = load_file(args.lora or args.generator, device=str(device))
     scale_attr = "scale"
@@ -107,24 +107,24 @@ def render(args, records, folder, jobs):
         mix, codes = apply_export(model, state)
     del state
     encoder, decoder = TextEncoder(args.model, device), Decoder(args.model, device)
-    uncond = encoder([""]) if args.vspace and args.cfg != 1.0 else None
+    uncond = encoder([""]) if args.vspace and any(c != 1.0 for *_, c in jobs) else None
     for i, record in enumerate(todo):
         noise = torch.randn(1, 128, args.size // 16, args.size // 16, device=device, dtype=torch.float32,
                             generator=torch.Generator(device=device).manual_seed(record["seed"]))
         contexts = encoder([record["prompt"]])
         if args.vspace:
             images = {}
-            for column, strength, n in jobs:
+            for column, strength, n, cfg in jobs:
                 set_lora_scale(loras, strength, scale_attr)
                 sigmas = moss_sigmas(n, args.shift)
                 if args.sampler == "renoise":
                     generator = torch.Generator(device=device).manual_seed(record["seed"] + 1)
                     images[column] = renoise(model, noise, sigmas, contexts, generator)
                 else:
-                    images[column] = cfg_euler(model, noise, sigmas, contexts, uncond, args.cfg)
+                    images[column] = cfg_euler(model, noise, sigmas, contexts, uncond, cfg)
         else:
             estimates = rollout(model, mix, codes, noise, contexts)
-            images = {column: estimates[n - 1] for column, _, n in jobs}
+            images = {column: estimates[n - 1] for column, _, n, _ in jobs}
         for column, latent in images.items():
             path = folder / f"{record['index']:02d}-{column}.png"
             to_pil(decoder(latent))[0].save(path.with_suffix(".tmp.png"))
@@ -203,25 +203,36 @@ def main():
                              "space; --nfe then lists Euler step counts, one independent run each")
     parser.add_argument("--lora-scale", type=float, nargs="+", default=[1.0],
                         help="--vspace only; several values give one column per strength x nfe")
-    parser.add_argument("--cfg", type=float, default=1.0, help="--vspace only")
+    parser.add_argument("--cfg", type=float, nargs="+", default=[1.0],
+                        help="--vspace only; one value, or one per --nfe entry")
     parser.add_argument("--shift", type=float, default=5.0, help="--vspace only")
+    parser.add_argument("--transformer", help="transformer/ folder replacing the one in --model (e.g. an SFT export)")
+    parser.add_argument("--shard", type=int, default=0)
+    parser.add_argument("--shards", type=int, default=1, help=">1: render every shards-th prompt and exit; "
+                        "a final --shards 1 run then only scores")
     args = parser.parse_args()
     if not (args.generator or args.lora):
         parser.error("need --generator or --lora")
+    if len(args.cfg) not in (1, len(args.nfe)):
+        parser.error("--cfg takes one value or one per --nfe entry")
     args.vspace = args.vspace or bool(args.lora)
     records = json.loads(Path(args.prompts).read_text())
     folder = Path(args.output) / "images"
     folder.mkdir(parents=True, exist_ok=True)
     if args.vspace:
-        many = len(args.lora_scale) > 1
-        jobs = [(f"s{s:g}-nfe{n}" if many else f"nfe{n}", s, n) for s in args.lora_scale for n in args.nfe]
-        labels = [f"LoRA x{s:g} {args.sampler} {n} steps" + (f", cfg {args.cfg:g}" if args.sampler == "euler" else "")
-                  for _, s, n in jobs]
+        many, cfgs = len(args.lora_scale) > 1, dict(zip(args.nfe, args.cfg * len(args.nfe)))
+        tag = (lambda n: f"-cfg{cfgs[n]:g}") if len(set(args.cfg)) > 1 else (lambda n: "")
+        jobs = [((f"s{s:g}-nfe{n}" if many else f"nfe{n}") + tag(n), s, n, cfgs[n])
+                for s in args.lora_scale for n in args.nfe]
+        labels = [f"LoRA x{s:g} {args.sampler} {n} steps" + (f", cfg {c:g}" if args.sampler == "euler" else "")
+                  for _, s, n, c in jobs]
     else:
-        jobs = [(f"nfe{n}", None, n) for n in args.nfe]
+        jobs = [(f"nfe{n}", None, n, 1.0) for n in args.nfe]
         labels = [f"DS-DMD {n} NFE" for n in args.nfe]
-    render(args, records, folder, jobs)
-    columns = [c for c, _, _ in jobs]
+    render(args, records[args.shard::args.shards], folder, jobs)
+    if args.shards > 1:
+        return
+    columns = [c for c, *_ in jobs]
     contact_sheets(folder, columns, labels, records)
     summary = score(args, folder, columns, records)
     print(json.dumps(summary, indent=1))

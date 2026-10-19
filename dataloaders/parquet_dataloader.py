@@ -27,7 +27,8 @@ Example config snippet:
     "s3_image_source": {                 // optional: fetch images from S3 instead of disk
         "endpoint_url":    "http://localhost:9000",
         "credential_file": "credential/local-rustfs.json",  // {"username": ..., "password": ...}
-        "strip_prefix":    "/mnt/nas_buckets/"   // file_path under this prefix -> <bucket>/<key>
+        "strip_prefix":    "/mnt/nas_buckets/"   // file_path under this prefix (or any of a list) -> <bucket>/<key>;
+                                                 // an extensionless key probes S3_PROBE_EXTENSIONS
     },
     "base_res":           [512, 1024],   // multiple base resolutions
     "base_res_weights":   [0.25, 0.75], // optional: weighted sampling; omit for uniform
@@ -198,6 +199,9 @@ def _reinhard_tonemap_to_pil(arr: np.ndarray) -> Image.Image:
 # ---------------------------------------------------------------------------
 
 _S3_CLIENT = None
+
+
+S3_PROBE_EXTENSIONS = (".jpg", ".png", ".webp", ".gif", ".jpeg", ".jxl")
 
 
 def _get_s3_client(s3_cfg: dict):
@@ -503,6 +507,9 @@ class ParquetTextImageDataset(Dataset):
         Initial opt-in plan epoch. ``set_epoch`` rebuilds from canonical records
         without rereading parquet; offset applies only to this initial epoch.
         Recreate workers each epoch (persistent workers hold stale plan copies).
+    min_pixels : int | None
+        Drop rows whose source width * height is below this (e.g. 896**2 so a
+        1024 bucket never upscales by more than ~1.14x). None keeps every row.
     """
 
     def __init__(
@@ -539,6 +546,7 @@ class ParquetTextImageDataset(Dataset):
         resolution_batching: dict | None = None,
         data_epoch: int = 0,
         s3_image_source: dict | None = None,
+        min_pixels: int | None = None,
     ):
         from .resolution_batching import normalize_resolution_batching, validate_resolution_geometry
 
@@ -593,6 +601,7 @@ class ParquetTextImageDataset(Dataset):
         self.base_res_weights = base_res_weights
         self.ratio_cutoff = ratio_cutoff
         self.resolution_step = resolution_step
+        self.min_pixels = min_pixels
         self.shuffle_tags = shuffle_tags
         self.tag_drop_percentage = tag_drop_percentage
         self.uncond_percentage = uncond_percentage
@@ -712,6 +721,8 @@ class ParquetTextImageDataset(Dataset):
             except (TypeError, ValueError, OverflowError):
                 continue
             if w <= 0 or h <= 0 or not 1 / self.ratio_cutoff < w / h < self.ratio_cutoff:
+                continue
+            if self.min_pixels and w * h < self.min_pixels:
                 continue
             available = [j for j, col in enumerate(self._caption_col_names)
                          if cols[col][i] is not None and str(cols[col][i]).strip()
@@ -878,6 +889,9 @@ class ParquetTextImageDataset(Dataset):
             except (TypeError, ValueError):
                 skipped += 1
                 continue
+            if self.min_pixels and w * h < self.min_pixels:
+                skipped += 1
+                continue
 
             bucket = _assign_bucket(w, h, standardized_buckets, self.ratio_cutoff, rng,
                                      weights=self.base_res_weights)
@@ -933,7 +947,7 @@ class ParquetTextImageDataset(Dataset):
                 buckets[bucket] = [sample]
 
         if skipped:
-            log.warning(f"Skipped {skipped:,} rows (bad dimensions or extreme aspect ratio)")
+            log.warning(f"Skipped {skipped:,} rows (bad dimensions, extreme aspect ratio or below min_pixels)")
         if skipped_no_caption:
             log.warning(f"Skipped {skipped_no_caption:,} rows (all caption columns were None/empty)")
 
@@ -1033,8 +1047,10 @@ class ParquetTextImageDataset(Dataset):
         A path is an S3 reference when ``strip_prefix`` is configured and the
         path starts with it; the remainder must be ``<bucket>/<key>``.
         """
-        prefix = self._s3_strip_prefix
-        if not prefix or not path.startswith(prefix):
+        prefixes = self._s3_strip_prefix
+        prefix = next((p for p in ([prefixes] if isinstance(prefixes, str) else prefixes or [])
+                       if p and path.startswith(p)), None)
+        if prefix is None:
             return None
         bucket, _, key = path[len(prefix):].partition("/")
         if not bucket or not key:
@@ -1180,8 +1196,17 @@ class ParquetTextImageDataset(Dataset):
             if s3_ref is not None:
                 bucket, key = s3_ref
                 client = _get_s3_client(self.s3_image_source)
-                response = client.get_object(Bucket=bucket, Key=key)
-                return response["Body"].read()
+                if "." in key.rsplit("/", 1)[-1]:
+                    return client.get_object(Bucket=bucket, Key=key)["Body"].read()
+                # Some sources store extensionless file_paths; the object carries the real extension.
+                from botocore.exceptions import ClientError
+                for ext in S3_PROBE_EXTENSIONS:
+                    try:
+                        return client.get_object(Bucket=bucket, Key=key + ext)["Body"].read()
+                    except ClientError as e:
+                        if e.response.get("Error", {}).get("Code") not in ("NoSuchKey", "404"):
+                            raise
+                raise FileNotFoundError(f"{bucket}/{key} with none of {S3_PROBE_EXTENSIONS}")
             elif self._is_url(path_or_url):
                 if self.session is None:
                     raise RuntimeError("requests is not installed; cannot load URLs")

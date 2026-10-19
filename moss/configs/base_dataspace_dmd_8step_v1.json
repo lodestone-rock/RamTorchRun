@@ -1,0 +1,56 @@
+{
+  "_comment": "base-v1: the SFT data-space DMD recipe applied to MOSS-Image-Base (the SFT was tuned on GPT-scored preferences and runs over-saturated). Fresh start, seed 45, the SFT v2 lrs (LoRA 2e-6, step-time/Q 4e-5), 100 fake-only warmup updates. Teacher/real = Base 50-step CFG 3, empty negative skipping block 22 (the release defaults for Base too). Captions: trainer_samples_v3 scene_graph, compact JSON.",
+  "seed": 45,
+  "model_path": "checkpoints/moss-image-base",
+  "output_dir": "runs/moss-base-dataspace-dmd-8step-v1",
+  "captions": {
+    "files": [
+      "trainer_samples_v3/source=*/samples.parquet"
+    ],
+    "column": "scene_graph",
+    "format": "compact_json",
+    "holdout": 16,
+    "filters": {
+      "caption_status": "ok"
+    }
+  },
+  "width": 1024,
+  "height": 1024,
+  "shift": 5.0,
+  "teacher_steps": 50,
+  "teacher_cfg": 3.0,
+  "student_steps": 8,
+  "lora_rank": 128,
+  "lora_alpha": 128.0,
+  "lr": 2e-06,
+  "step_lr": 4e-05,
+  "fake_lr": 2e-05,
+  "betas": [
+    0.0,
+    0.95
+  ],
+  "weight_decay": 0.0,
+  "max_grad_norm": 10.0,
+  "warmup": 0,
+  "tau_beta": [
+    2.5,
+    1.0
+  ],
+  "real_cfg": 3.0,
+  "real_cfg_max_tau": 1.0,
+  "real_uncond_skip": [
+    22
+  ],
+  "fake_ratio": 4,
+  "fake_warmup": 100,
+  "ema_sigma_rel": 0.1,
+  "batch_size": 1,
+  "grad_accum": 4,
+  "max_updates": 12000,
+  "max_seconds": 1000000000.0,
+  "eval_interval": 200,
+  "save_interval": 100,
+  "milestone_interval": 800,
+  "keep_checkpoints": 3,
+  "validation_count": 10
+}

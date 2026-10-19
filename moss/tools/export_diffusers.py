@@ -31,20 +31,28 @@ from moss.model.transformer import load_transformer
 from moss.tools.export_lora import adapter_files
 from moss.train_dataspace_dmd import MossDataSpaceDMD
 
+HF_IDS = {"moss-image-sft": "OpenMOSS-Team/MOSS-Image-SFT", "moss-image-base": "OpenMOSS-Team/MOSS-Image-Base"}
+DEMOS = {"moss-image-sft": "# Demo\nhttps://huggingface.co/spaces/hugging-apps/moss-image-8-step-dmd\n\n"}
+
 README = """---
 license: apache-2.0
-base_model: OpenMOSS-Team/MOSS-Image-SFT
+base_model: {base_id}
 ---
-# Demo
-https://huggingface.co/spaces/hugging-apps/moss-image-8-step-dmd
+{demo}# {base_name}, {steps}-step data-space DMD
 
-# MOSS-Image-SFT, 8-step data-space DMD
-
-Work-in-progress distillation of [OpenMOSS-Team/MOSS-Image-SFT](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT)
+Work-in-progress distillation of [{base_id}](https://huggingface.co/{base_id})
 (50 steps, CFG 3) to {steps} network evaluations, no CFG. Data-space DMD (arXiv 2610.12102): the
 generator iterates on its own clean estimate from fixed noise. Trained on compact-JSON `scene_graph` captions.
 
 Checkpoint: update {update} (EMA), {dtype} weights.
+
+# Usage (recommended): the LoRA alone, standard sampler
+
+Load `lora.safetensors` on the stock {base_name} transformer (e.g. a ComfyUI LoRA loader, strength 1) and
+sample with the model's usual flow-matching Euler sampler, shift 5, **CFG 1**, 4-8 steps. Nothing else from
+this repo is needed.
+
+# Data-space sampler (the training-time form)
 
 `transformer/` is a stock `MOSSImageTransformer` (load it with the release `pipeline_moss_image.py`); the
 text encoder, tokenizer and VAE are the base repo's.
@@ -185,7 +193,10 @@ def main():
               str(out / "dataspace.safetensors"))
     save_file({k: v.contiguous() for k, v in export.items()}, str(out / "generator.safetensors"))
     adapter_files(export, cfg["lora_alpha"], out)
-    (out / "README.md").write_text(README.format(steps=steps, update=update, dtype=args.dtype))
+    key = Path(cfg["model_path"]).name
+    base_id = HF_IDS.get(key, cfg["model_path"])
+    (out / "README.md").write_text(README.format(steps=steps, update=update, dtype=args.dtype, base_id=base_id,
+                                                 base_name=base_id.split("/")[-1], demo=DEMOS.get(key, "")))
     (out / "export.json").write_text(json.dumps({"update": update, "checkpoint": str(ckpt), "dtype": args.dtype}))
     print(f"exported update {update} -> {out}", flush=True)
 

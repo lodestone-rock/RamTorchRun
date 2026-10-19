@@ -1,0 +1,153 @@
+{
+  "_comment": "Smoke of sft_kromoss_v1: 4 updates, accum 2, save at 2 (resume shards) and 4 (export), eval at 4.",
+  "seed": 48,
+  "model_path": "checkpoints/kromoss",
+  "data": {
+    "parquet_sources": {
+      "danbooru": {
+        "path": "trainer_samples_v3/source=danbooru",
+        "n_samples": 2000
+      },
+      "deviantart": {
+        "path": "trainer_samples_v3/source=deviantart",
+        "n_samples": 2000
+      },
+      "e621": {
+        "path": "trainer_samples_v3/source=e621",
+        "n_samples": 2000
+      },
+      "midjourney": {
+        "path": "trainer_samples_v3/source=midjourney",
+        "n_samples": 2000
+      },
+      "reddit": {
+        "path": "trainer_samples_v3/source=reddit",
+        "n_samples": 2000
+      }
+    },
+    "caption_columns": {
+      "tags": {
+        "weight": 1.0,
+        "is_tag_based": true
+      },
+      "10_word_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "brief_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "midjourney_style_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "long_caption": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "scene_graph": {
+        "weight": 1.0,
+        "is_tag_based": false
+      }
+    },
+    "filename_column": "file_path",
+    "width_column": "image_width",
+    "height_column": "image_height",
+    "base_resolution": [
+      1024
+    ],
+    "ratio_cutoff": 2.0,
+    "resolution_step": 32,
+    "shuffle_tags": true,
+    "tag_drop_percentage": 0.0,
+    "uncond_percentage": 0.1,
+    "timeout": 30,
+    "num_workers": 16,
+    "prefetch_factor": 4,
+    "min_pixels": 802816,
+    "s3_image_source": {
+      "endpoint_url": "http://localhost:9000",
+      "credential_file": "credential/local-rustfs-readonly.json",
+      "strip_prefix": [
+        "/mnt/nas_buckets/",
+        "nas_buckets/"
+      ]
+    }
+  },
+  "parallelism": "zero",
+  "optimizer": "muon",
+  "per_rank_batch": 2,
+  "grad_accum": 2,
+  "timestep": {
+    "kind": "moss_final",
+    "mean": -1.09,
+    "std": 0.95,
+    "cutoff": 0.95,
+    "uniform": 0.01,
+    "steps": 1000
+  },
+  "lr": 9e-06,
+  "betas": [
+    0.9,
+    0.95
+  ],
+  "weight_decay": 0.01,
+  "warmup": 2,
+  "max_grad_norm": 1.0,
+  "grad_checkpoint": 30,
+  "max_updates": 4,
+  "eval_interval": 4,
+  "save_interval": 2,
+  "milestone_interval": 4,
+  "keep_checkpoints": 2,
+  "output_dir": "runs/moss-kromoss-sft-smoke",
+  "negative_prompt": "",
+  "validation": {
+    "width": 1024,
+    "height": 1024,
+    "steps": 30,
+    "guidance": 3.0,
+    "shift": 5.0,
+    "uncond_skip": [
+      22
+    ]
+  },
+  "validation_prompts": [
+    "A red fox sitting in fresh snow at dawn, soft golden light, shallow depth of field",
+    "A cozy bookstore cafe interior on a rainy evening, warm lamps, people reading",
+    "An astronaut riding a horse across a desert under a purple sky, cinematic",
+    "Portrait of an elderly fisherman with a weathered face, overcast harbor background"
+  ],
+  "validation_seeds": [
+    1000,
+    1001,
+    1002,
+    1003
+  ],
+  "batched_forward": true,
+  "batched_text": true,
+  "encode_update_text": true,
+  "compile": true,
+  "compile_dynamic": "static",
+  "seq_pad": 256,
+  "sdpa": "cudnn",
+  "muon": {
+    "momentum": 0.95,
+    "nesterov": true,
+    "ns_steps": 5,
+    "rms_scale": 0.2,
+    "batch": 16
+  },
+  "eps": 1e-08,
+  "qk_norm_decay_to_one": 0.01,
+  "ema": {
+    "decay": 0.999
+  },
+  "zero": {
+    "clip": "global",
+    "mode": "coalesced",
+    "comm_dtype": null,
+    "bucket_mb": 1024
+  }
+}

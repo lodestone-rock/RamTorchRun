@@ -1,0 +1,147 @@
+{
+  "_comment": "Full SFT of MOSS-Image-Base at 1024 on trainer_samples_v3 (v1 at 512 degraded quality), fresh from Base, with the MOSS-Image report's final pretraining recipe scaled to our batch: hybrid Muon-AdamW (Muon on block matrices, fused qkv / gate-up split; AdamW betas 0.9/0.95 eps 1e-8 on embeddings, head, time/modulation, 1-D), weight decay 0.01 (none on embeddings / 1-D), clip 1.0, final-block q/k norm decay-to-one 0.01, final-stage timesteps (truncated logit-normal mu -1.09 s 0.95 cutoff 0.95 + 1% uniform, shift 1), EMA (exported). lr 5e-5 at their ~2000 samples/update scaled by sqrt(64/2000) -> 9e-6; EMA 0.9999 (horizon >> our run) -> 0.999 (~1k updates = 64k images); warmup 2000 -> 200 updates. DDP on 2 GPUs x 2 per GPU x accum 16 = 64 images/update; the first 21 of 42 blocks checkpointed (B=2 unchecked peaks at 167 GiB once EMA + Muon momentum are resident), regional compile (static shapes via seq_pad 256), cuDNN attention: the 1024 probe's smallest saturating batch. Rows below 896^2 pixels dropped (no >1.14x upscales).",
+  "seed": 47,
+  "model_path": "checkpoints/moss-image-base",
+  "data": {
+    "parquet_sources": {
+      "danbooru": {
+        "path": "trainer_samples_v3/source=danbooru",
+        "n_samples": null
+      },
+      "deviantart": {
+        "path": "trainer_samples_v3/source=deviantart",
+        "n_samples": null
+      },
+      "e621": {
+        "path": "trainer_samples_v3/source=e621",
+        "n_samples": null
+      },
+      "midjourney": {
+        "path": "trainer_samples_v3/source=midjourney",
+        "n_samples": null
+      },
+      "reddit": {
+        "path": "trainer_samples_v3/source=reddit",
+        "n_samples": null
+      }
+    },
+    "caption_columns": {
+      "tags": {
+        "weight": 1.0,
+        "is_tag_based": true
+      },
+      "10_word_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "brief_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "midjourney_style_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "long_caption": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "scene_graph": {
+        "weight": 1.0,
+        "is_tag_based": false
+      }
+    },
+    "filename_column": "url",
+    "width_column": "image_width",
+    "height_column": "image_height",
+    "base_resolution": [
+      1024
+    ],
+    "ratio_cutoff": 2.0,
+    "resolution_step": 32,
+    "shuffle_tags": true,
+    "tag_drop_percentage": 0.0,
+    "uncond_percentage": 0.1,
+    "timeout": 30,
+    "num_workers": 16,
+    "prefetch_factor": 4,
+    "min_pixels": 802816
+  },
+  "parallelism": "ddp",
+  "optimizer": "muon",
+  "per_rank_batch": 2,
+  "grad_accum": 16,
+  "timestep": {
+    "kind": "moss_final",
+    "mean": -1.09,
+    "std": 0.95,
+    "cutoff": 0.95,
+    "uniform": 0.01,
+    "steps": 1000
+  },
+  "lr": 9e-06,
+  "betas": [
+    0.9,
+    0.95
+  ],
+  "weight_decay": 0.01,
+  "warmup": 200,
+  "max_grad_norm": 1.0,
+  "grad_checkpoint": 21,
+  "max_updates": 11000,
+  "eval_interval": 250,
+  "save_interval": 250,
+  "milestone_interval": 1000,
+  "keep_checkpoints": 2,
+  "output_dir": "runs/moss-base-sft-v2",
+  "negative_prompt": "",
+  "validation": {
+    "width": 1024,
+    "height": 1024,
+    "steps": 30,
+    "guidance": 3.0,
+    "shift": 5.0,
+    "uncond_skip": [
+      22
+    ]
+  },
+  "validation_prompts": [
+    "A red fox sitting in fresh snow at dawn, soft golden light, shallow depth of field",
+    "A cozy bookstore cafe interior on a rainy evening, warm lamps, people reading",
+    "An astronaut riding a horse across a desert under a purple sky, cinematic",
+    "Portrait of an elderly fisherman with a weathered face, overcast harbor background",
+    "A neon sign that says \"OPEN 24 HOURS\" above a diner door at night",
+    "1girl, solo, long hair, silver hair, blue eyes, school uniform, cherry blossoms, outdoors, smile, looking at viewer, wind",
+    "anime digital illustration, wolf anthro knight in silver armor, holding a glowing sword, moonlit castle ruins, dramatic rim light, cel shaded, clean lineart",
+    "{\"artist\":null,\"characters\":[],\"species\":[],\"subject_count\":0,\"subjects\":[],\"setting\":\"Modern cantilevered villa built into a rocky sandstone cliff face surrounded by wilderness\",\"background\":\"Towering vertical sandstone cliff face with hanging ivy and a tree-lined ridge\",\"lighting\":\"Warm late-afternoon golden sunlight with soft ambient shadows and glowing rim light\",\"objects\":[\"concrete house\",\"glass window walls\",\"cantilevered terrace\",\"orange outdoor dining table\",\"orange dining chairs\",\"orange lounge armchair\",\"bed with bedding\",\"sandstone cliff\",\"eucalyptus trees\",\"bushes\",\"glass railing\"],\"text_in_image\":[],\"watermarks\":[],\"perspective\":\"Wide eye-level exterior architectural view\",\"style\":\"Photorealistic 3D architectural rendering\",\"nsfw_level\":\"general\"}"
+  ],
+  "validation_seeds": [
+    1000,
+    1001,
+    1002,
+    1003,
+    1004,
+    1005,
+    1006,
+    1007
+  ],
+  "batched_forward": true,
+  "batched_text": true,
+  "encode_update_text": true,
+  "compile": true,
+  "compile_dynamic": "static",
+  "seq_pad": 256,
+  "sdpa": "cudnn",
+  "muon": {
+    "momentum": 0.95,
+    "nesterov": true,
+    "ns_steps": 5,
+    "rms_scale": 0.2,
+    "batch": 16
+  },
+  "eps": 1e-08,
+  "qk_norm_decay_to_one": 0.01,
+  "ema": {
+    "decay": 0.999
+  }
+}

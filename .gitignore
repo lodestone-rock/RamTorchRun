@@ -23,6 +23,7 @@ hf_cache/
 # Logs
 *.log
 loss_log.csv
+/logs/
 
 # Profiler traces (hundreds of MB)
 profiles/

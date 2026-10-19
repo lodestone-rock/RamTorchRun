@@ -1,0 +1,110 @@
+{
+  "_comment": "Smoke for sft_base_v1: same data/model, 6 updates, save every 3 (milestone at 6), small previews.",
+  "seed": 46,
+  "model_path": "checkpoints/moss-image-base",
+  "data": {
+    "parquet_sources": {
+      "danbooru": {
+        "path": "trainer_samples_v3/source=danbooru",
+        "n_samples": null
+      },
+      "deviantart": {
+        "path": "trainer_samples_v3/source=deviantart",
+        "n_samples": null
+      },
+      "e621": {
+        "path": "trainer_samples_v3/source=e621",
+        "n_samples": null
+      },
+      "midjourney": {
+        "path": "trainer_samples_v3/source=midjourney",
+        "n_samples": null
+      },
+      "reddit": {
+        "path": "trainer_samples_v3/source=reddit",
+        "n_samples": null
+      }
+    },
+    "caption_columns": {
+      "tags": {
+        "weight": 1.0,
+        "is_tag_based": true
+      },
+      "10_word_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "brief_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "midjourney_style_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "long_caption": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "scene_graph": {
+        "weight": 1.0,
+        "is_tag_based": false
+      }
+    },
+    "filename_column": "url",
+    "width_column": "image_width",
+    "height_column": "image_height",
+    "base_resolution": [
+      1024
+    ],
+    "ratio_cutoff": 2.0,
+    "resolution_step": 64,
+    "shuffle_tags": true,
+    "tag_drop_percentage": 0.0,
+    "uncond_percentage": 0.1,
+    "timeout": 30,
+    "num_workers": 6,
+    "prefetch_factor": 4
+  },
+  "per_rank_batch": 2,
+  "grad_accum": 2,
+  "timestep": {
+    "mean": 0.0,
+    "std": 1.0,
+    "shift": 3.0
+  },
+  "lr": 1e-05,
+  "betas": [
+    0.9,
+    0.99
+  ],
+  "weight_decay": 0.0,
+  "warmup": 2,
+  "max_grad_norm": 1.0,
+  "grad_checkpoint": true,
+  "max_updates": 6,
+  "eval_interval": 6,
+  "save_interval": 3,
+  "milestone_interval": 6,
+  "keep_checkpoints": 2,
+  "output_dir": "runs/moss-base-sft-smoke",
+  "negative_prompt": "",
+  "validation": {
+    "width": 512,
+    "height": 512,
+    "steps": 10,
+    "guidance": 3.0,
+    "shift": 5.0,
+    "uncond_skip": [
+      22
+    ]
+  },
+  "validation_prompts": [
+    "A red fox sitting in fresh snow at dawn, soft golden light, shallow depth of field",
+    "1girl, solo, long hair, silver hair, blue eyes, school uniform, cherry blossoms, outdoors, smile, looking at viewer, wind"
+  ],
+  "validation_seeds": [
+    1000,
+    1001
+  ]
+}

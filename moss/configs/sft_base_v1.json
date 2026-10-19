@@ -1,0 +1,122 @@
+{
+  "_comment": "Full SFT of MOSS-Image-Base on trainer_samples_v3 (all 763k rows, images by url), FSDP2 over 2 GPUs. Six caption columns drawn evenly per row (tags shuffled, no tag drop; scene_graph as compact JSON), 10% uncond, aspect buckets around 512^2 (step 32) to digest the data faster; previews at 512. Global batch 2 GPUs x 2 x accum 4 = 16; 46000 updates ~ one epoch (46107).",
+  "seed": 46,
+  "model_path": "checkpoints/moss-image-base",
+  "data": {
+    "parquet_sources": {
+      "danbooru": {
+        "path": "trainer_samples_v3/source=danbooru",
+        "n_samples": null
+      },
+      "deviantart": {
+        "path": "trainer_samples_v3/source=deviantart",
+        "n_samples": null
+      },
+      "e621": {
+        "path": "trainer_samples_v3/source=e621",
+        "n_samples": null
+      },
+      "midjourney": {
+        "path": "trainer_samples_v3/source=midjourney",
+        "n_samples": null
+      },
+      "reddit": {
+        "path": "trainer_samples_v3/source=reddit",
+        "n_samples": null
+      }
+    },
+    "caption_columns": {
+      "tags": {
+        "weight": 1.0,
+        "is_tag_based": true
+      },
+      "10_word_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "brief_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "midjourney_style_summary": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "long_caption": {
+        "weight": 1.0,
+        "is_tag_based": false
+      },
+      "scene_graph": {
+        "weight": 1.0,
+        "is_tag_based": false
+      }
+    },
+    "filename_column": "url",
+    "width_column": "image_width",
+    "height_column": "image_height",
+    "base_resolution": [
+      512
+    ],
+    "ratio_cutoff": 2.0,
+    "resolution_step": 32,
+    "shuffle_tags": true,
+    "tag_drop_percentage": 0.0,
+    "uncond_percentage": 0.1,
+    "timeout": 30,
+    "num_workers": 6,
+    "prefetch_factor": 4
+  },
+  "per_rank_batch": 2,
+  "grad_accum": 4,
+  "timestep": {
+    "mean": 0.0,
+    "std": 1.0,
+    "shift": 3.0
+  },
+  "lr": 1e-05,
+  "betas": [
+    0.9,
+    0.99
+  ],
+  "weight_decay": 0.0,
+  "warmup": 200,
+  "max_grad_norm": 1.0,
+  "grad_checkpoint": true,
+  "max_updates": 46000,
+  "eval_interval": 500,
+  "save_interval": 500,
+  "milestone_interval": 2000,
+  "keep_checkpoints": 2,
+  "output_dir": "runs/moss-base-sft-v1",
+  "negative_prompt": "",
+  "validation": {
+    "width": 512,
+    "height": 512,
+    "steps": 30,
+    "guidance": 3.0,
+    "shift": 5.0,
+    "uncond_skip": [
+      22
+    ]
+  },
+  "validation_prompts": [
+    "A red fox sitting in fresh snow at dawn, soft golden light, shallow depth of field",
+    "A cozy bookstore cafe interior on a rainy evening, warm lamps, people reading",
+    "An astronaut riding a horse across a desert under a purple sky, cinematic",
+    "Portrait of an elderly fisherman with a weathered face, overcast harbor background",
+    "A neon sign that says \"OPEN 24 HOURS\" above a diner door at night",
+    "1girl, solo, long hair, silver hair, blue eyes, school uniform, cherry blossoms, outdoors, smile, looking at viewer, wind",
+    "anime digital illustration, wolf anthro knight in silver armor, holding a glowing sword, moonlit castle ruins, dramatic rim light, cel shaded, clean lineart",
+    "{\"artist\":null,\"characters\":[],\"species\":[],\"subject_count\":0,\"subjects\":[],\"setting\":\"Modern cantilevered villa built into a rocky sandstone cliff face surrounded by wilderness\",\"background\":\"Towering vertical sandstone cliff face with hanging ivy and a tree-lined ridge\",\"lighting\":\"Warm late-afternoon golden sunlight with soft ambient shadows and glowing rim light\",\"objects\":[\"concrete house\",\"glass window walls\",\"cantilevered terrace\",\"orange outdoor dining table\",\"orange dining chairs\",\"orange lounge armchair\",\"bed with bedding\",\"sandstone cliff\",\"eucalyptus trees\",\"bushes\",\"glass railing\"],\"text_in_image\":[],\"watermarks\":[],\"perspective\":\"Wide eye-level exterior architectural view\",\"style\":\"Photorealistic 3D architectural rendering\",\"nsfw_level\":\"general\"}"
+  ],
+  "validation_seeds": [
+    1000,
+    1001,
+    1002,
+    1003,
+    1004,
+    1005,
+    1006,
+    1007
+  ]
+}

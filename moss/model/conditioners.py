@@ -7,24 +7,35 @@ import torch
 
 
 class TextEncoder:
-    """Prompt -> unpadded last hidden state [L, 4096]. Prompts run one at a time, like the release:
-    Qwen3.5's gated-delta layers are not padding-invariant."""
+    """Prompt -> unpadded last hidden state [L, 4096]. By default prompts run one at a time, like the release:
+    Qwen3.5's gated-delta layers are not padding-invariant under left padding. ``batched=True`` runs one
+    RIGHT-padded forward; every layer is causal, so the real tokens see no padding (check with
+    moss/tools/probe_sft_throughput.py --text-parity)."""
 
-    def __init__(self, path, device, max_length=4096):
+    def __init__(self, path, device, max_length=4096, batched=False):
         from transformers import AutoModel, AutoTokenizer
         path = Path(path)
         self.tokenizer = AutoTokenizer.from_pretrained(path / "tokenizer" if (path / "tokenizer").is_dir() else path)
         self.model = AutoModel.from_pretrained(path / "text_encoder", dtype=torch.bfloat16).to(device).eval()
         self.model.requires_grad_(False)
-        self.device, self.max_length = device, max_length
+        self.device, self.max_length, self.batched = device, max_length, batched
+
+    def _template(self, prompt):
+        return self.tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False,
+                                                  add_generation_prompt=True, enable_thinking=True)
 
     @torch.no_grad()
-    def __call__(self, prompts: list[str]) -> list[torch.Tensor]:
+    def __call__(self, prompts: list[str], batched=None) -> list[torch.Tensor]:
+        if (self.batched if batched is None else batched) and len(prompts) > 1:
+            inputs = self.tokenizer([self._template(p) for p in prompts], return_tensors="pt", padding=True,
+                                    padding_side="right", truncation=True, max_length=self.max_length)
+            output = self.model(**inputs.to(self.device), use_cache=False, return_dict=True)
+            lengths = inputs["attention_mask"].sum(1).tolist()
+            return [output.last_hidden_state[i, :n] for i, n in enumerate(lengths)]
         rows = []
         for prompt in prompts:
-            text = self.tokenizer.apply_chat_template([{"role": "user", "content": prompt}], tokenize=False,
-                                                      add_generation_prompt=True, enable_thinking=True)
-            inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=self.max_length)
+            inputs = self.tokenizer(self._template(prompt), return_tensors="pt", truncation=True,
+                                    max_length=self.max_length)
             output = self.model(**inputs.to(self.device), use_cache=False, return_dict=True)
             rows.append(output.last_hidden_state[0])
         return rows

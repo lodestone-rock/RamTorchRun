@@ -4426,3 +4426,43 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   (254k rows) is exactly the set that 404s on Backblaze; on rustfs all 5
   sources fetch 24/24, ~17 img/s @1024 on 16 workers. The read-only key cannot
   ListBuckets (AccessDenied) - GetObject only. DMAD configs still use `url`.
+
+## 2026-10-19 — MOSS SFT patch applied; Kromoss; ZeRO-1 mode for the PCIe box
+
+- Applied `moss-sft-github.patch` (train_sft.py, utils/muon.py, batched
+  forward, sft_base_* configs, tools); its CPU checks pass.
+- `checkpoints/kromoss` = `lodestones/Kromoss` diffusers layout (27 GB, comfy
+  singles excluded; keeps `8-steps-dmd-lora.safetensors`). Gotcha: `hf
+  download --exclude a b c` treats b, c as FILENAMES to download — repeat
+  `--exclude` per pattern.
+- Comms (`moss/tools/probe_comms.py`, 5.08B params): NCCL's default here puts
+  every link on SHM (2 channels) because GPU pairs 0-1 / 2-3 sit on different
+  sockets: ~3.4 GB/s, fp32 all-reduce 7.8 s/update. `NCCL_P2P_LEVEL=SYS`:
+  reduce / broadcast ~18 GB/s (fp32 1.1 s each, all-reduce 2.1 s); a same-
+  socket pair alone does 28 GB/s. train_sft now setdefaults it.
+- `parallelism: "zero"` in train_sft (`utils/zero_sharding.py`): ramtorch
+  MultiGPUWrapper's ZeRO-1 ported to torchrun — whole-tensor owners (greedy
+  largest-first, Muon and AdamW sets balanced separately), grads reduced to
+  owners once per update (no DDP), owner-only Muon/AdamW + EMA shadow,
+  broadcast after the step; `zero.clip` global (default, one scalar
+  all-reduce) | local (owners clip alone; logged norm stays global);
+  `zero.comm_dtype`, `muon.state_dtype` bf16 options (not needed at 85 GiB).
+  EMA previews / export swap the owned shards in and broadcast.
+- `moss/tools/check_zero_sync.py` passes: world 1/3 == one process, local
+  clip, bf16 options, bit-exact DCP resume, world-3 ckpt -> world 2. Two
+  findings: (1) ZeRO checkpoints need `flatten_optimizer_state_dict=True` —
+  the default list-indexed `param_groups` keys collide across ranks with
+  different groups (resume crashed with KeyError 'momentum'); (2) Muon's bf16
+  Newton-Schulz amplifies an fp32 ulp (cross-rank sum order) to ~10% of an
+  update along small singular directions, so parity is checked with an fp32
+  orthogonalize.
+- Parquet loader: `s3_image_source.strip_prefix` may be a list, extensionless
+  keys probe extensions; train_sft passes `data.s3_image_source`. All 5
+  sources fetch 20/20 from rustfs via `file_path`.
+- `configs/sft_kromoss_v1(.json|_smoke)`: continue Kromoss, zero on 4 GPUs x 2
+  x accum 8 = 64 img/update, fresh optimizer, warmup 50. Smoke (4 GPUs):
+  peak 85 GiB at grad_checkpoint 30 (42 -> 71 GiB, 24 -> 93 GiB; speed within
+  5%), ~12 s/update at accum 4 of which ~3.5 s is sync; saves/export/previews
+  work; export strictly loadable. Resume reproduces data position + timesteps
+  but not losses exactly: ParquetTextImageDataset.__getitem__ uses the global
+  `random` for uncond/tag shuffle (pre-existing, per-worker state).

@@ -4466,3 +4466,58 @@ injection modes.** Script: scratchpad/tagcode_weight_analysis.py.
   work; export strictly loadable. Resume reproduces data position + timesteps
   but not losses exactly: ParquetTextImageDataset.__getitem__ uses the global
   `random` for uncond/tag shuffle (pre-existing, per-worker state).
+
+## 2026-10-19 — Artist LoRAs resumed after power outage
+
+- Relaunched `launch_artist_loras.py run --queue e621:0,1 --queue danbooru:2,3
+  --cooldown 200 --rank 32` (cd200_r32): resumed at e621 1056 / danbooru 1091.
+- The outage left `e621/cache/karakylia_*/manifest.json` empty -> JSONDecodeError.
+  train_concept_lora.build_cache now rebuilds on an unreadable manifest and
+  writes it atomically (tmp + os.replace). karakylia is in failures.jsonl;
+  pick it up later with `--retry-failed`.
+- Deleted the applied `moss-sft-github.patch` and `moss.zip`.
+
+## 2026-10-19 — krea2 OPD: all artist LoRAs -> one student LoRA
+
+- New `krea2/train_opd.py` (torchrun + ZeroSync over student LoRA),
+  `krea2/model/teacher_bank.py` (DistillLinear: base / student / S-slot teacher
+  bank via grouped bmm), `dataloaders/lora_teacher_loader.py` (TeacherPool,
+  rank-partitioned ArtistStepSampler, pinned LoRACache, StepQueue), configs
+  `train_opd_lora.json` (shared base = opd_base_candidate),
+  `train_opd_lora_separate.json` (teacher = fullft_step_49600 + LoRA),
+  `train_opd_smoke.json`; CPU guard `tools/check_teacher_bank.py` passes.
+- `mmdit.SingleStreamDiT.grad_ckpt` accepts an int N (first N blocks).
+- Gotchas: fullft_step_49600 is fp32 (51 GB) -> `load_dit` casts per tensor to
+  bf16; bank is bf16 so CPU parity needs bf16-representable fake LoRAs; student
+  rank must be uniform for merge_lora_into_base_sd; an OOM'd rank can leave
+  peers holding GPUs + port 29500 -> sweep script pkills and picks a port.
+- Rank sweep (4 GPUs, compile off, full ckpt, slots 4 x 1, accum 2, peak/GPU of
+  94.97 GiB; peaks vary ~±3 GiB with the off/on-policy draw):
+  shared 512: r1024 81.9 / r1280 88.8 GiB (36 s/upd), r1408 OOM.
+  shared 1024: r256 64.3, r1024 92.0, r1152 89.6 GiB (83 s/upd).
+  separate 512: r256 71.6, r640 86.5, r736 90.4 GiB (34 s/upd), r832 OOM.
+  separate 1024: r256 79.9, r512 88.8, r576 91.0 GiB (77 s/upd), r640 OOM.
+
+## 2026-10-20 — moss concept LoRA trainer + artist launcher (batch 1 @1024)
+
+- New `moss/train_concept_lora.py` (krea2/train_concept_lora port, plain engine only, Kromoss base,
+  LoRA on layers.*.proj.{q,k,v,o,ffn_up_gate,ffn_down}, fused AdamW, kohya save),
+  `moss/model/fast_lora.py` (fuse_qkv, FP8 frozen base), `moss/configs/concept_lora_artist.json`,
+  `moss/tools/launch_artist_loras.py` (reads runs/k2-artist-loras lists/parquets, out
+  runs/moss-artist-loras/<src>/cd<N>_r<rank>/, `--per-gpu`), `check_concept_lora.py` (CPU + `--gpu`),
+  `bench_concept_lora.py`, `preview_concept_lora.py`. `transformer.forward(..., projected=True)` +
+  `project_text`: the frozen text projection is cached; check_batched_forward still passes.
+- Ladder (1x RTX PRO 6000, mellonbun 27 imgs, 120 steps, steady s/step, peak GiB; run-to-run
+  |dloss| noise floor 0.019, every variant inside it):
+  eager 0.747/50.9 | raw text 0.751 | cudnn 1.181 | efficient 1.099 | ckpt all 1.058/14.3 |
+  bf16 lora 0.750 | bf16 modulation 0.719/54.8 | compile 0.532/34.5 | compile static+seq_pad
+  0.577 | cudagraphs 0.577 | autotune 0.502 | compile+fuse 0.519 | fp8 eager 0.643 |
+  compile+fp8 0.423 | +fuse 0.409 | tensorwise 0.429 | +autotune 0.392 (warm cache 0.384).
+  2 trainers/GPU: 0.86 each (worse). Profile at 0.4: FP8 GEMMs 32%, flash attn 29%, LoRA mms 11%,
+  quantize 5%. Defaults now autotune + fuse_qkv + fp8 rowwise + flash.
+- Real 1000 steps: fp8 7.2 min, bf16 9.8 min (incl. compile); last-200 loss 0.591 vs 0.579;
+  previews (runs/moss-concept-bench/preview_mellonbun.jpg) equally strong style transfer.
+- Gotchas: FP8 as an autograd.Function inside compiled blocks fails ("lift_tracked_freevar_to_input")
+  when q/k/v share an input -> torch.library custom ops; rowwise _scaled_mm works on sm_120;
+  local `import torch._dynamo` inside a function shadows `torch` (UnboundLocalError) — module level.
+- Krea artist launcher paused for the bench, resumed at e621 1433 / danbooru 1490.

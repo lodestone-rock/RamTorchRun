@@ -208,8 +208,10 @@ class MOSSImageTransformer(nn.Module):
         self.text_pad = 64
         self.seq_pad = None  # batched: pad the text so image + text is a multiple of this (few static shapes)
 
-    def forward(self, x, timestep, contexts, skip_layers=(), features=False, batched=None):
+    def forward(self, x, timestep, contexts, skip_layers=(), features=False, batched=None, projected=False):
         """x [B, C, H, W]; timestep [B] (sigma * 1000) or scalar; contexts: B unpadded [L_i, text_dim].
+        ``projected``: contexts are already ``project_text`` outputs [L_i, dim] (the text projection sees only
+        text positions, so its output does not depend on the image and can be cached).
         ``features``: return the image tokens after the last block, [B, H*W, dim], skipping the output head.
         ``batched`` (default ``self.batched``): one pass over the whole batch with the text right-padded to a
         multiple of ``text_pad`` (or so the whole sequence is a multiple of ``seq_pad``) and masked as keys;
@@ -226,14 +228,14 @@ class MOSSImageTransformer(nn.Module):
             head = self.video_head_modulation(time.to(self.video_head_modulation.weight.dtype)).view(batch, 2, -1)
         skip = frozenset(skip_layers)
         if self.batched if batched is None else batched:
-            return self._forward_batched(x, contexts, mod, head, skip, features)
+            return self._forward_batched(x, contexts, mod, head, skip, features, projected)
         outputs = []
         for index in range(batch):
             context = contexts[index][None]
             video = x[index:index + 1].flatten(2).transpose(1, 2)
             video = self.video_embedder(video.to(self.video_embedder.weight.dtype).contiguous())
             rope = self.rope(height, width, context.shape[1], x.device).to(video.dtype)
-            text = self.text_embedder(context, rope[:, height * width:])
+            text = context.to(video.dtype) if projected else self.text_embedder(context, rope[:, height * width:])
             h = torch.cat((video, text), 1)
             for layer_index, layer in enumerate(self.layers):
                 if layer_index in skip:
@@ -255,7 +257,13 @@ class MOSSImageTransformer(nn.Module):
             return -(-(image_tokens + longest) // self.seq_pad) * self.seq_pad - image_tokens
         return -(-longest // self.text_pad) * self.text_pad
 
-    def _forward_batched(self, x, contexts, mod, head, skip, features):
+    @torch.no_grad()
+    def project_text(self, context):
+        """Unpadded [L, text_dim] -> [L, dim]: the text projection exactly as both forward paths run it."""
+        rope = self.rope(1, 1, context.shape[0], context.device)[:, 1:]
+        return self.text_embedder(context[None], rope.to(self.video_embedder.weight.dtype))[0]
+
+    def _forward_batched(self, x, contexts, mod, head, skip, features, projected=False):
         batch, _, height, width = x.shape
         n, device = height * width, x.device
         lengths = [c.shape[0] for c in contexts]
@@ -266,7 +274,7 @@ class MOSSImageTransformer(nn.Module):
         valid = torch.arange(padded, device=device)[None] < torch.as_tensor(lengths, device=device)[:, None]
         video = self.video_embedder(x.flatten(2).transpose(1, 2).to(self.video_embedder.weight.dtype).contiguous())
         rope = self.rope.batched(height, width, lengths, padded, device).to(video.dtype)
-        text = self.text_embedder(context, rope[:, n:], valid[:, None, None])
+        text = context.to(video.dtype) if projected else self.text_embedder(context, rope[:, n:], valid[:, None, None])
         # Every block adds modulation-dtype terms, so start the residual there: one dtype for all blocks.
         h = torch.cat((video, text), 1).to(torch.promote_types(video.dtype, mod.dtype))
         mask = torch.cat((valid.new_ones(batch, n), valid), 1)[:, None, None]

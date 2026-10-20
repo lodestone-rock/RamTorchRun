@@ -108,6 +108,31 @@ ranks; and NCCL must get `NCCL_P2P_LEVEL=SYS` (train_sft sets it) — its defaul
 stages cross-socket traffic through host memory at ~3.4 GB/s instead of ~18
 (`moss/tools/probe_comms.py`).
 
+`moss/train_concept_lora.py` is the batch-1 artist LoRA trainer (one GPU, 1024 px,
+driven by `moss/tools/launch_artist_loras.py`). Its speed comes from switches
+measured by `moss/tools/bench_concept_lora.py`: the frozen text projection is
+cached (`forward(..., projected=True)`), blocks are compiled, q/k/v run as one
+GEMM, and the frozen base matmuls run in FP8 (`model/fast_lora.py`, rowwise
+`torch._scaled_mm` as `torch.library` custom ops — an `autograd.Function` there
+trips dynamo when two projections share an input). Result: 0.75 -> 0.39 s/step,
+51 -> 34.5 GiB. Run `moss/tools/check_concept_lora.py` (add `--gpu` for FP8) after
+touching the trainer, `fast_lora.py` or the projected-text path.
+
+`krea2/train_opd.py` distills every trained artist LoRA (`runs/k2-artist-loras`)
+into ONE student LoRA, DiffusionOPD/DanceOPD style, on torchrun + the same
+`ZeroSync` (student params only). `model/teacher_bank.py`'s `DistillLinear`
+holds the frozen base, the student LoRA and an S-slot teacher bank in buffers;
+one DiT serves as base / student / teacher (grouped bmm, row group i = slot i)
+via `set_distill_mode`, or `teacher.base: "separate"` loads a second DiT.
+`dataloaders/lora_teacher_loader.py` scans the teachers, partitions them over
+ranks, and feeds pinned LoRAs from an LRU; the bank is refilled each micro-step
+on a side stream. `policy.off_policy_updates` of dataset x_t first, then a
+mix with student rollouts (`query`: dense | subset | single_low_noise). Run
+`krea2/tools/check_teacher_bank.py` after touching the bank, the slot loader or
+the teacher loader. Student rank must be uniform (`merge_lora_into_base_sd`).
+Max rank on 4x96 GB (full grad ckpt, 4 rows/micro, `tools/sweep_opd_rank.sh`):
+shared ~1280 @512 / ~1152 @1024; separate ~736 @512 / ~576 @1024.
+
 ## Repo map
 
 Three model folders, all the same shape:
@@ -131,6 +156,11 @@ krea2/                    # Krea-2 ~12B MMDiT + Qwen-Image VAE + Qwen3-VL encode
   train_concept_lora.py   #   ONE concept: cached dataset, concept token, Lion
                           #   + warmup/constant/COOLDOWN. launcher + CPU check
                           #   in tools/launch_concept_lora.py, model/marker parser
+  train_opd.py            #   all artist LoRAs -> ONE student LoRA (OPD), torchrun +
+                          #   ZeroSync; model/teacher_bank.py (DistillLinear: base /
+                          #   student / S-slot teacher bank), off -> on-policy flag,
+                          #   teacher shared | separate base; configs/train_opd_*.json,
+                          #   tools/check_teacher_bank.py (CPU), tools/sweep_opd_rank.sh
   train_utils.py          #   K2 helpers (VAE encode/decode, timesteps, SDPA pinning)
                           #   + TagTrainer: the whole tag-embedding policy
   inference.py            #   single-GPU / --pipeline / --offload (combinable), --tags
@@ -157,6 +187,12 @@ moss/                     # MOSS-Image-SFT 5B (Qwen3.5-9B encoder, FLUX.2 VAE), 
                           #     (+ min_pixels, rustfs file_path); milestones export a release-layout
                           #     bf16 transformer/. configs/sft_kromoss_v1*.json: continue
                           #     lodestones/Kromoss (checkpoints/kromoss) under zero on 4 GPUs
+  train_concept_lora.py   #   ONE artist LoRA on Kromoss, 1 GPU, batch 1 @1024 (krea2's port):
+                          #     cached latents + text, projected text, compile + fuse_qkv + FP8
+                          #     base (model/fast_lora.py); kohya save. configs/concept_lora_artist.json,
+                          #     tools/launch_artist_loras.py (reuses k2 artist lists),
+                          #     tools/check_concept_lora.py (CPU; --gpu adds FP8),
+                          #     tools/bench_concept_lora.py (speed ladder), preview_concept_lora.py
   tools/                  #   + check_batched_forward.py / check_sft_recipe.py (CPU, SFT trainer)
                           #   + check_zero_sync.py (CPU gloo: zero == one process, DCP resume,
                           #     reshard to a new world) / probe_comms.py (NCCL timings, torchrun)
@@ -169,6 +205,8 @@ dataloaders/              # SHARED: parquet image+caption dataset, aspect-ratio 
                           #   + caption_stream.py / caption_image_stream.py (moss streams;
                           #     configs expect a trainer_samples_v3 symlink in the repo root)
                           #   + tag_column: tag ids DECOUPLED from the caption
+                          #   + lora_teacher_loader.py: TeacherPool / ArtistStepSampler /
+                          #     pinned LoRACache / StepQueue for train_opd
                           #   + mass_lora_dataloader.py: slot-packed step plans,
                           #     caption band drawn PER VISIT, not per row
                           #   + check_mass_lora_captions.py: guards that draw

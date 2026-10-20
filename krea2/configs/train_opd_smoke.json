@@ -1,0 +1,95 @@
+{
+  "seed": 0,
+  "output_dir": "runs/k2-opd/smoke",
+  "mmdit_checkpoint": "checkpoints/opd_base_candidate.safetensors",
+  "mmdit_config": "large_wide",
+  "encoder_model_id": "Qwen/Qwen3-VL-4B-Instruct",
+  "encoder_max_length": 1024,
+  "teacher": {
+    "base": "shared",
+    "checkpoint": null,
+    "root": "runs/k2-artist-loras",
+    "sources": [
+      "e621",
+      "danbooru"
+    ],
+    "variant": "cd200_r32",
+    "rank": 32,
+    "min_images": 8,
+    "limit": 16,
+    "cfg": 1.0,
+    "cache_gb": 32,
+    "cache_workers": 4
+  },
+  "student": {
+    "rank": 256,
+    "alpha": 256,
+    "init": null
+  },
+  "slots": 4,
+  "per_slot": 1,
+  "grad_accum": 2,
+  "resolution": 512,
+  "resolution_step": 64,
+  "ratio_cutoff": 2.0,
+  "uncond_ratio": 0.0,
+  "policy": {
+    "off_policy_updates": 2,
+    "on_policy_fraction": 1.0,
+    "rollout_steps": 8,
+    "rollout_cfg": 1.0,
+    "rollout_mu": 1.15,
+    "query": "single_low_noise",
+    "query_k": 2,
+    "t_range": [
+      0.1,
+      0.5
+    ]
+  },
+  "timestep": {
+    "mu_y1": 0.5,
+    "mu_y2": 1.15,
+    "mu_override": null,
+    "sigma": 1.0,
+    "minres": 256,
+    "maxres": 1280
+  },
+  "anchor_weight": 0.0,
+  "lr": 0.0001,
+  "betas": [
+    0.9,
+    0.99
+  ],
+  "eps": 1e-08,
+  "weight_decay": 0.0,
+  "warmup": 2,
+  "max_grad_norm": 1.0,
+  "max_updates": 4,
+  "parallelism": "zero",
+  "zero": {
+    "clip": "global",
+    "mode": "coalesced",
+    "comm_dtype": null,
+    "bucket_mb": 256
+  },
+  "grad_ckpt": true,
+  "compile": false,
+  "attention": "cudnn",
+  "txt_pad": 64,
+  "prefetch_steps": 3,
+  "image_workers": 8,
+  "time_phases": true,
+  "save_interval": 4,
+  "keep_states": 1,
+  "preview": {
+    "artists": 4,
+    "steps": 8,
+    "cfg": 1.0,
+    "mu": 1.15,
+    "resolution": 512,
+    "interval": 4,
+    "at_start": false
+  },
+  "log_every": 1,
+  "bench_updates": 0
+}

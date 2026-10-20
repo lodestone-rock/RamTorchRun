@@ -272,8 +272,12 @@ def build_cache(cfg: dict) -> dict:
 
     fingerprint = _cfg_fingerprint(cfg)
     if os.path.exists(manifest_path):
-        with open(manifest_path) as f:
-            manifest = json.load(f)
+        try:
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+        except json.JSONDecodeError:
+            print(f"[cache] unreadable {manifest_path}; rebuilding.")
+            manifest = {}
         if manifest.get("fingerprint") == fingerprint:
             print(f"[cache] reusing {cache_dir} (fingerprint {fingerprint[:12]}).")
             return manifest
@@ -473,8 +477,9 @@ def build_cache(cfg: dict) -> dict:
         ],
         "uncond_path": uncond_path,
     }
-    with open(manifest_path, "w") as f:
+    with open(manifest_path + ".tmp", "w") as f:
         json.dump(manifest, f, indent=2)
+    os.replace(manifest_path + ".tmp", manifest_path)
     print(f"[cache] manifest -> {manifest_path} "
           f"({len(manifest['images'])} images, {len(dropped)} dropped).")
     return manifest

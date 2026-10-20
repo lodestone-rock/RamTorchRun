@@ -661,8 +661,10 @@ class SingleStreamDiT(nn.Module):
             return_hidden_at is not None
             and getattr(self, "_hidden_only", False)
         )
+        # grad_ckpt: True = every block, an int N = the first N blocks.
+        grad_ckpt = getattr(self, "grad_ckpt", False)
         for i, block in enumerate(self.blocks):
-            if torch.is_grad_enabled() and getattr(self, 'grad_ckpt', False):
+            if torch.is_grad_enabled() and (grad_ckpt is True or (type(grad_ckpt) is int and i < grad_ckpt)):
                 combined = checkpoint_block(block, combined, tvec, freqs, mask, kv_extra)
             else:
                 combined = block(combined, tvec, freqs, mask, kv_extra)
